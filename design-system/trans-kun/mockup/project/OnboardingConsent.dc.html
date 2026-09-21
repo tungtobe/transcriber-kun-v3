@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<title>Onboarding — Đồng ý dữ liệu</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0;font-family:"IBM Plex Sans",-apple-system,"Segoe UI","Hiragino Sans","Yu Gothic UI",sans-serif;background:#F6F6F2;color:#171A1F;-webkit-font-smoothing:antialiased;font-size:14px;line-height:1.5}
+a{color:#0F766E}a:hover{color:#0B5D57}
+*{box-sizing:border-box}
+.mono{font-family:"IBM Plex Mono",ui-monospace,Menlo,monospace;font-variant-numeric:tabular-nums}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;height:36px;padding:0 14px;border-radius:8px;font:inherit;font-size:14px;font-weight:500;cursor:pointer;border:1px solid transparent;text-decoration:none;white-space:nowrap;transition:background-color 150ms ease,color 150ms ease,border-color 150ms ease}
+.btn-primary{background:#0F766E;color:#FFFFFF}.btn-primary:hover{background:#0B5D57;color:#FFFFFF}
+.btn-secondary{background:#FFFFFF;color:#171A1F;border-color:#CFD4DA}.btn-secondary:hover{background:#F1F2EE;color:#171A1F}
+.btn-ghost{background:transparent;color:#3C4551}.btn-ghost:hover{background:#ECEDE8;color:#171A1F}
+.btn-danger{background:#B42318;color:#FFFFFF}.btn-danger:hover{background:#8E1C13;color:#FFFFFF}
+.btn-danger-soft{background:#FFFFFF;color:#B42318;border-color:#F0B8B3}.btn-danger-soft:hover{background:#FDF1F0;color:#B42318}
+.btn-lg{height:44px;padding:0 20px;font-size:15px;border-radius:10px}
+.btn-sm{height:30px;padding:0 10px;font-size:13px}
+.btn-icon{width:36px;padding:0}.btn-icon.btn-sm{width:30px}
+.btn[aria-disabled="true"]{opacity:.45;cursor:not-allowed}
+.btn:focus-visible,.input:focus-visible,.select:focus-visible,.seg-btn:focus-visible,.nav-item:focus-visible,.row:focus-visible,textarea:focus-visible{outline:2px solid #0F766E;outline-offset:2px}
+.input,.select{height:36px;padding:0 12px;border:1px solid #CFD4DA;border-radius:8px;font:inherit;font-size:14px;background:#FFFFFF;color:#171A1F;width:100%}
+.select{appearance:none;-webkit-appearance:none;padding-right:32px;background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%235B6470' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><polyline points='6 9 12 15 18 9'/></svg>");background-repeat:no-repeat;background-position:right 10px center;cursor:pointer}
+textarea.input{height:auto;padding:10px 12px;resize:none;line-height:1.55}
+.label{font-size:13px;font-weight:600;color:#3C4551;display:flex;align-items:center;gap:6px}
+.help{font-size:12px;color:#5B6470;line-height:1.5}
+.card{background:#FFFFFF;border:1px solid #E1E4E8;border-radius:12px}
+.chip{display:inline-flex;align-items:center;gap:6px;height:26px;padding:0 10px;border-radius:999px;font-size:12px;font-weight:500;background:#ECEDE8;color:#3C4551;border:1px solid transparent;cursor:pointer}
+.chip-on{background:#E6F3F1;color:#0B5D57;border-color:#B7DDD8}
+.badge{display:inline-flex;align-items:center;gap:4px;height:20px;padding:0 7px;border-radius:6px;font-size:11px;font-weight:600;letter-spacing:.02em;white-space:nowrap}
+.badge-memo{background:#E0F2F1;color:#0B5D57}
+.badge-audio{background:#E8EEF7;color:#1E4E9B}
+.badge-partial{background:#FDF0DC;color:#8A4B0A}
+.badge-recover{background:#F0EAFB;color:#5B2FA3}
+.badge-live{background:#FDE8E8;color:#A11E1E}
+.badge-file{background:#ECEDE8;color:#3C4551}
+.badge-token{background:#FFF7E6;color:#8A4B0A;border:1px solid #F5D9A8}
+.seg{display:grid;grid-template-columns:56px 1fr;gap:12px;padding:8px 12px;border-radius:8px;cursor:pointer;align-items:start}
+.seg:hover{background:#F1F2EE}
+.seg-active{background:#E6F3F1}
+.ts{font-family:"IBM Plex Mono",ui-monospace,Menlo,monospace;font-variant-numeric:tabular-nums;font-size:12px;color:#5B6470;padding-top:3px}
+.speaker{font-size:11px;font-weight:700;color:#0F766E;margin-right:6px;letter-spacing:.03em}
+.seg-text{font-size:14px;line-height:1.55;color:#171A1F}
+.mark{background:#FDE68A;border-radius:3px;padding:0 2px}
+.nav-item{display:flex;align-items:center;gap:10px;height:38px;padding:0 12px;border-radius:8px;font-size:14px;color:#3C4551;text-decoration:none;cursor:pointer;font-weight:500}
+.nav-item:hover{background:#ECEDE8;color:#171A1F}
+.nav-item-active{background:#E6F3F1;color:#0B5D57;font-weight:600}.nav-item-active:hover{background:#E6F3F1;color:#0B5D57}
+.row{display:grid;grid-template-columns:minmax(0,1fr) 120px 88px 84px 300px 36px;gap:12px;align-items:center;height:48px;padding:0 12px;border-top:1px solid #EDEFF1;cursor:pointer;text-decoration:none;color:#171A1F}
+.row:hover{background:#F7F7F4}
+.th{display:grid;grid-template-columns:minmax(0,1fr) 120px 88px 84px 300px 36px;gap:12px;align-items:center;height:36px;padding:0 12px;font-size:12px;font-weight:600;color:#5B6470;text-transform:uppercase;letter-spacing:.04em}
+.chip-sm{height:22px;padding:0 8px;font-size:11px}
+.seg-btn{height:30px;padding:0 12px;border:0;background:transparent;border-radius:6px;font:inherit;font-size:13px;font-weight:500;color:#3C4551;cursor:pointer}
+.seg-btn-on{background:#FFFFFF;color:#0B5D57;font-weight:600;box-shadow:0 1px 2px rgba(17,24,39,.08)}
+.segmented{display:inline-flex;gap:2px;padding:3px;background:#ECEDE8;border-radius:8px}
+.status{display:inline-flex;align-items:center;gap:8px;height:30px;padding:0 10px;border-radius:999px;font-size:13px;font-weight:600}
+.status-rec{background:#FDE8E8;color:#A11E1E}
+.status-ok{background:#E0F2F1;color:#0B5D57}
+.status-warn{background:#FDF0DC;color:#8A4B0A}
+.status-off{background:#ECEDE8;color:#3C4551}
+.dot{width:8px;height:8px;border-radius:50%;background:currentColor;flex:none}
+.dot-pulse{animation:pulse 1.4s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+@media (prefers-reduced-motion: reduce){.dot-pulse{animation:none}}
+.tip{display:inline-flex;color:#8A919C;cursor:help}
+.field{display:flex;flex-direction:column;gap:6px}
+.kbd{font-family:"IBM Plex Mono",ui-monospace,Menlo,monospace;font-size:11px;padding:1px 6px;border:1px solid #CFD4DA;border-bottom-width:2px;border-radius:5px;background:#FFFFFF;color:#3C4551}
+.h1{font-size:22px;font-weight:600;letter-spacing:-.01em;margin:0}
+.h2{font-size:16px;font-weight:600;margin:0}
+.muted{color:#5B6470}
+.caret{display:inline-block;width:2px;height:16px;background:#0F766E;vertical-align:-3px;margin-left:2px;animation:pulse 1s steps(2) infinite}
+.md h3{font-size:14px;margin:14px 0 6px;font-weight:600}
+.md p,.md li{font-size:13px;line-height:1.6;margin:0 0 4px}
+.md ul{padding-left:18px;margin:0}
+.sw{width:40px;height:40px;border-radius:8px;border:1px solid rgba(0,0,0,.08)}
+</style>
+</helmet>
+<div style="width: 1280px; height: 800px; display: flex; align-items: center; justify-content: center; background: #F6F6F2;">
+<div style="width: 600px; display: flex; flex-direction: column; gap: 28px;">
+  <div style="display: flex; align-items: center; justify-content: space-between;">
+    <div style="display: flex; align-items: center; gap: 10px;">
+      <div style="width: 30px; height: 30px; border-radius: 8px; background: #0F766E; display: flex; align-items: center; justify-content: center;"><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 18px; height: 18px;"><path d="M2 12h2l2-5 3 10 3-14 3 14 3-10 2 5h2"/></svg></div>
+      <div style="font-size: 16px; font-weight: 700;">trans-kun</div>
+    </div>
+    <div style="display: flex; align-items: center; gap: 12px;"><div style="display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 600; color: #0B5D57;"><div style="width: 24px; height: 24px; border-radius: 50%; background: #0F766E; color: #FFFFFF; display: flex; align-items: center; justify-content: center;"><svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 14px; height: 14px;"><polyline points="20 6 9 17 4 12"/></svg></div><span>Ngôn ngữ</span></div><div style="width: 40px; height: 1px; background: #CFD4DA;"></div><div style="display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 600; color: #171A1F;"><div style="width: 24px; height: 24px; border-radius: 50%; background: #0F766E; color: #FFFFFF; display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 700;">2</div><span>Dữ liệu</span></div><div style="width: 40px; height: 1px; background: #CFD4DA;"></div><div style="display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 600; color: #5B6470;"><div style="width: 24px; height: 24px; border-radius: 50%; border: 1.5px solid #CFD4DA; color: #5B6470; display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 600;">3</div><span>API key</span></div></div>
+  </div>
+  <div class="card" style="padding: 32px; display: flex; flex-direction: column; gap: 24px;">
+    <div style="display: flex; flex-direction: column; gap: 6px;">
+      <h1 class="h1">Dữ liệu buổi họp của bạn đi đâu?</h1>
+      <p class="muted" style="margin: 0; font-size: 14px;">Chúng tôi cần bạn đồng ý trước khi bất kỳ tính năng nào gửi dữ liệu.</p>
+    </div>
+    <div style="display: flex; align-items: center; gap: 0; padding: 20px; border-radius: 10px; background: #F6F6F2;">
+  <div style="flex: 1; display: flex; flex-direction: column; align-items: center; gap: 8px; text-align: center;">
+    <div style="width: 48px; height: 48px; border-radius: 12px; background: #FFFFFF; border: 1px solid #E1E4E8; display: flex; align-items: center; justify-content: center; color: #171A1F;"><svg aria-hidden="true" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 22px; height: 22px;"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M2 20h20"/></svg></div>
+    <div style="font-size: 13px; font-weight: 600;">Máy của bạn</div>
+    <div class="help">Audio, transcript, ghi chú<br>lưu trong app</div>
+  </div>
+  <div style="display: flex; flex-direction: column; align-items: center; gap: 4px; width: 140px; color: #0F766E;">
+    <svg aria-hidden="true" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#0F766E" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 22px; height: 22px;"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+    <div style="font-size: 11px; font-weight: 600; text-align: center;">Bằng API key<br>của bạn</div>
+  </div>
+  <div style="flex: 1; display: flex; flex-direction: column; align-items: center; gap: 8px; text-align: center;">
+    <div style="width: 48px; height: 48px; border-radius: 12px; background: #FFFFFF; border: 1px solid #E1E4E8; display: flex; align-items: center; justify-content: center; color: #171A1F;"><svg aria-hidden="true" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 22px; height: 22px;"><path d="M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z"/></svg></div>
+    <div style="font-size: 13px; font-weight: 600;">Google Gemini</div>
+    <div class="help">Transcribe, dịch,<br>sinh memo</div>
+  </div>
+</div>
+<ul style="margin: 0; padding-left: 0; list-style: none; display: flex; flex-direction: column; gap: 10px;">
+  <li style="display: flex; gap: 10px; font-size: 14px; line-height: 1.5;"><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#0F766E" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 18px; height: 18px;"><polyline points="20 6 9 17 4 12"/></svg><span><strong>Audio và transcript</strong> của buổi họp được gửi tới Google Gemini bằng API key do bạn cung cấp.</span></li>
+  <li style="display: flex; gap: 10px; font-size: 14px; line-height: 1.5;"><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#0F766E" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 18px; height: 18px;"><polyline points="20 6 9 17 4 12"/></svg><span><strong>Không có server trung gian</strong> của trans-kun. Chúng tôi không thấy, không lưu nội dung họp.</span></li>
+  <li style="display: flex; gap: 10px; font-size: 14px; line-height: 1.5;"><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#0F766E" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 18px; height: 18px;"><polyline points="20 6 9 17 4 12"/></svg><span><strong>Không telemetry</strong> mặc định. Nhật ký chẩn đoán không chứa nội dung.</span></li>
+</ul>
+<div class="help">Xem <a href="https://transkun.app/privacy" target="_blank" rel="noopener">Chính sách quyền riêng tư</a> (mở trong trình duyệt). Văn bản đồng ý phiên bản 1 · 2026-09.</div>
+    <div style="display: flex; align-items: center; justify-content: space-between; padding-top: 8px; border-top: 1px solid #EDEFF1;">
+      <a class="btn btn-ghost btn-lg" href="OnboardingLang.dc.html">Không đồng ý</a><a class="btn btn-primary btn-lg" href="OnboardingKey.dc.html">Đồng ý và tiếp tục</a>
+    </div>
+  </div>
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview": {"width": 1280, "height": 800}}'>
+class Component extends DCLogic {
+renderVals() {
+return {};
+}
+}
+</script>
+</body>
+</html>

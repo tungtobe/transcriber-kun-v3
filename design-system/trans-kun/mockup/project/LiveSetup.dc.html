@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<title>Live — bắt đầu</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0;font-family:"IBM Plex Sans",-apple-system,"Segoe UI","Hiragino Sans","Yu Gothic UI",sans-serif;background:#F6F6F2;color:#171A1F;-webkit-font-smoothing:antialiased;font-size:14px;line-height:1.5}
+a{color:#0F766E}a:hover{color:#0B5D57}
+*{box-sizing:border-box}
+.mono{font-family:"IBM Plex Mono",ui-monospace,Menlo,monospace;font-variant-numeric:tabular-nums}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;height:36px;padding:0 14px;border-radius:8px;font:inherit;font-size:14px;font-weight:500;cursor:pointer;border:1px solid transparent;text-decoration:none;white-space:nowrap;transition:background-color 150ms ease,color 150ms ease,border-color 150ms ease}
+.btn-primary{background:#0F766E;color:#FFFFFF}.btn-primary:hover{background:#0B5D57;color:#FFFFFF}
+.btn-secondary{background:#FFFFFF;color:#171A1F;border-color:#CFD4DA}.btn-secondary:hover{background:#F1F2EE;color:#171A1F}
+.btn-ghost{background:transparent;color:#3C4551}.btn-ghost:hover{background:#ECEDE8;color:#171A1F}
+.btn-danger{background:#B42318;color:#FFFFFF}.btn-danger:hover{background:#8E1C13;color:#FFFFFF}
+.btn-danger-soft{background:#FFFFFF;color:#B42318;border-color:#F0B8B3}.btn-danger-soft:hover{background:#FDF1F0;color:#B42318}
+.btn-lg{height:44px;padding:0 20px;font-size:15px;border-radius:10px}
+.btn-sm{height:30px;padding:0 10px;font-size:13px}
+.btn-icon{width:36px;padding:0}.btn-icon.btn-sm{width:30px}
+.btn[aria-disabled="true"]{opacity:.45;cursor:not-allowed}
+.btn:focus-visible,.input:focus-visible,.select:focus-visible,.seg-btn:focus-visible,.nav-item:focus-visible,.row:focus-visible,textarea:focus-visible{outline:2px solid #0F766E;outline-offset:2px}
+.input,.select{height:36px;padding:0 12px;border:1px solid #CFD4DA;border-radius:8px;font:inherit;font-size:14px;background:#FFFFFF;color:#171A1F;width:100%}
+.select{appearance:none;-webkit-appearance:none;padding-right:32px;background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%235B6470' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><polyline points='6 9 12 15 18 9'/></svg>");background-repeat:no-repeat;background-position:right 10px center;cursor:pointer}
+textarea.input{height:auto;padding:10px 12px;resize:none;line-height:1.55}
+.label{font-size:13px;font-weight:600;color:#3C4551;display:flex;align-items:center;gap:6px}
+.help{font-size:12px;color:#5B6470;line-height:1.5}
+.card{background:#FFFFFF;border:1px solid #E1E4E8;border-radius:12px}
+.chip{display:inline-flex;align-items:center;gap:6px;height:26px;padding:0 10px;border-radius:999px;font-size:12px;font-weight:500;background:#ECEDE8;color:#3C4551;border:1px solid transparent;cursor:pointer}
+.chip-on{background:#E6F3F1;color:#0B5D57;border-color:#B7DDD8}
+.badge{display:inline-flex;align-items:center;gap:4px;height:20px;padding:0 7px;border-radius:6px;font-size:11px;font-weight:600;letter-spacing:.02em;white-space:nowrap}
+.badge-memo{background:#E0F2F1;color:#0B5D57}
+.badge-audio{background:#E8EEF7;color:#1E4E9B}
+.badge-partial{background:#FDF0DC;color:#8A4B0A}
+.badge-recover{background:#F0EAFB;color:#5B2FA3}
+.badge-live{background:#FDE8E8;color:#A11E1E}
+.badge-file{background:#ECEDE8;color:#3C4551}
+.badge-token{background:#FFF7E6;color:#8A4B0A;border:1px solid #F5D9A8}
+.seg{display:grid;grid-template-columns:56px 1fr;gap:12px;padding:8px 12px;border-radius:8px;cursor:pointer;align-items:start}
+.seg:hover{background:#F1F2EE}
+.seg-active{background:#E6F3F1}
+.ts{font-family:"IBM Plex Mono",ui-monospace,Menlo,monospace;font-variant-numeric:tabular-nums;font-size:12px;color:#5B6470;padding-top:3px}
+.speaker{font-size:11px;font-weight:700;color:#0F766E;margin-right:6px;letter-spacing:.03em}
+.seg-text{font-size:14px;line-height:1.55;color:#171A1F}
+.mark{background:#FDE68A;border-radius:3px;padding:0 2px}
+.nav-item{display:flex;align-items:center;gap:10px;height:38px;padding:0 12px;border-radius:8px;font-size:14px;color:#3C4551;text-decoration:none;cursor:pointer;font-weight:500}
+.nav-item:hover{background:#ECEDE8;color:#171A1F}
+.nav-item-active{background:#E6F3F1;color:#0B5D57;font-weight:600}.nav-item-active:hover{background:#E6F3F1;color:#0B5D57}
+.row{display:grid;grid-template-columns:minmax(0,1fr) 120px 88px 84px 300px 36px;gap:12px;align-items:center;height:48px;padding:0 12px;border-top:1px solid #EDEFF1;cursor:pointer;text-decoration:none;color:#171A1F}
+.row:hover{background:#F7F7F4}
+.th{display:grid;grid-template-columns:minmax(0,1fr) 120px 88px 84px 300px 36px;gap:12px;align-items:center;height:36px;padding:0 12px;font-size:12px;font-weight:600;color:#5B6470;text-transform:uppercase;letter-spacing:.04em}
+.chip-sm{height:22px;padding:0 8px;font-size:11px}
+.seg-btn{height:30px;padding:0 12px;border:0;background:transparent;border-radius:6px;font:inherit;font-size:13px;font-weight:500;color:#3C4551;cursor:pointer}
+.seg-btn-on{background:#FFFFFF;color:#0B5D57;font-weight:600;box-shadow:0 1px 2px rgba(17,24,39,.08)}
+.segmented{display:inline-flex;gap:2px;padding:3px;background:#ECEDE8;border-radius:8px}
+.status{display:inline-flex;align-items:center;gap:8px;height:30px;padding:0 10px;border-radius:999px;font-size:13px;font-weight:600}
+.status-rec{background:#FDE8E8;color:#A11E1E}
+.status-ok{background:#E0F2F1;color:#0B5D57}
+.status-warn{background:#FDF0DC;color:#8A4B0A}
+.status-off{background:#ECEDE8;color:#3C4551}
+.dot{width:8px;height:8px;border-radius:50%;background:currentColor;flex:none}
+.dot-pulse{animation:pulse 1.4s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+@media (prefers-reduced-motion: reduce){.dot-pulse{animation:none}}
+.tip{display:inline-flex;color:#8A919C;cursor:help}
+.field{display:flex;flex-direction:column;gap:6px}
+.kbd{font-family:"IBM Plex Mono",ui-monospace,Menlo,monospace;font-size:11px;padding:1px 6px;border:1px solid #CFD4DA;border-bottom-width:2px;border-radius:5px;background:#FFFFFF;color:#3C4551}
+.h1{font-size:22px;font-weight:600;letter-spacing:-.01em;margin:0}
+.h2{font-size:16px;font-weight:600;margin:0}
+.muted{color:#5B6470}
+.caret{display:inline-block;width:2px;height:16px;background:#0F766E;vertical-align:-3px;margin-left:2px;animation:pulse 1s steps(2) infinite}
+.md h3{font-size:14px;margin:14px 0 6px;font-weight:600}
+.md p,.md li{font-size:13px;line-height:1.6;margin:0 0 4px}
+.md ul{padding-left:18px;margin:0}
+.sw{width:40px;height:40px;border-radius:8px;border:1px solid rgba(0,0,0,.08)}
+</style>
+</helmet>
+<div style="width: 1280px; height: 920px; display: flex; flex-direction: row; background: #F6F6F2; overflow: hidden;">
+
+<aside style="width: 260px; flex: none; display: flex; flex-direction: column; gap: 6px; padding: 16px 12px; background: #F0F0EB; border-right: 1px solid #E1E4E8; height: 100%;">
+  <div style="display: flex; align-items: center; gap: 10px; padding: 4px 8px 14px;">
+    <div style="width: 30px; height: 30px; border-radius: 8px; background: #0F766E; display: flex; align-items: center; justify-content: center;"><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 18px; height: 18px;"><path d="M2 12h2l2-5 3 10 3-14 3 14 3-10 2 5h2"/></svg></div>
+    <div style="font-size: 16px; font-weight: 700; letter-spacing: -.01em;">trans-kun</div>
+  </div>
+  <a class="nav-item" href="Home.dc.html"><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 18px; height: 18px;"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg><span>Trang chủ</span></a>
+  <a class="nav-item nav-item-active" href="LiveSetup.dc.html" aria-current="page"><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 18px; height: 18px;"><circle cx="12" cy="12" r="2"/><path d="M16.24 7.76a6 6 0 0 1 0 8.49m-8.48-.01a6 6 0 0 1 0-8.49m11.31-2.82a10 10 0 0 1 0 14.14m-14.14 0a10 10 0 0 1 0-14.14"/></svg><span>Live</span></a>
+  <a class="nav-item" href="Settings.dc.html"><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 18px; height: 18px;"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg><span>Cài đặt</span></a>
+  <div style="flex-grow: 1;"></div>
+  
+<div style="display: flex; flex-direction: column; gap: 8px; padding: 12px; border-radius: 10px; background: #FFFFFF; border: 1px solid #E1E4E8;">
+  <div style="display: flex; align-items: center; gap: 8px; font-size: 12px; font-weight: 600; color: #8A4B0A;"><svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 14px; height: 14px;"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg><span>1 job đang chạy</span></div>
+  <div style="font-size: 13px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">zoom-recording-0912.mp4</div>
+  <div style="height: 6px; border-radius: 3px; background: #ECEDE8; overflow: hidden;"><div style="width: 36%; height: 100%; background: #0F766E;"></div></div>
+  <div style="display: flex; justify-content: space-between; font-size: 12px; color: #5B6470;"><span class="mono">32 / 90 phút</span><a href="Transcript.dc.html" style="font-weight: 600; text-decoration: none;">Mở</a></div>
+</div>
+  
+</aside>
+<main style="flex-grow: 1; min-width: 0; height: 100%; display: flex; flex-direction: column; overflow: hidden;">
+<div style="display: flex; align-items: center; justify-content: space-between; gap: 16px; height: 64px; padding: 0 24px; border-bottom: 1px solid #E1E4E8; background: #FFFFFF; flex: none;">
+  <h1 class="h1">Live</h1>
+  <div style="display: flex; align-items: center; gap: 8px;"></div>
+</div>
+<div style="flex-grow: 1; display: flex; align-items: flex-start; justify-content: center; padding: 28px 24px; overflow: hidden;">
+  <div class="card" style="width: 680px; display: flex; flex-direction: column; gap: 22px; padding: 28px;">
+    <div style="display: flex; flex-direction: column; gap: 4px;">
+      <h2 class="h2" style="font-size: 18px;">Bắt đầu phiên Live</h2>
+      <p class="muted" style="margin: 0;">Ghi âm liên tục từ lúc bắt đầu; transcript và bản dịch chạy realtime. Đổi nguồn, đổi ngôn ngữ dịch giữa chừng không ngắt phiên.</p>
+    </div>
+    <div style="display: flex; flex-direction: column; gap: 10px;">
+      <div class="label">Nguồn âm thanh</div>
+      <label style="display: flex; align-items: flex-start; gap: 14px; padding: 14px 16px; border: 1.5px solid #0F766E; border-radius: 10px; background: #F3FAF9; cursor: pointer;">
+  <input type="radio" name="source" value="Mic + Hệ thống" checked="checked" style="width: 18px; height: 18px; accent-color: #0F766E; margin: 3px 0 0;">
+  <div style="display: flex; flex-direction: column; gap: 4px; flex-grow: 1; min-width: 0;">
+    <div style="display: flex; align-items: center; gap: 8px; font-size: 15px; font-weight: 600;"><span style="display: inline-flex; gap: 2px;"><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#0B5D57" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 18px; height: 18px;"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/></svg><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#0B5D57" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 18px; height: 18px;"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg></span><span>Mic + Hệ thống</span><span class="badge badge-memo">Khuyên dùng</span></div>
+    <div class="help">Thu giọng bạn và âm thanh máy (Zoom, Teams, Meet…). Cả hai đều được transcribe và ghi âm.</div>
+    <div style="display: flex; align-items: center; gap: 8px; margin-top: 4px;">
+      <label class="help" for="mic-sel" style="white-space: nowrap;">Microphone</label>
+      <select id="mic-sel" class="select" style="height: 32px; font-size: 13px;"><option>AirPods Pro (mặc định)</option><option>MacBook Pro Microphone</option></select>
+      <button class="btn btn-ghost btn-icon btn-sm" type="button" aria-label="Làm mới danh sách mic"><svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 14px; height: 14px;"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg></button>
+    </div>
+  </div>
+</label>
+      <label style="display: flex; align-items: flex-start; gap: 14px; padding: 14px 16px; border: 1.5px solid #E1E4E8; border-radius: 10px; background: #FFFFFF; cursor: pointer;">
+  <input type="radio" name="source" value="Chỉ hệ thống" style="width: 18px; height: 18px; accent-color: #0F766E; margin: 3px 0 0;">
+  <div style="display: flex; flex-direction: column; gap: 4px; flex-grow: 1; min-width: 0;">
+    <div style="display: flex; align-items: center; gap: 8px; font-size: 15px; font-weight: 600;"><span style="display: inline-flex; gap: 2px;"><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#3C4551" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 18px; height: 18px;"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg></span><span>Chỉ hệ thống</span></div>
+    <div class="help">Chỉ âm thanh phát ra từ máy. Giọng bạn không được ghi.</div>
+    
+  </div>
+</label>
+      <label style="display: flex; align-items: flex-start; gap: 14px; padding: 14px 16px; border: 1.5px solid #E1E4E8; border-radius: 10px; background: #FFFFFF; cursor: pointer;">
+  <input type="radio" name="source" value="Chỉ mic" style="width: 18px; height: 18px; accent-color: #0F766E; margin: 3px 0 0;">
+  <div style="display: flex; flex-direction: column; gap: 4px; flex-grow: 1; min-width: 0;">
+    <div style="display: flex; align-items: center; gap: 8px; font-size: 15px; font-weight: 600;"><span style="display: inline-flex; gap: 2px;"><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#3C4551" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 18px; height: 18px;"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/></svg></span><span>Chỉ mic</span></div>
+    <div class="help">Chỉ microphone. Dùng khi họp trực tiếp trong phòng.</div>
+    
+  </div>
+</label>
+    </div>
+    <div class="field">
+      <label class="label" for="live-tag">Tag <span class="help" style="font-weight: 400;">(tuỳ chọn)</span> <span class="tip"><svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 14px; height: 14px;"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></span></label>
+      <div style="display: flex; align-items: center; gap: 6px; flex-wrap: wrap; min-height: 36px; padding: 4px 6px; border: 1px solid #CFD4DA; border-radius: 8px; background: #FFFFFF;">
+        <button class="chip chip-on" type="button" aria-label="Bỏ tag KH-ABC">KH-ABC <svg aria-hidden="true" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 12px; height: 12px;"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+        <button class="chip chip-on" type="button" aria-label="Bỏ tag sprint-12">sprint-12 <svg aria-hidden="true" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 12px; height: 12px;"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+        <input id="live-tag" class="input" type="text" placeholder="Gõ để tìm hoặc thêm tag…" style="border: 0; height: 28px; width: 220px; padding: 0 6px; background: transparent;">
+      </div>
+      <div style="display: flex; align-items: center; gap: 6px; flex-wrap: wrap;">
+        <span class="help">Gần đây:</span>
+        <button class="chip chip-sm" type="button">KH-XYZ</button>
+        <button class="chip chip-sm" type="button">sales</button>
+        <button class="chip chip-sm" type="button">nội bộ</button>
+        <button class="chip chip-sm" type="button">demo</button>
+      </div>
+      <div class="help">Phiên sẽ vào đúng bộ lọc ngay khi lưu; sửa tag sau ở Trang chủ hoặc Transcript detail.</div>
+    </div>
+    <div style="display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px;">
+      <div class="field">
+        <label class="label" for="lang-sel">Ngôn ngữ transcribe <span class="tip"><svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 14px; height: 14px;"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></span></label>
+        <select id="lang-sel" class="select"><option>Tự nhận diện (auto)</option><option>日本語</option><option>Tiếng Việt</option><option>English</option></select>
+        <div class="help">Auto cho phép “Nhận diện lại” khi buổi họp đổi ngôn ngữ.</div>
+      </div>
+      <div class="field">
+        <label class="label" for="target-sel">Dịch sang <span class="tip"><svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 14px; height: 14px;"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></span></label>
+        <select id="target-sel" class="select"><option>Tiếng Việt</option><option>English</option><option>日本語</option><option>Không dịch</option></select>
+        <div class="help">Bản dịch chỉ hiển thị trong Live, không lưu vào phiên.</div>
+      </div>
+    </div>
+    <div style="display: flex; align-items: flex-start; gap: 10px; padding: 12px 14px; border-radius: 10px; background: #F6F6F2; color: #3C4551; font-size: 13px;">
+      <svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#0F766E" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 16px; height: 16px;"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg><span>macOS sẽ hỏi quyền <strong>System Audio Recording</strong> và <strong>Micro</strong> lần đầu. trans-kun không bao giờ xin quyền Screen Recording. Âm thanh app tự phát (đọc bản dịch) không bị thu lại.</span>
+    </div>
+    <div style="display: flex; align-items: center; justify-content: space-between; padding-top: 6px; border-top: 1px solid #EDEFF1;">
+      <span class="help">Phím tắt: <span class="kbd">⌘</span> <span class="kbd">⇧</span> <span class="kbd">L</span> bắt đầu / dừng</span>
+      <a class="btn btn-primary btn-lg" href="Live.dc.html"><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 18px; height: 18px;"><circle cx="12" cy="12" r="2"/><path d="M16.24 7.76a6 6 0 0 1 0 8.49m-8.48-.01a6 6 0 0 1 0-8.49m11.31-2.82a10 10 0 0 1 0 14.14m-14.14 0a10 10 0 0 1 0-14.14"/></svg><span>Bắt đầu ghi</span></a>
+    </div>
+  </div>
+</div>
+</main>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview": {"width": 1280, "height": 920}}'>
+class Component extends DCLogic {
+renderVals() {
+return {};
+}
+}
+</script>
+</body>
+</html>

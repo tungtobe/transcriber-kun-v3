@@ -1,0 +1,251 @@
+<!doctype html>
+<html data-theme="dark" lang="vi">
+<head>
+<meta charset="utf-8">
+<title>Transcript detail (dark)</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0;font-family:"IBM Plex Sans",-apple-system,"Segoe UI","Hiragino Sans","Yu Gothic UI",sans-serif;background:#141517;color:#ECEDEF;-webkit-font-smoothing:antialiased;font-size:14px;line-height:1.5}
+a{color:#2DD4BF}a:hover{color:#5EEAD4}
+*{box-sizing:border-box}
+.mono{font-family:"IBM Plex Mono",ui-monospace,Menlo,monospace;font-variant-numeric:tabular-nums}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;height:36px;padding:0 14px;border-radius:8px;font:inherit;font-size:14px;font-weight:500;cursor:pointer;border:1px solid transparent;text-decoration:none;white-space:nowrap;transition:background-color 150ms ease,color 150ms ease,border-color 150ms ease}
+.btn-primary{background:#0F766E;color:#FFFFFF}.btn-primary:hover{background:#0F766E;color:#FFFFFF}
+.btn-secondary{background:#1F2024;color:#ECEDEF;border-color:#3C3F47}.btn-secondary:hover{background:#26282D;color:#ECEDEF}
+.btn-ghost{background:transparent;color:#C2C7CF}.btn-ghost:hover{background:#2A2B30;color:#ECEDEF}
+.btn-danger{background:#F87171;color:#FFFFFF}.btn-danger:hover{background:#FCA5A5;color:#FFFFFF}
+.btn-danger-soft{background:#1F2024;color:#F87171;border-color:#5A3330}.btn-danger-soft:hover{background:#35201F;color:#F87171}
+.btn-lg{height:44px;padding:0 20px;font-size:15px;border-radius:10px}
+.btn-sm{height:30px;padding:0 10px;font-size:13px}
+.btn-icon{width:36px;padding:0}.btn-icon.btn-sm{width:30px}
+.btn[aria-disabled="true"]{opacity:.45;cursor:not-allowed}
+.btn:focus-visible,.input:focus-visible,.select:focus-visible,.seg-btn:focus-visible,.nav-item:focus-visible,.row:focus-visible,textarea:focus-visible{outline:2px solid #0F766E;outline-offset:2px}
+.input,.select{height:36px;padding:0 12px;border:1px solid #3C3F47;border-radius:8px;font:inherit;font-size:14px;background:#1F2024;color:#ECEDEF;width:100%}
+.select{appearance:none;-webkit-appearance:none;padding-right:32px;background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%235B6470' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><polyline points='6 9 12 15 18 9'/></svg>");background-repeat:no-repeat;background-position:right 10px center;cursor:pointer}
+textarea.input{height:auto;padding:10px 12px;resize:none;line-height:1.55}
+.label{font-size:13px;font-weight:600;color:#C2C7CF;display:flex;align-items:center;gap:6px}
+.help{font-size:12px;color:#A0A6B0;line-height:1.5}
+.card{background:#1F2024;border:1px solid #2E3036;border-radius:12px}
+.chip{display:inline-flex;align-items:center;gap:6px;height:26px;padding:0 10px;border-radius:999px;font-size:12px;font-weight:500;background:#2A2B30;color:#C2C7CF;border:1px solid transparent;cursor:pointer}
+.chip-on{background:#16302E;color:#5EEAD4;border-color:#2F5F5A}
+.badge{display:inline-flex;align-items:center;gap:4px;height:20px;padding:0 7px;border-radius:6px;font-size:11px;font-weight:600;letter-spacing:.02em;white-space:nowrap}
+.badge-memo{background:#12302D;color:#5EEAD4}
+.badge-audio{background:#1C2636;color:#7AA7F0}
+.badge-partial{background:#33291A;color:#F5B75C}
+.badge-recover{background:#262036;color:#C4A6F5}
+.badge-live{background:#35201F;color:#FCA5A5}
+.badge-file{background:#2A2B30;color:#C2C7CF}
+.badge-token{background:#2B2413;color:#F5B75C;border:1px solid #4A3A1F}
+.seg{display:grid;grid-template-columns:56px 1fr;gap:12px;padding:8px 12px;border-radius:8px;cursor:pointer;align-items:start}
+.seg:hover{background:#26282D}
+.seg-active{background:#16302E}
+.ts{font-family:"IBM Plex Mono",ui-monospace,Menlo,monospace;font-variant-numeric:tabular-nums;font-size:12px;color:#A0A6B0;padding-top:3px}
+.speaker{font-size:11px;font-weight:700;color:#2DD4BF;margin-right:6px;letter-spacing:.03em}
+.seg-text{font-size:14px;line-height:1.55;color:#ECEDEF}
+.mark{background:#7A6019;border-radius:3px;padding:0 2px}
+.nav-item{display:flex;align-items:center;gap:10px;height:38px;padding:0 12px;border-radius:8px;font-size:14px;color:#C2C7CF;text-decoration:none;cursor:pointer;font-weight:500}
+.nav-item:hover{background:#2A2B30;color:#ECEDEF}
+.nav-item-active{background:#16302E;color:#5EEAD4;font-weight:600}.nav-item-active:hover{background:#16302E;color:#5EEAD4}
+.row{display:grid;grid-template-columns:minmax(0,1fr) 120px 88px 84px 300px 36px;gap:12px;align-items:center;height:48px;padding:0 12px;border-top:1px solid #26282D;cursor:pointer;text-decoration:none;color:#ECEDEF}
+.row:hover{background:#1F2024}
+.th{display:grid;grid-template-columns:minmax(0,1fr) 120px 88px 84px 300px 36px;gap:12px;align-items:center;height:36px;padding:0 12px;font-size:12px;font-weight:600;color:#A0A6B0;text-transform:uppercase;letter-spacing:.04em}
+.chip-sm{height:22px;padding:0 8px;font-size:11px}
+.seg-btn{height:30px;padding:0 12px;border:0;background:transparent;border-radius:6px;font:inherit;font-size:13px;font-weight:500;color:#C2C7CF;cursor:pointer}
+.seg-btn-on{background:#1F2024;color:#5EEAD4;font-weight:600;box-shadow:0 1px 2px rgba(17,24,39,.08)}
+.segmented{display:inline-flex;gap:2px;padding:3px;background:#2A2B30;border-radius:8px}
+.status{display:inline-flex;align-items:center;gap:8px;height:30px;padding:0 10px;border-radius:999px;font-size:13px;font-weight:600}
+.status-rec{background:#35201F;color:#FCA5A5}
+.status-ok{background:#12302D;color:#5EEAD4}
+.status-warn{background:#33291A;color:#F5B75C}
+.status-off{background:#2A2B30;color:#C2C7CF}
+.dot{width:8px;height:8px;border-radius:50%;background:currentColor;flex:none}
+.dot-pulse{animation:pulse 1.4s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+@media (prefers-reduced-motion: reduce){.dot-pulse{animation:none}}
+.tip{display:inline-flex;color:#A0A6B0;cursor:help}
+.field{display:flex;flex-direction:column;gap:6px}
+.kbd{font-family:"IBM Plex Mono",ui-monospace,Menlo,monospace;font-size:11px;padding:1px 6px;border:1px solid #3C3F47;border-bottom-width:2px;border-radius:5px;background:#1F2024;color:#C2C7CF}
+.h1{font-size:22px;font-weight:600;letter-spacing:-.01em;margin:0}
+.h2{font-size:16px;font-weight:600;margin:0}
+.muted{color:#A0A6B0}
+.caret{display:inline-block;width:2px;height:16px;background:#0F766E;vertical-align:-3px;margin-left:2px;animation:pulse 1s steps(2) infinite}
+.md h3{font-size:14px;margin:14px 0 6px;font-weight:600}
+.md p,.md li{font-size:13px;line-height:1.6;margin:0 0 4px}
+.md ul{padding-left:18px;margin:0}
+.sw{width:40px;height:40px;border-radius:8px;border:1px solid rgba(0,0,0,.08)}
+</style>
+</helmet>
+<div style="width: 1280px; height: 860px; display: flex; flex-direction: row; background: #141517; overflow: hidden;">
+
+<aside style="width: 260px; flex: none; display: flex; flex-direction: column; gap: 6px; padding: 16px 12px; background: #1A1B1E; border-right: 1px solid #2E3036; height: 100%;">
+  <div style="display: flex; align-items: center; gap: 10px; padding: 4px 8px 14px;">
+    <div style="width: 30px; height: 30px; border-radius: 8px; background: #0F766E; display: flex; align-items: center; justify-content: center;"><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 18px; height: 18px;"><path d="M2 12h2l2-5 3 10 3-14 3 14 3-10 2 5h2"/></svg></div>
+    <div style="font-size: 16px; font-weight: 700; letter-spacing: -.01em;">trans-kun</div>
+  </div>
+  <a class="nav-item nav-item-active" href="Home.dc.html" aria-current="page"><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 18px; height: 18px;"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg><span>Trang chủ</span></a>
+  <a class="nav-item" href="LiveSetup.dc.html"><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 18px; height: 18px;"><circle cx="12" cy="12" r="2"/><path d="M16.24 7.76a6 6 0 0 1 0 8.49m-8.48-.01a6 6 0 0 1 0-8.49m11.31-2.82a10 10 0 0 1 0 14.14m-14.14 0a10 10 0 0 1 0-14.14"/></svg><span>Live</span></a>
+  <a class="nav-item" href="Settings.dc.html"><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 18px; height: 18px;"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg><span>Cài đặt</span></a>
+  <div style="flex-grow: 1;"></div>
+  
+<div style="display: flex; flex-direction: column; gap: 8px; padding: 12px; border-radius: 10px; background: #1F2024; border: 1px solid #2E3036;">
+  <div style="display: flex; align-items: center; gap: 8px; font-size: 12px; font-weight: 600; color: #F5B75C;"><svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 14px; height: 14px;"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg><span>1 job đang chạy</span></div>
+  <div style="font-size: 13px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">zoom-recording-0912.mp4</div>
+  <div style="height: 6px; border-radius: 3px; background: #2A2B30; overflow: hidden;"><div style="width: 36%; height: 100%; background: #0F766E;"></div></div>
+  <div style="display: flex; justify-content: space-between; font-size: 12px; color: #A0A6B0;"><span class="mono">32 / 90 phút</span><a href="Transcript.dc.html" style="font-weight: 600; text-decoration: none;">Mở</a></div>
+</div>
+  
+<div style="display: flex; flex-direction: column; gap: 6px;">
+  <div style="display: flex; align-items: center; justify-content: space-between; font-size: 11px; color: #A0A6B0;">
+    <span style="font-weight: 600; letter-spacing: .04em; text-transform: uppercase;">Sponsored</span>
+    <button class="tip" type="button" aria-label="Vì sao tôi thấy quảng cáo này" style="border: 0; background: transparent; padding: 0;"><svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 14px; height: 14px;"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></button>
+  </div>
+  <a href="https://relipasoft.com" target="_blank" rel="noopener" style="display: flex; flex-direction: column; gap: 0; border-radius: 10px; overflow: hidden; border: 1px solid #2E3036; background: #1F2024; text-decoration: none; color: #ECEDEF;">
+    <div style="height: 64px; background: #16302E; display: flex; align-items: center; justify-content: center; color: #5EEAD4;"><svg aria-hidden="true" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#5EEAD4" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 22px; height: 22px;"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg></div>
+    <div style="padding: 8px 10px; display: flex; flex-direction: column; gap: 2px;">
+      <div style="font-size: 12px; font-weight: 600; line-height: 1.3;">Relipa — đối tác offshore Nhật–Việt</div>
+      <div style="font-size: 11px; color: #A0A6B0;">relipasoft.com</div>
+    </div>
+  </a>
+  <a href="mailto:ads@transkun.app?subject=Report%20creative%20house-relipa-01" style="font-size: 11px; color: #A0A6B0; text-decoration: none; display: inline-flex; align-items: center; gap: 4px;"><svg aria-hidden="true" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 12px; height: 12px;"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><line x1="4" y1="22" x2="4" y2="15"/></svg><span>Báo cáo quảng cáo</span></a>
+</div>
+</aside>
+<main style="flex-grow: 1; min-width: 0; height: 100%; display: flex; flex-direction: column; overflow: hidden;">
+
+<div style="display: flex; align-items: center; gap: 12px; height: 64px; padding: 0 20px; border-bottom: 1px solid #2E3036; background: #1F2024; flex: none;">
+  <a class="btn btn-ghost btn-icon" href="Home.dc.html" aria-label="Về trang chủ"><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 18px; height: 18px;"><polyline points="15 18 9 12 15 6"/></svg></a>
+  <div style="display: flex; flex-direction: column; gap: 2px; min-width: 0; flex-grow: 1;">
+    <div style="display: flex; align-items: center; gap: 8px; min-width: 0;">
+      <h1 class="h1" style="font-size: 18px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">Họp KH-ABC — review admin UI</h1>
+      <button class="btn btn-ghost btn-icon btn-sm" type="button" aria-label="Đổi tên"><svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 14px; height: 14px;"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg></button>
+    </div>
+    <div style="display: flex; align-items: center; gap: 6px; font-size: 12px; color: #A0A6B0;">
+      <span class="badge badge-live">LIVE</span><span class="mono">18/09/2026 14:00 · 1:02:10 · 412 segment</span>
+      <span>·</span><button class="chip" type="button" style="height: 22px;">KH-ABC</button><button class="chip" type="button" style="height: 22px;">sprint-12</button><button class="chip" type="button" style="height: 22px; border-style: dashed; border-color: #3C3F47; background: transparent;">+ Tag</button>
+    </div>
+  </div>
+  <div style="position: relative; width: 240px; display: flex;">
+    <span style="position: absolute; left: 10px; top: 9px; color: #A0A6B0;"><svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 16px; height: 16px;"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg></span>
+    <input class="input" type="search" value="CSV" aria-label="Tìm trong transcript" style="padding-left: 34px; padding-right: 96px;">
+    <div style="position: absolute; right: 3px; top: 3px; display: flex; align-items: center; gap: 2px;">
+      <span class="mono" style="font-size: 12px; color: #A0A6B0; padding: 0 4px;">2/3</span>
+      <button class="btn btn-ghost btn-icon btn-sm" type="button" aria-label="Kết quả trước"><svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 14px; height: 14px;"><polyline points="18 15 12 9 6 15"/></svg></button>
+      <button class="btn btn-ghost btn-icon btn-sm" type="button" aria-label="Kết quả sau"><svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 14px; height: 14px;"><polyline points="6 9 12 15 18 9"/></svg></button>
+    </div>
+  </div>
+  <button class="btn btn-secondary" type="button"><svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 16px; height: 16px;"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg><span>Export</span><svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 14px; height: 14px;"><polyline points="6 9 12 15 18 9"/></svg></button>
+  <button class="btn btn-secondary btn-icon" type="button" aria-label="Copy toàn bộ transcript"><svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 16px; height: 16px;"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>
+  <button class="btn btn-ghost btn-icon" type="button" aria-label="Thao tác khác"><svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 16px; height: 16px;"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></svg></button>
+</div>
+
+<div style="display: flex; align-items: center; gap: 14px; height: 56px; padding: 0 20px; background: #1F2024; border-bottom: 1px solid #2E3036; flex: none;">
+  <button class="btn btn-primary btn-icon" type="button" aria-label="Tạm dừng" style="border-radius: 50%; width: 40px; height: 40px;"><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 18px; height: 18px;"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg></button>
+  <span class="mono" style="font-size: 13px; color: #C2C7CF; width: 132px;">00:42:15 / 01:02:10</span>
+  <div style="flex-grow: 1; position: relative; height: 24px; display: flex; align-items: center; cursor: pointer;" role="slider" aria-label="Vị trí phát" aria-valuemin="0" aria-valuemax="3730" aria-valuenow="2535" tabindex="0">
+    <div style="width: 100%; height: 4px; border-radius: 2px; background: #2E3036; overflow: hidden;"><div style="width: 68%; height: 100%; background: #0F766E;"></div></div>
+    <div style="position: absolute; left: 68%; top: 5px; width: 14px; height: 14px; margin-left: -7px; border-radius: 50%; background: #1F2024; border: 2px solid #0F766E;"></div>
+  </div>
+  <button class="btn btn-ghost btn-sm mono" type="button">1.0×</button>
+  <button class="btn btn-ghost btn-icon btn-sm" type="button" aria-label="Âm lượng"><svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 16px; height: 16px;"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg></button>
+</div>
+
+<div style="display: flex; align-items: center; gap: 12px; padding: 10px 20px; background: #33291A; border-bottom: 1px solid #4A3A1F; color: #F5B75C; font-size: 13px; flex: none;">
+  <svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#F5B75C" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 16px; height: 16px;"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+  <span style="flex-grow: 1;"><strong>Bản Transcribe lại chưa hoàn chỉnh</strong> — thiếu 1 khoảng: <span class="mono">45:00–50:00</span>. Bản live vẫn được giữ nguyên.</span>
+  <button class="btn btn-secondary btn-sm" type="button">Chạy lại phần thiếu</button>
+  <button class="btn btn-ghost btn-sm" type="button">Chạy lại toàn bộ</button>
+</div>
+
+<div style="flex-grow: 1; display: flex; min-height: 0;">
+  <section style="flex-grow: 1; min-width: 0; display: flex; flex-direction: column; border-right: 1px solid #2E3036; background: #1F2024;">
+    <div style="display: flex; align-items: center; gap: 12px; height: 44px; padding: 0 12px 0 20px; border-bottom: 1px solid #26282D; flex: none;">
+      <div class="segmented" role="group" aria-label="Chọn bản transcript">
+        <button class="seg-btn" type="button">Bản live</button>
+        <button class="seg-btn" type="button">Transcribe lại</button>
+        <button class="seg-btn seg-btn-on" type="button" aria-pressed="true">Cạnh nhau</button>
+      </div>
+      <span class="help">Click segment ở cột nào cũng seek trình phát · export lấy bản đang chọn</span>
+      <span style="flex-grow: 1;"></span>
+      <span class="help mono">offset +0.0 s</span>
+    </div>
+    <div style="display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); flex-grow: 1; min-height: 0;">
+      <div style="display: flex; flex-direction: column; gap: 2px; padding: 8px; border-right: 1px solid #26282D; overflow: hidden;">
+        <div style="display: flex; align-items: center; gap: 8px; padding: 4px 12px 8px; font-size: 12px; font-weight: 600; color: #A0A6B0; text-transform: uppercase; letter-spacing: .04em;"><svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 14px; height: 14px;"><circle cx="12" cy="12" r="2"/><path d="M16.24 7.76a6 6 0 0 1 0 8.49m-8.48-.01a6 6 0 0 1 0-8.49m11.31-2.82a10 10 0 0 1 0 14.14m-14.14 0a10 10 0 0 1 0-14.14"/></svg><span>Bản live</span></div>
+        <a class="seg" href="#t004152" style="text-decoration: none;"><span class="ts">00:41:52</span><span class="seg-text">管理画面のユーザー一覧ですが、<span class="mark">CSV</span>エクスポートは初期リリースに含めますか。</span></a>
+        <a class="seg" href="#t004203" style="text-decoration: none;"><span class="ts">00:42:03</span><span class="seg-text">はい、含めます。ただしフィルタ条件を保持したままエクスポートしたいです。</span></a>
+        <a class="seg seg-active" href="#t004215" style="text-decoration: none;"><span class="ts">00:42:15</span><span class="seg-text">承知しました。フィルタはサーバー側で適用してから<span class="mark">CSV</span>を生成します。</span></a>
+        <a class="seg" href="#t004231" style="text-decoration: none;"><span class="ts">00:42:31</span><span class="seg-text">権限のところ、閲覧のみのロールでもエクスポートできてしまうと困ります。</span></a>
+        <a class="seg" href="#t004244" style="text-decoration: none;"><span class="ts">00:42:44</span><span class="seg-text">エクスポートは編集権限以上に限定します。仕様書に追記します。</span></a>
+        <div style="display: flex; align-items: center; gap: 10px; padding: 8px 12px; margin: 4px 0; border-radius: 8px; background: #2A2B30; color: #C2C7CF; font-size: 12px; font-weight: 600;"><svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 14px; height: 14px;"><line x1="1" y1="1" x2="23" y2="23"/><path d="M16.72 11.06A10.94 10.94 0 0 1 19 12.55"/><path d="M5 12.55a10.94 10.94 0 0 1 5.17-2.39"/><path d="M10.71 5.05A16 16 0 0 1 22.58 9"/><path d="M1.42 9a15.91 15.91 0 0 1 4.7-2.88"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><line x1="12" y1="20" x2="12.01" y2="20"/></svg><span>Mất kết nối 45:02–48:10 (đã ghi âm, xem bản Transcribe lại)</span></div>
+      </div>
+      <div style="display: flex; flex-direction: column; gap: 2px; padding: 8px; overflow: hidden;">
+        <div style="display: flex; align-items: center; gap: 8px; padding: 4px 12px 8px; font-size: 12px; font-weight: 600; color: #A0A6B0; text-transform: uppercase; letter-spacing: .04em;"><svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 14px; height: 14px;"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z"/><path d="M19 16l.8 2.2L22 19l-2.2.8L19 22l-.8-2.2L16 19l2.2-.8z"/></svg><span>Transcribe lại</span><span class="badge badge-partial">Partial</span></div>
+        <a class="seg" href="#t004152" style="text-decoration: none;"><span class="ts">00:41:52</span><span class="seg-text">管理画面のユーザー一覧ですが、<span class="mark">CSV</span>エクスポートは初期リリースに含めますか。</span></a>
+        <a class="seg" href="#t004203" style="text-decoration: none;"><span class="ts">00:42:03</span><span class="seg-text">はい、含めます。ただしフィルタ条件を保持したままエクスポートしたいです。</span></a>
+        <a class="seg seg-active" href="#t004215" style="text-decoration: none;"><span class="ts">00:42:15</span><span class="seg-text">承知しました。フィルタはサーバー側で適用してから<span class="mark">CSV</span>を生成します。</span></a>
+        <a class="seg" href="#t004231" style="text-decoration: none;"><span class="ts">00:42:31</span><span class="seg-text">権限のところ、閲覧のみのロールでもエクスポートできてしまうと困ります。</span></a>
+        <a class="seg" href="#t004244" style="text-decoration: none;"><span class="ts">00:42:44</span><span class="seg-text">エクスポートは編集権限以上に限定します。仕様書に追記します。</span></a>
+        <div style="display: flex; align-items: center; gap: 10px; padding: 8px 12px; margin: 4px 0; border-radius: 8px; background: #33291A; color: #F5B75C; font-size: 12px; font-weight: 600;">
+  <svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#F5B75C" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 14px; height: 14px;"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg><span>Thiếu 45:00–50:00</span><span style="flex-grow: 1;"></span><button class="btn btn-secondary btn-sm" type="button" style="height: 26px;">Chạy lại khoảng này</button>
+</div>
+      </div>
+    </div>
+  </section>
+
+  <aside style="width: 360px; flex: none; display: flex; flex-direction: column; background: #1A1B1E;">
+    <div style="display: flex; align-items: center; gap: 2px; height: 44px; padding: 6px 12px; border-bottom: 1px solid #2E3036; flex: none;">
+      <div class="segmented" role="tablist" aria-label="Panel phụ">
+        <button class="seg-btn seg-btn-on" role="tab" type="button" aria-selected="true">Memo</button>
+        <button class="seg-btn" role="tab" type="button" aria-selected="false">Ghi chú</button>
+      </div>
+    </div>
+    <div style="display: flex; flex-direction: column; gap: 10px; padding: 12px; border-bottom: 1px solid #2E3036; flex: none;">
+      <div style="display: flex; gap: 8px;">
+        <select class="select" aria-label="Template memo" style="flex-grow: 1;"><option>議事録 (mặc định)</option><option>Biên bản họp sales</option><option>Action items</option></select>
+        <button class="btn btn-primary" type="button"><svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 16px; height: 16px;"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z"/><path d="M19 16l.8 2.2L22 19l-2.2.8L19 22l-.8-2.2L16 19l2.2-.8z"/></svg><span>Sinh lại</span></button>
+      </div>
+      <div style="display: flex; align-items: center; gap: 8px;">
+        <span class="badge badge-token"><svg aria-hidden="true" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#F5B75C" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 11px; height: 11px;"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg> Tốn token Gemini</span>
+        <span class="help">Sinh từ bản live + ghi chú · 14:05</span>
+      </div>
+    </div>
+    <div class="md" style="flex-grow: 1; padding: 14px 16px; overflow: hidden; font-size: 13px;">
+      <h3 style="margin-top: 0;">議事録 — Review admin UI (18/09)</h3>
+      <p><strong>Tham dự:</strong> 田中さん (KH-ABC), Linh (Relipa)</p>
+      <h3>Quyết định</h3>
+      <ul>
+        <li>Xuất CSV nằm trong bản phát hành đầu, giữ nguyên điều kiện lọc.</li>
+        <li>Chỉ role chỉnh sửa trở lên mới được xuất.</li>
+      </ul>
+      <h3>Action items</h3>
+      <ul>
+        <li>Linh — bổ sung điều kiện phân quyền export vào spec (hạn 20/09).</li>
+        <li>田中 — xác nhận danh sách cột CSV.</li>
+      </ul>
+      <h3>Ghi chú của bạn</h3>
+      <p class="muted">“Hỏi lại về giới hạn 10k dòng khi export.”</p>
+    </div>
+    <div style="display: flex; gap: 8px; padding: 12px; border-top: 1px solid #2E3036; flex: none;">
+      <button class="btn btn-secondary btn-sm" type="button"><svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 14px; height: 14px;"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><span>Copy</span></button>
+      <button class="btn btn-secondary btn-sm" type="button"><svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 14px; height: 14px;"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg><span>Tải .md</span></button>
+      <span style="flex-grow: 1;"></span>
+      <button class="btn btn-ghost btn-sm" type="button"><svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 14px; height: 14px;"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg><span>Transcribe lại</span></button>
+    </div>
+  </aside>
+</div>
+</main>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview": {"width": 1280, "height": 860}}'>
+class Component extends DCLogic {
+renderVals() {
+return {};
+}
+}
+</script>
+</body>
+</html>

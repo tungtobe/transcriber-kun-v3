@@ -1,0 +1,112 @@
+# STATUS DEFINITIONS:
+# ==================
+# Epic Status:
+#   - backlog: Epic not yet started
+#   - in-progress: Epic actively being worked on
+#   - done: All stories in epic completed
+
+# Story Status:
+#   - backlog: Story only exists in epic file
+#   - ready-for-dev: Story file created, ready for development
+#   - in-progress: Developer actively working on implementation
+#   - review: Implementation complete, ready for review
+#   - done: Story completed
+
+# Retrospective Status:
+#   - optional: Can be completed but not required
+#   - done: Retrospective has been completed
+
+# Action Item Status:
+#   - open: Committed during a retrospective, not yet addressed
+#   - in-progress: Actively being worked on
+#   - done: Completed
+
+# WORKFLOW NOTES:
+# ===============
+# - Epic transitions to 'in-progress' automatically when its first story starts (via build's sprint sync)
+# - Stories can be worked in parallel if team capacity allows
+# - Developer typically creates the next story after the previous one is 'done' to incorporate learnings
+# - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
+# - Retrospective appends its action items to action_items; the status view surfaces open ones
+generated: 09-22-2026 06:12
+last_updated: 09-22-2026 06:12
+project: transcriber_kun
+project_key: NOKEY
+tracking_system: file-system
+story_location: _bmad-output/implementation-artifacts
+development_status:
+  epic-1: backlog
+  1-1-dựng-repo-greenfield-ci-hai-os-và-binding-ipc-typed: backlog
+  1-2-nền-lưu-trữ-lỗi-có-category-và-log-content-free: backlog
+  1-3-token-thị-giác-theme-sáng-tối-và-app-shell: backlog
+  1-4-i18n-vi-en-ja-và-onboarding-chọn-ngôn-ngữ: backlog
+  1-5-onboarding-consent: backlog
+  1-6-kho-khoá-os-và-key-pool: backlog
+  1-7-cổng-gemini-duy-nhất-và-liệt-kê-model: backlog
+  1-8-onboarding-nhập-key-và-home-khởi-đầu-khi-chưa-có-key: backlog
+  1-9-settings-khung-chung-và-gemini: backlog
+  1-10-settings-chẩn-đoán-và-giới-thiệu-quyền-riêng-tư: backlog
+  1-11-bản-beta-macos-lên-testflight-for-mac-spike-s5: backlog
+  1-12-bản-beta-windows-msix-qua-store-package-flight-spike-s6: backlog
+  epic-1-retrospective: optional
+
+  epic-2: backlog
+  2-1-media-pipeline-thuần-rust-và-kiểm-chứng-phát-flac-spike-s1-s: backlog
+  2-2-gemini-transcribe-adapter-theo-họ-model-và-parser-chịu-lỗi-s: backlog
+  2-3-lưu-phiên-và-transcript-bền-vững: backlog
+  2-4-job-transcribe-file-hàng-đợi-tiến-độ-và-huỷ: backlog
+  2-5-chịu-lỗi-chunk-khoảng-thiếu-và-chạy-lại: backlog
+  2-6-settings-chunking-offset-và-ngôn-ngữ-transcribe: backlog
+  2-7-transcript-detail-hiển-thị-trình-phát-và-click-to-seek: backlog
+  2-8-nhận-file-dialog-kéo-thả-kiểm-tra-định-dạng-phát-hiện-trùng: backlog
+  2-9-home-danh-sách-phiên-và-card-job: backlog
+  2-10-tìm-trong-transcript-export-và-copy: backlog
+  epic-2-retrospective: optional
+
+  epic-3: backlog
+  3-1-đổi-tên-và-xoá-phiên: backlog
+  3-2-tag-gắn-lọc-và-quản-lý: backlog
+  3-3-tìm-phiên-theo-tên-kết-hợp-lọc-tag: backlog
+  3-4-settings-lưu-trữ-trong-container: backlog
+  3-5-ghi-chú-tự-lưu: backlog
+  3-6-template-memo-quản-lý-trong-settings: backlog
+  3-7-sinh-cache-và-sinh-lại-memo: backlog
+  epic-3-retrospective: optional
+
+  epic-4: backlog
+  4-1-nền-capture-audio-nguồn-mic-trộn-và-gate-mềm: backlog
+  4-2-capture-âm-thanh-hệ-thống-trên-macos-core-audio-tap-spike-s4: backlog
+  4-3-capture-âm-thanh-hệ-thống-trên-windows-wasapi-loopback-kép: backlog
+  4-4-gemini-live-transport-websocket-resumption-và-reconnect-spik: backlog
+  4-5-recording-bền-và-tạo-phiên-live-khi-mở-capture: backlog
+  4-6-livesession-transcript-realtime-và-trạng-thái: backlog
+  4-7-màn-live-bắt-đầu-và-đang-ghi: backlog
+  4-8-live-mất-kết-nối-lỗi-setup-và-trạng-thái-lỗi-trên-giao-diện: backlog
+  4-9-dừng-live-và-lưu-phiên: backlog
+  4-10-boot-và-đóng-cửa-sổ-phục-hồi-phiên-mồ-côi-chặn-thoát: backlog
+  4-11-transcribe-lại-từ-recording-và-xem-cạnh-bản-live: backlog
+  4-12-tải-recording-wav-hoặc-flac: backlog
+  epic-4-retrospective: optional
+
+  epic-5: backlog
+  5-1-dịch-realtime-song-song-và-đổi-target-giữa-phiên: backlog
+  5-2-nhận-diện-lại-ngôn-ngữ: backlog
+  5-3-đọc-bản-dịch-tts-trong-tiến-trình-app: backlog
+  5-4-ducking-volume-hệ-thống: backlog
+  epic-5-retrospective: optional
+
+  epic-6: backlog
+  6-1-module-remote-tải-xác-minh-chữ-ký-cache-fallback: backlog
+  6-2-đồng-bộ-cấu-hình-đề-xuất: backlog
+  6-3-pipeline-creative-chọn-xoay-giới-hạn-và-cờ-tắt-quảng-cáo: backlog
+  6-4-ad-slot-ở-sidebar-và-tuân-thủ-store: backlog
+  6-5-công-cụ-ký-xuất-bản-nội-dung-từ-xa-và-smoke-test-hằng-tuần: backlog
+  epic-6-retrospective: optional
+
+  epic-7: backlog
+  7-1-build-store-mac-hoàn-chỉnh-và-kiểm-chứng-sandbox-thật: backlog
+  7-2-build-store-win-hoàn-chỉnh-và-kiểm-chứng-msix: backlog
+  7-3-hồ-sơ-submit-và-tài-liệu-quyền-riêng-tư: backlog
+  7-4-kiểm-chứng-nfr-tiếp-cận-và-các-luồng-chính-trên-máy-sạch: backlog
+  7-5-submit-xử-lý-review-và-ra-mắt: backlog
+  epic-7-retrospective: optional

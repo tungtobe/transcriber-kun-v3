@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<title>Live — đang lưu phiên</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0;font-family:"IBM Plex Sans",-apple-system,"Segoe UI","Hiragino Sans","Yu Gothic UI",sans-serif;background:#F6F6F2;color:#171A1F;-webkit-font-smoothing:antialiased;font-size:14px;line-height:1.5}
+a{color:#0F766E}a:hover{color:#0B5D57}
+*{box-sizing:border-box}
+.mono{font-family:"IBM Plex Mono",ui-monospace,Menlo,monospace;font-variant-numeric:tabular-nums}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;height:36px;padding:0 14px;border-radius:8px;font:inherit;font-size:14px;font-weight:500;cursor:pointer;border:1px solid transparent;text-decoration:none;white-space:nowrap;transition:background-color 150ms ease,color 150ms ease,border-color 150ms ease}
+.btn-primary{background:#0F766E;color:#FFFFFF}.btn-primary:hover{background:#0B5D57;color:#FFFFFF}
+.btn-secondary{background:#FFFFFF;color:#171A1F;border-color:#CFD4DA}.btn-secondary:hover{background:#F1F2EE;color:#171A1F}
+.btn-ghost{background:transparent;color:#3C4551}.btn-ghost:hover{background:#ECEDE8;color:#171A1F}
+.btn-danger{background:#B42318;color:#FFFFFF}.btn-danger:hover{background:#8E1C13;color:#FFFFFF}
+.btn-danger-soft{background:#FFFFFF;color:#B42318;border-color:#F0B8B3}.btn-danger-soft:hover{background:#FDF1F0;color:#B42318}
+.btn-lg{height:44px;padding:0 20px;font-size:15px;border-radius:10px}
+.btn-sm{height:30px;padding:0 10px;font-size:13px}
+.btn-icon{width:36px;padding:0}.btn-icon.btn-sm{width:30px}
+.btn[aria-disabled="true"]{opacity:.45;cursor:not-allowed}
+.btn:focus-visible,.input:focus-visible,.select:focus-visible,.seg-btn:focus-visible,.nav-item:focus-visible,.row:focus-visible,textarea:focus-visible{outline:2px solid #0F766E;outline-offset:2px}
+.input,.select{height:36px;padding:0 12px;border:1px solid #CFD4DA;border-radius:8px;font:inherit;font-size:14px;background:#FFFFFF;color:#171A1F;width:100%}
+.select{appearance:none;-webkit-appearance:none;padding-right:32px;background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%235B6470' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><polyline points='6 9 12 15 18 9'/></svg>");background-repeat:no-repeat;background-position:right 10px center;cursor:pointer}
+textarea.input{height:auto;padding:10px 12px;resize:none;line-height:1.55}
+.label{font-size:13px;font-weight:600;color:#3C4551;display:flex;align-items:center;gap:6px}
+.help{font-size:12px;color:#5B6470;line-height:1.5}
+.card{background:#FFFFFF;border:1px solid #E1E4E8;border-radius:12px}
+.chip{display:inline-flex;align-items:center;gap:6px;height:26px;padding:0 10px;border-radius:999px;font-size:12px;font-weight:500;background:#ECEDE8;color:#3C4551;border:1px solid transparent;cursor:pointer}
+.chip-on{background:#E6F3F1;color:#0B5D57;border-color:#B7DDD8}
+.badge{display:inline-flex;align-items:center;gap:4px;height:20px;padding:0 7px;border-radius:6px;font-size:11px;font-weight:600;letter-spacing:.02em;white-space:nowrap}
+.badge-memo{background:#E0F2F1;color:#0B5D57}
+.badge-audio{background:#E8EEF7;color:#1E4E9B}
+.badge-partial{background:#FDF0DC;color:#8A4B0A}
+.badge-recover{background:#F0EAFB;color:#5B2FA3}
+.badge-live{background:#FDE8E8;color:#A11E1E}
+.badge-file{background:#ECEDE8;color:#3C4551}
+.badge-token{background:#FFF7E6;color:#8A4B0A;border:1px solid #F5D9A8}
+.seg{display:grid;grid-template-columns:56px 1fr;gap:12px;padding:8px 12px;border-radius:8px;cursor:pointer;align-items:start}
+.seg:hover{background:#F1F2EE}
+.seg-active{background:#E6F3F1}
+.ts{font-family:"IBM Plex Mono",ui-monospace,Menlo,monospace;font-variant-numeric:tabular-nums;font-size:12px;color:#5B6470;padding-top:3px}
+.speaker{font-size:11px;font-weight:700;color:#0F766E;margin-right:6px;letter-spacing:.03em}
+.seg-text{font-size:14px;line-height:1.55;color:#171A1F}
+.mark{background:#FDE68A;border-radius:3px;padding:0 2px}
+.nav-item{display:flex;align-items:center;gap:10px;height:38px;padding:0 12px;border-radius:8px;font-size:14px;color:#3C4551;text-decoration:none;cursor:pointer;font-weight:500}
+.nav-item:hover{background:#ECEDE8;color:#171A1F}
+.nav-item-active{background:#E6F3F1;color:#0B5D57;font-weight:600}.nav-item-active:hover{background:#E6F3F1;color:#0B5D57}
+.row{display:grid;grid-template-columns:minmax(0,1fr) 120px 88px 84px 300px 36px;gap:12px;align-items:center;height:48px;padding:0 12px;border-top:1px solid #EDEFF1;cursor:pointer;text-decoration:none;color:#171A1F}
+.row:hover{background:#F7F7F4}
+.th{display:grid;grid-template-columns:minmax(0,1fr) 120px 88px 84px 300px 36px;gap:12px;align-items:center;height:36px;padding:0 12px;font-size:12px;font-weight:600;color:#5B6470;text-transform:uppercase;letter-spacing:.04em}
+.chip-sm{height:22px;padding:0 8px;font-size:11px}
+.seg-btn{height:30px;padding:0 12px;border:0;background:transparent;border-radius:6px;font:inherit;font-size:13px;font-weight:500;color:#3C4551;cursor:pointer}
+.seg-btn-on{background:#FFFFFF;color:#0B5D57;font-weight:600;box-shadow:0 1px 2px rgba(17,24,39,.08)}
+.segmented{display:inline-flex;gap:2px;padding:3px;background:#ECEDE8;border-radius:8px}
+.status{display:inline-flex;align-items:center;gap:8px;height:30px;padding:0 10px;border-radius:999px;font-size:13px;font-weight:600}
+.status-rec{background:#FDE8E8;color:#A11E1E}
+.status-ok{background:#E0F2F1;color:#0B5D57}
+.status-warn{background:#FDF0DC;color:#8A4B0A}
+.status-off{background:#ECEDE8;color:#3C4551}
+.dot{width:8px;height:8px;border-radius:50%;background:currentColor;flex:none}
+.dot-pulse{animation:pulse 1.4s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+@media (prefers-reduced-motion: reduce){.dot-pulse{animation:none}}
+.tip{display:inline-flex;color:#8A919C;cursor:help}
+.field{display:flex;flex-direction:column;gap:6px}
+.kbd{font-family:"IBM Plex Mono",ui-monospace,Menlo,monospace;font-size:11px;padding:1px 6px;border:1px solid #CFD4DA;border-bottom-width:2px;border-radius:5px;background:#FFFFFF;color:#3C4551}
+.h1{font-size:22px;font-weight:600;letter-spacing:-.01em;margin:0}
+.h2{font-size:16px;font-weight:600;margin:0}
+.muted{color:#5B6470}
+.caret{display:inline-block;width:2px;height:16px;background:#0F766E;vertical-align:-3px;margin-left:2px;animation:pulse 1s steps(2) infinite}
+.md h3{font-size:14px;margin:14px 0 6px;font-weight:600}
+.md p,.md li{font-size:13px;line-height:1.6;margin:0 0 4px}
+.md ul{padding-left:18px;margin:0}
+.sw{width:40px;height:40px;border-radius:8px;border:1px solid rgba(0,0,0,.08)}
+</style>
+</helmet>
+<div style="position: relative; width: 1280px; height: 800px;"><div style="width: 1280px; height: 800px; display: flex; flex-direction: row; background: #F6F6F2; overflow: hidden;">
+
+<aside style="width: 260px; flex: none; display: flex; flex-direction: column; gap: 6px; padding: 16px 12px; background: #F0F0EB; border-right: 1px solid #E1E4E8; height: 100%;">
+  <div style="display: flex; align-items: center; gap: 10px; padding: 4px 8px 14px;">
+    <div style="width: 30px; height: 30px; border-radius: 8px; background: #0F766E; display: flex; align-items: center; justify-content: center;"><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 18px; height: 18px;"><path d="M2 12h2l2-5 3 10 3-14 3 14 3-10 2 5h2"/></svg></div>
+    <div style="font-size: 16px; font-weight: 700; letter-spacing: -.01em;">trans-kun</div>
+  </div>
+  <a class="nav-item" href="Home.dc.html"><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 18px; height: 18px;"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg><span>Trang chủ</span></a>
+  <a class="nav-item nav-item-active" href="LiveSetup.dc.html" aria-current="page"><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 18px; height: 18px;"><circle cx="12" cy="12" r="2"/><path d="M16.24 7.76a6 6 0 0 1 0 8.49m-8.48-.01a6 6 0 0 1 0-8.49m11.31-2.82a10 10 0 0 1 0 14.14m-14.14 0a10 10 0 0 1 0-14.14"/></svg><span>Live</span></a>
+  <a class="nav-item" href="Settings.dc.html"><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 18px; height: 18px;"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg><span>Cài đặt</span></a>
+  <div style="flex-grow: 1;"></div>
+  
+<div style="display: flex; flex-direction: column; gap: 8px; padding: 12px; border-radius: 10px; background: #FFFFFF; border: 1px solid #E1E4E8;">
+  <div style="display: flex; align-items: center; gap: 8px; font-size: 12px; font-weight: 600; color: #8A4B0A;"><svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 14px; height: 14px;"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg><span>1 job đang chạy</span></div>
+  <div style="font-size: 13px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">zoom-recording-0912.mp4</div>
+  <div style="height: 6px; border-radius: 3px; background: #ECEDE8; overflow: hidden;"><div style="width: 36%; height: 100%; background: #0F766E;"></div></div>
+  <div style="display: flex; justify-content: space-between; font-size: 12px; color: #5B6470;"><span class="mono">32 / 90 phút</span><a href="Transcript.dc.html" style="font-weight: 600; text-decoration: none;">Mở</a></div>
+</div>
+  
+</aside>
+<main style="flex-grow: 1; min-width: 0; height: 100%; display: flex; flex-direction: column; overflow: hidden;">
+
+<div style="display: flex; align-items: center; gap: 10px; height: 64px; padding: 0 20px; border-bottom: 1px solid #E1E4E8; background: #FFFFFF; flex: none;">
+  <span class="status status-rec" role="status"><span class="dot dot-pulse"></span><span>Đang ghi</span><span class="mono" style="font-weight: 500;">00:45:12</span></span>
+  <span class="status status-warn" role="status"><svg aria-hidden="true" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#8A4B0A" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 15px; height: 15px;"><line x1="1" y1="1" x2="23" y2="23"/><path d="M16.72 11.06A10.94 10.94 0 0 1 19 12.55"/><path d="M5 12.55a10.94 10.94 0 0 1 5.17-2.39"/><path d="M10.71 5.05A16 16 0 0 1 22.58 9"/><path d="M1.42 9a15.91 15.91 0 0 1 4.7-2.88"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><line x1="12" y1="20" x2="12.01" y2="20"/></svg><span>Đang nối lại</span><span class="mono" style="font-weight: 500;">2:10</span></span>
+  <span style="flex-grow: 1;"></span>
+  <div class="segmented" role="group" aria-label="Chế độ xem">
+    <button class="seg-btn" type="button">Gốc</button>
+    <button class="seg-btn" type="button">Dịch</button>
+    <button class="seg-btn seg-btn-on" type="button" aria-pressed="true">Cả hai</button>
+  </div>
+  <div style="width: 1px; height: 24px; background: #E1E4E8; margin: 0 4px;"></div>
+  <select class="select" aria-label="Nguồn âm thanh" style="width: 170px;"><option>Mic + Hệ thống</option><option>Chỉ hệ thống</option><option>Chỉ mic</option></select>
+  <select class="select" aria-label="Ngôn ngữ dịch" style="width: 150px;"><option>→ Tiếng Việt</option><option>→ English</option><option>→ 日本語</option><option>Không dịch</option></select>
+  <button class="btn btn-secondary" type="button" title="Mở kết nối mới với ngữ cảnh trống để bắt lại ngôn ngữ đang nói"><svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 16px; height: 16px;"><path d="M5 8l6 6"/><path d="M4 14l6-6 2-3"/><path d="M2 5h12"/><path d="M7 2h1"/><path d="M22 22l-5-10-5 10"/><path d="M14 18h6"/></svg><span>Nhận diện lại</span></button>
+  <button class="btn btn-secondary btn-icon" type="button" aria-label="Đọc bản dịch: đang bật" aria-pressed="true" style="border-color: #0F766E; color: #0B5D57; background: #E6F3F1;"><svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#0B5D57" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 16px; height: 16px;"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg></button>
+  <button class="btn btn-secondary btn-icon" type="button" aria-label="Ghi chú" aria-pressed="true" style="border-color: #0F766E; color: #0B5D57; background: #E6F3F1;"><svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#0B5D57" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 16px; height: 16px;"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg></button>
+  <a class="btn btn-danger" href="Transcript.dc.html"><svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 16px; height: 16px;"><rect x="5" y="5" width="14" height="14" rx="2"/></svg><span>Dừng</span></a>
+</div>
+
+<div style="display: flex; align-items: center; gap: 10px; padding: 8px 20px; background: #FDF0DC; border-bottom: 1px solid #F5D9A8; color: #8A4B0A; font-size: 13px; flex: none;">
+  <svg aria-hidden="true" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#8A4B0A" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 15px; height: 15px;"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg><span><strong>Mất mạng từ 45:02.</strong> Vẫn đang ghi âm; transcript sẽ tự chạy tiếp khi có mạng. Bạn có thể Transcribe lại sau để lấp khoảng thiếu.</span>
+</div>
+
+<div style="flex-grow: 1; display: flex; min-height: 0;">
+  <section style="flex-grow: 1; min-width: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); background: #FFFFFF; border-right: 1px solid #E1E4E8;">
+    <div style="display: flex; flex-direction: column; gap: 2px; padding: 8px; border-right: 1px solid #EDEFF1; overflow: hidden;">
+      <div style="display: flex; align-items: center; gap: 8px; padding: 4px 12px 8px; font-size: 12px; font-weight: 600; color: #5B6470; text-transform: uppercase; letter-spacing: .04em;"><svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 14px; height: 14px;"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/></svg><span>Gốc</span><span class="badge badge-file">ja · auto</span></div>
+      <div class="seg" style="cursor: default;"><span class="ts">00:43:10</span><span class="seg-text">それから、ダッシュボードのグラフは週次と月次の切り替えが必要です。</span></div>
+      <div class="seg" style="cursor: default;"><span class="ts">00:43:24</span><span class="seg-text">デフォルトは週次でお願いします。</span></div>
+      <div class="seg" style="cursor: default;"><span class="ts">00:43:38</span><span class="seg-text">了解です。月次はカレンダーの選択で対応します。</span></div>
+      <div class="seg" style="cursor: default;"><span class="ts">00:44:02</span><span class="seg-text">あと、通知メールのテンプレートは日本語と英語の両方が必要になります。</span></div>
+      <div class="seg" style="cursor: default;"><span class="ts">00:44:31</span><span class="seg-text">ベトナム語は今回のスコープ外で大丈夫です。</span></div>
+      <div class="seg" style="cursor: default;"><span class="ts">00:44:50</span><span class="seg-text">では、テンプレートは二言語で作成し、後から追加できる構成にします。</span></div>
+      <div style="display: flex; align-items: center; gap: 10px; padding: 8px 12px; margin: 4px 0; border-radius: 8px; background: #ECEDE8; color: #3C4551; font-size: 12px; font-weight: 600;"><svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 14px; height: 14px;"><line x1="1" y1="1" x2="23" y2="23"/><path d="M16.72 11.06A10.94 10.94 0 0 1 19 12.55"/><path d="M5 12.55a10.94 10.94 0 0 1 5.17-2.39"/><path d="M10.71 5.05A16 16 0 0 1 22.58 9"/><path d="M1.42 9a15.91 15.91 0 0 1 4.7-2.88"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><line x1="12" y1="20" x2="12.01" y2="20"/></svg><span>Mất kết nối 45:02 – đang chờ…</span></div>
+    </div>
+    <div style="display: flex; flex-direction: column; gap: 2px; padding: 8px; overflow: hidden;">
+      <div style="display: flex; align-items: center; gap: 8px; padding: 4px 12px 8px; font-size: 12px; font-weight: 600; color: #5B6470; text-transform: uppercase; letter-spacing: .04em;"><svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 14px; height: 14px;"><path d="M5 8l6 6"/><path d="M4 14l6-6 2-3"/><path d="M2 5h12"/><path d="M7 2h1"/><path d="M22 22l-5-10-5 10"/><path d="M14 18h6"/></svg><span>Dịch</span><span class="badge badge-file">→ vi</span><span class="status status-ok" style="height: 22px; font-size: 11px; padding: 0 8px; margin-left: auto;"><svg aria-hidden="true" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#0B5D57" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 12px; height: 12px;"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg><span>Đang đọc</span></span></div>
+      <div class="seg" style="cursor: default;"><span class="ts">00:43:10</span><span class="seg-text">Ngoài ra, biểu đồ trên dashboard cần chuyển được giữa theo tuần và theo tháng.</span></div>
+      <div class="seg" style="cursor: default;"><span class="ts">00:43:24</span><span class="seg-text">Mặc định xin để theo tuần.</span></div>
+      <div class="seg" style="cursor: default;"><span class="ts">00:43:38</span><span class="seg-text">Đã rõ. Theo tháng sẽ xử lý bằng chọn trên lịch.</span></div>
+      <div class="seg" style="cursor: default;"><span class="ts">00:44:02</span><span class="seg-text">Ngoài ra, template email thông báo sẽ cần cả tiếng Nhật lẫn tiếng Anh.</span></div>
+      <div class="seg" style="cursor: default;"><span class="ts">00:44:31</span><span class="seg-text">Tiếng Việt nằm ngoài phạm vi lần này cũng được.</span></div>
+      <div class="seg" style="cursor: default;"><span class="ts">00:44:50</span><span class="seg-text">Vậy template sẽ làm hai ngôn ngữ, cấu trúc cho phép thêm sau<span class="caret"></span></span></div>
+    </div>
+  </section>
+  <aside style="width: 320px; flex: none; display: flex; flex-direction: column; background: #FAFAF7;">
+    <div style="display: flex; align-items: center; justify-content: space-between; height: 44px; padding: 0 14px; border-bottom: 1px solid #E1E4E8; flex: none;">
+      <div class="label"><svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 14px; height: 14px;"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>Ghi chú</div>
+      <span class="help" style="display: inline-flex; align-items: center; gap: 4px;"><svg aria-hidden="true" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#0B5D57" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 12px; height: 12px;"><polyline points="20 6 9 17 4 12"/></svg>Đã lưu 14:44</span>
+    </div>
+    <label for="notes" style="position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0);">Ghi chú phiên</label>
+    <textarea id="notes" class="input" style="flex-grow: 1; border: 0; border-radius: 0; background: transparent; font-size: 14px; padding: 14px;">- Export CSV: giữ filter, chỉ quyền edit+
+- Dashboard: tuần (mặc định) / tháng
+- Email template: ja + en, vi để sau
+- Hỏi lại: giới hạn 10k dòng khi export?</textarea>
+    <div style="padding: 10px 14px; border-top: 1px solid #E1E4E8; flex: none;" class="help">Ghi chú được nhúng vào prompt khi sinh memo. Tự lưu, không mất khi force-quit.</div>
+  </aside>
+</div>
+</main>
+</div>
+<div role="status" style="position: absolute; inset: 0; background: rgba(23,26,31,.45); display: flex; align-items: center; justify-content: center;">
+  <div style="width: 380px; background: #FFFFFF; border-radius: 16px; box-shadow: 0 10px 32px rgba(17,24,39,.12); padding: 28px; display: flex; flex-direction: column; align-items: center; gap: 12px; text-align: center;">
+    <div style="width: 40px; height: 40px; border-radius: 999px; background: #E6F3F1; display: flex; align-items: center; justify-content: center;"><svg aria-hidden="true" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#0B5D57" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="flex: none; width: 20px; height: 20px;"><polyline points="20 6 9 17 4 12"/></svg></div>
+    <div style="font-size: 16px; font-weight: 600;">Đang lưu phiên…</div>
+    <div class="help" style="max-width: 280px;">Finalize recording, tạo proxy phát lại. Xong sẽ mở Transcript detail của phiên vừa tạo.</div>
+  </div>
+</div></div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview": {"width": 1280, "height": 800}}'>
+class Component extends DCLogic {
+renderVals() {
+return {};
+}
+}
+</script>
+</body>
+</html>

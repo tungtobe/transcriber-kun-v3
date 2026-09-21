@@ -1,0 +1,253 @@
+<title>Kiến trúc trans-kun v3</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&display=swap">
+<style>
+:root{
+  --bg:#F6F6F2; --surface:#FFFFFF; --sunken:#ECEDE8; --border:#E1E4E8; --border-strong:#CFD4DA;
+  --text:#171A1F; --text-2:#3C4551; --muted:#5B6470;
+  --accent:#0F766E; --accent-soft:#E6F3F1; --accent-border:#B7DDD8;
+  --warning:#8A4B0A; --warning-soft:#FDF0DC; --warning-border:#F5D9A8;
+  --info:#1E4E9B; --info-soft:#E8EEF7;
+  --recover:#5B2FA3; --recover-soft:#F0EAFB;
+  --sans:'IBM Plex Sans',system-ui,-apple-system,'Segoe UI',sans-serif;
+  --mono:'IBM Plex Mono',ui-monospace,'SF Mono',Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#141517; --surface:#1F2024; --sunken:#2A2B30; --border:#2E3036; --border-strong:#3C3F47;
+    --text:#ECEDEF; --text-2:#C2C7CF; --muted:#A0A6B0;
+    --accent:#2DD4BF; --accent-soft:rgba(45,212,191,.14); --accent-border:rgba(45,212,191,.38);
+    --warning:#F5B75C; --warning-soft:rgba(245,183,92,.14); --warning-border:rgba(245,183,92,.38);
+    --info:#7AA7F0; --info-soft:rgba(122,167,240,.14);
+    --recover:#C4A6F5; --recover-soft:rgba(196,166,245,.14);
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#141517; --surface:#1F2024; --sunken:#2A2B30; --border:#2E3036; --border-strong:#3C3F47;
+  --text:#ECEDEF; --text-2:#C2C7CF; --muted:#A0A6B0;
+  --accent:#2DD4BF; --accent-soft:rgba(45,212,191,.14); --accent-border:rgba(45,212,191,.38);
+  --warning:#F5B75C; --warning-soft:rgba(245,183,92,.14); --warning-border:rgba(245,183,92,.38);
+  --info:#7AA7F0; --info-soft:rgba(122,167,240,.14);
+  --recover:#C4A6F5; --recover-soft:rgba(196,166,245,.14);
+}
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:15px;line-height:1.6;padding-inline:20px;padding-block:40px 64px}
+.wrap{max-width:980px;margin:0 auto;display:flex;flex-direction:column;gap:56px}
+header{display:flex;flex-direction:column;gap:12px;max-width:68ch}
+.eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+h1{font-size:30px;line-height:1.2;font-weight:600;margin:0;text-wrap:balance}
+h2{font-size:21px;line-height:1.3;font-weight:600;margin:0;text-wrap:balance}
+h3{font-size:15px;font-weight:600;margin:0}
+p{margin:0}
+.lead{font-size:17px;color:var(--text-2)}
+.meta{display:flex;flex-wrap:wrap;gap:8px;font-size:13px;color:var(--muted)}
+.meta span{border:1px solid var(--border);border-radius:4px;padding:2px 8px;background:var(--surface)}
+section{display:flex;flex-direction:column;gap:18px}
+section > p, .prose{max-width:68ch;color:var(--text-2)}
+code{font-family:var(--mono);font-size:.88em;background:var(--sunken);padding:1px 5px;border-radius:3px;color:var(--text)}
+.promise{border-left:3px solid var(--accent);background:var(--accent-soft);padding:16px 20px;max-width:72ch}
+.promise p{color:var(--text)}
+.diagram{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:20px;overflow-x:auto}
+.diagram pre.mermaid{margin:0;background:transparent;display:flex;justify-content:center}
+.caption{font-size:13px;color:var(--muted)}
+.layers{display:grid;gap:8px}
+.layer{display:grid;grid-template-columns:150px 1fr;gap:16px;align-items:baseline;border:1px solid var(--border);background:var(--surface);border-radius:6px;padding:12px 16px}
+.layer .name{font-weight:600}
+.layer .name small{display:block;font-weight:400;font-size:12px;color:var(--muted);font-family:var(--mono)}
+.layer .mods{font-family:var(--mono);font-size:13px;color:var(--text-2)}
+.layer .mods em{font-family:var(--sans);font-style:normal;color:var(--muted);display:block;font-size:13px;margin-top:2px}
+.arrow{font-size:12px;color:var(--muted);padding-left:16px;font-family:var(--mono)}
+.trio{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px}
+.card{border:1px solid var(--border);background:var(--surface);border-radius:6px;padding:16px;display:flex;flex-direction:column;gap:8px}
+.card .tag{font-family:var(--mono);font-size:12px;color:var(--accent)}
+.card p{font-size:14px;color:var(--text-2)}
+.tbl{overflow-x:auto;border:1px solid var(--border);border-radius:6px;background:var(--surface)}
+table{border-collapse:collapse;width:100%;font-size:14px;min-width:620px}
+th,td{text-align:left;padding:10px 14px;border-bottom:1px solid var(--border);vertical-align:top}
+th{font-size:12px;letter-spacing:.05em;text-transform:uppercase;color:var(--muted);font-weight:500;background:var(--sunken)}
+tr:last-child td{border-bottom:0}
+td.id{font-family:var(--mono);font-size:13px;color:var(--accent);white-space:nowrap}
+tr.group td{background:var(--bg);font-weight:600;font-size:13px;color:var(--text-2)}
+.pill{display:inline-block;font-size:12px;border-radius:999px;padding:1px 9px;border:1px solid;white-space:nowrap}
+.pill.spike{color:var(--info);background:var(--info-soft);border-color:transparent}
+.pill.owner{color:var(--warning);background:var(--warning-soft);border-color:var(--warning-border)}
+.pill.doc{color:var(--recover);background:var(--recover-soft);border-color:transparent}
+.cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:24px}
+ul.plain{margin:0;padding-left:18px;display:flex;flex-direction:column;gap:8px;color:var(--text-2)}
+ul.plain li::marker{color:var(--muted)}
+footer{font-size:13px;color:var(--muted);border-top:1px solid var(--border);padding-top:16px;display:flex;flex-direction:column;gap:4px}
+@media (max-width:560px){
+  body{padding-inline:16px}
+  h1{font-size:25px}
+  .layer{grid-template-columns:1fr;gap:4px}
+}
+</style>
+
+<div class="wrap">
+
+<header>
+  <div class="eyebrow">Architecture · trans-kun v3 · 2026-09-18</div>
+  <h1>Kiến trúc trans-kun v3 trong một trang</h1>
+  <p class="lead">Trang này dành cho team build (1–2 dev và AI agent) và chủ sản phẩm. Nó tóm tắt cách app được chia phần và những quy tắc mọi epic phải tuân theo để các phần làm độc lập vẫn ghép được với nhau. Bản chuẩn để build là <code>ARCHITECTURE-SPINE.md</code> với 19 quyết định AD-1 đến AD-19.</p>
+  <div class="meta"><span>Tauri 2.11 · Rust · Svelte 5</span><span>macOS ≥ 14.4 · Windows 10 1809+/11</span><span>Mac App Store · Microsoft Store</span><span>Repo mới</span></div>
+</header>
+
+<section>
+  <h2>Bức tranh tổng thể</h2>
+  <p>trans-kun là <strong>một tiến trình duy nhất</strong> chạy trên máy người dùng. Dữ liệu họp chỉ đi thẳng tới Google Gemini bằng key của chính người dùng. Phía Relipa chỉ có trang tĩnh chứa quảng cáo, cấu hình đề xuất và Privacy Policy, và app xác minh chữ ký mọi thứ tải từ đó. Không có server nào lưu dữ liệu họp.</p>
+  <div class="diagram">
+<pre class="mermaid">
+flowchart LR
+  subgraph M["Máy người dùng"]
+    APP["trans-kun · 1 tiến trình"] --- C[("Container<br/>app.db · media/ · cache/ · state/")]
+    APP --- KC["Keychain / Credential Manager<br/>(API key)"]
+  end
+  APP -->|"HTTPS / WSS · key người dùng"| G["Google Gemini API"]
+  APP -->|"GET · xác minh ed25519"| S["Trang tĩnh Relipa<br/>ads.json · recommended-settings.json"]
+  CI["GitHub Actions<br/>test · store-mac · store-win"] --> ST["Mac App Store · Microsoft Store"]
+  ST --> APP
+</pre>
+  </div>
+</section>
+
+<section>
+  <h2>Bốn tầng, phụ thuộc chỉ đi xuống</h2>
+  <p>Toàn bộ state nằm ở Rust: DB, Job, Phiên live và settings. WebView chỉ hiển thị và gửi lệnh. Phần Rust được chia theo tính năng và đặt trên một lớp hạ tầng dùng chung. <strong>Tính năng không bao giờ gọi trực tiếp tính năng khác.</strong> Khi một luồng chạm nhiều tính năng (ví dụ Dừng Live → lưu Phiên → mở trang chi tiết), tầng <code>ipc/</code> đứng ra điều phối.</p>
+  <div class="layers">
+    <div class="layer"><div class="name">Adapter UI<small>ipc/</small></div><div class="mods">command · Channel · boot · đóng cửa sổ<em>Nơi duy nhất được điều phối nhiều tính năng cùng lúc.</em></div></div>
+    <div class="arrow">↓ chỉ gọi xuống</div>
+    <div class="layer"><div class="name">Tính năng</div><div class="mods">settings/ · library/ · transcribe/ · live/ · memo/ · ads/<em>Mỗi module ứng với một năng lực người dùng thấy được.</em></div></div>
+    <div class="arrow">↓</div>
+    <div class="layer"><div class="name">Hạ tầng</div><div class="mods">gemini/ · media/ · audio/ · db/ · secrets/ · remote/<em>Dùng chung, không biết gì về tính năng phía trên.</em></div></div>
+    <div class="arrow">↓</div>
+    <div class="layer"><div class="name">Core</div><div class="mods">AppError · ID · Sensitive&lt;T&gt; · đồng hồ</div></div>
+  </div>
+</section>
+
+<section>
+  <h2>Ba “cỗ máy” sống lâu</h2>
+  <p>Chỉ có ba thứ chạy liên tục và giữ state riêng, và mỗi thứ là một actor (tokio task nhận lệnh qua message). Phần còn lại, như tag, đổi tên hay export, chỉ là hàm gọi DB bình thường. Epic nào muốn thêm actor thứ tư thì phải sửa spine trước.</p>
+  <div class="trio">
+    <div class="card"><span class="tag">LiveSession</span><h3>Một phiên họp đang ghi</h3><p>Giữ đồng hồ, Recording, kết nối WebSocket và các lần nối lại. Mỗi lúc chỉ có tối đa một phiên.</p></div>
+    <div class="card"><span class="tag">JobRegistry</span><h3>Hàng đợi transcribe file</h3><p>Transcribe file, Chạy lại và Transcribe lại cùng xếp một hàng và chạy lần lượt. Hàng đợi chỉ nằm trong bộ nhớ; đóng app thì huỷ sạch.</p></div>
+    <div class="card"><span class="tag">KeyPool</span><h3>Người phát key Gemini</h3><p>Xoay key theo quota và ưu tiên <strong>Live &gt; Job &gt; Memo</strong>, để việc transcribe file chạy nền không làm Live dính 429 giữa buổi họp.</p></div>
+  </div>
+</section>
+
+<section>
+  <h2>Luồng Live: ghi âm không bao giờ dừng vì mạng</h2>
+  <div class="promise"><p>Đây là lời hứa trung tâm của sản phẩm. Audio thu được đi theo <strong>hai nhánh độc lập</strong>: một nhánh ghi thẳng ra file WAV, nhánh kia gửi lên Gemini qua một bộ đệm 60 giây. Mất mạng chỉ làm gián đoạn nhánh gửi. Phần vượt quá 60 giây trở thành một dòng “Mất kết nối mm:ss–mm:ss” trong transcript, còn file ghi âm vẫn đủ nên Transcribe lại lấp được.</p></div>
+  <div class="diagram">
+<pre class="mermaid">
+flowchart LR
+  CAP["Capture<br/>Core Audio tap / WASAPI / mic"] --> WAV["WAV writer<br/>chỉ dừng khi người dùng bấm Dừng"]
+  CAP --> BUF["Ring buffer 60 s"]
+  BUF --> WS["WebSocket Gemini Live<br/>tự nối lại 1 s → 30 s"]
+  WS -->|"segment · bản dịch"| LS["LiveSession"]
+  WAV --> DISK[("media/&lt;id&gt;/recording.wav")]
+  LS -->|"flush định kỳ"| DB[("segments")]
+  LS -->|"Channel · seq"| UI["Màn Live"]
+  WS -->|"audio TTS"| PB["Playback (Rust)<br/>không qua UI"]
+</pre>
+  </div>
+  <p class="caption">Đồng hồ phiên tính bằng số sample đã thu, không theo giờ hệ thống, nên timestamp không nhảy khi nối lại hay khi Nhận diện lại. Phiên được bắt đầu ngay cả khi đang offline.</p>
+</section>
+
+<section>
+  <h2>Luồng transcribe file: không lưu gì cho tới khi xong</h2>
+  <div class="diagram">
+<pre class="mermaid">
+flowchart LR
+  F["File người dùng chọn"] --> H{"Hash SHA-256<br/>đã có Phiên?"}
+  H -->|"có"| OPEN["Mở Phiên cũ<br/>không gọi Gemini"]
+  H -->|"chưa"| Q["Xếp vào JobRegistry"]
+  Q --> STG["media/.staging/&lt;job&gt;<br/>decode → chunk 5 phút → Gemini"]
+  STG -->|"xong / thiếu vài chunk"| TX["Một transaction:<br/>Phiên + Transcript + Proxy"]
+  STG -->|"huỷ"| DEL["Xoá staging<br/>không để lại dòng DB"]
+</pre>
+  </div>
+  <p class="caption">Chunk thất bại hẳn thành Khoảng thiếu và được đánh dấu rõ. Transcript có Khoảng thiếu là “partial” và không bao giờ bị coi là hoàn chỉnh.</p>
+</section>
+
+<section>
+  <h2>Dữ liệu: Phiên có một hoặc hai Transcript</h2>
+  <p>Một <strong>Phiên</strong> là thứ người dùng thấy trong thư viện. Tag, Ghi chú và Memo gắn vào Phiên. Mỗi Phiên có một Transcript chính, và Phiên live có thể có thêm một bản Transcribe lại để xem cạnh nhau. Khoảng thiếu, dù do chunk lỗi hay do mất kết nối, đều được lưu chung một dạng: là một segment loại <code>gap</code>.</p>
+  <div class="diagram">
+<pre class="mermaid">
+erDiagram
+  SESSIONS ||--|{ TRANSCRIPTS : "primary | retranscribe"
+  TRANSCRIPTS ||--o{ SEGMENTS : "text | gap"
+  SESSIONS ||--o{ SESSION_TAGS : ""
+  TAGS ||--o{ SESSION_TAGS : ""
+  SESSIONS ||--o| NOTES : ""
+  SESSIONS ||--o{ MEMOS : ""
+  MEMO_TEMPLATES ||--o{ MEMOS : ""
+</pre>
+  </div>
+</section>
+
+<section>
+  <h2>19 quyết định, gom theo chủ đề</h2>
+  <p>Mỗi quyết định trong spine có ba phần: nó ràng buộc chỗ nào, nó ngăn sự lệch nào giữa các epic, và quy tắc cụ thể. Dưới đây là bản một dòng cho từng quyết định.</p>
+  <div class="tbl">
+  <table>
+    <thead><tr><th>ID</th><th>Quyết định</th><th>Ngăn điều gì</th></tr></thead>
+    <tbody>
+      <tr class="group"><td colspan="3">Khung</td></tr>
+      <tr><td class="id">AD-1</td><td>Phụ thuộc chỉ đi xuống; tính năng không gọi tính năng; điều phối chéo ở <code>ipc/</code></td><td>Module gọi chéo thành mạng rối</td></tr>
+      <tr><td class="id">AD-2</td><td>Actor chỉ cho LiveSession, JobRegistry, KeyPool</td><td>Mỗi epic một kiểu concurrency</td></tr>
+      <tr><td class="id">AD-17</td><td>Một tiến trình; không subprocess, không plugin shell/fs/updater; không ScreenCaptureKit; entitlement tối thiểu</td><td>Trượt review store</td></tr>
+      <tr><td class="id">AD-18</td><td>Khởi động và đóng cửa sổ do một chỗ duy nhất điều khiển</td><td>Hai routine phục hồi chạy lệch thứ tự</td></tr>
+      <tr class="group"><td colspan="3">Dữ liệu</td></tr>
+      <tr><td class="id">AD-4</td><td>Chỉ <code>db/</code> được ghi SQLite; Phiên live có vòng đời recording → finalizing → complete</td><td>Ghi song song; hiểu “mồ côi” khác nhau</td></tr>
+      <tr><td class="id">AD-5</td><td>ID là UUIDv7; tên file theo ID, không theo tên người dùng đặt</td><td>Chuỗi người dùng lọt vào đường dẫn</td></tr>
+      <tr><td class="id">AD-16</td><td>Phiên 1–n Transcript; Khoảng thiếu là segment loại <code>gap</code>; Job file chỉ ghi khi xong</td><td>Chạy lại mất Tag/Memo; hai kiểu lưu gap</td></tr>
+      <tr><td class="id">AD-9</td><td>Đồng hồ Live tính theo sample; segment dùng giây tuyệt đối</td><td>Timestamp nhảy khi nối lại</td></tr>
+      <tr><td class="id">AD-8</td><td>Settings do Rust giữ trong SQLite; key nằm trong Keychain</td><td>Hai kho settings lệch nhau</td></tr>
+      <tr class="group"><td colspan="3">Gemini &amp; mạng</td></tr>
+      <tr><td class="id">AD-6</td><td>Một cổng Gemini: chặn khi chưa có Consent, ưu tiên quota, không gọi nền</td><td>Mỗi luồng một chính sách xoay key; tốn token ngầm</td></tr>
+      <tr><td class="id">AD-7</td><td>Một kiểu lỗi, 8 category khớp UX</td><td>Hiển thị lỗi thô, lộ key</td></tr>
+      <tr><td class="id">AD-14</td><td>Cấu hình từ xa luôn đi qua <code>remote/</code>, có chữ ký</td><td>Ads và cấu hình đề xuất xác minh mỗi bên một kiểu</td></tr>
+      <tr class="group"><td colspan="3">Live &amp; Job</td></tr>
+      <tr><td class="id">AD-10</td><td>Capture chia hai nhánh độc lập; tách trạng thái ghi và trạng thái kết nối</td><td>Mất mạng làm đứt Recording</td></tr>
+      <tr><td class="id">AD-11</td><td>Job file chạy tuần tự, Live chạy song song; file trùng thì không tạo Job</td><td>Tranh quota; tốn token vô ích</td></tr>
+      <tr><td class="id">AD-19</td><td>Lỗi proxy/memo/ads không đụng tới transcript hay recording</td><td>Lỗi phụ làm hỏng lõi</td></tr>
+      <tr class="group"><td colspan="3">Giao diện</td></tr>
+      <tr><td class="id">AD-3</td><td>UI lấy snapshot rồi nhận delta có <code>seq</code>; hụt thì lấy lại</td><td>UI báo sai trạng thái sau khi reload (lỗi v2)</td></tr>
+      <tr><td class="id">AD-12</td><td>WebView chỉ đọc được thư mục <code>media/</code></td><td>WebView đọc file ngoài Container</td></tr>
+      <tr><td class="id">AD-13</td><td>Mỗi domain một store; route quyết định Ad slot; phím tắt tập trung</td><td>IPC rải rác; quảng cáo lọt vào Live</td></tr>
+      <tr><td class="id">AD-15</td><td>Nội dung họp được bọc kiểu <code>Sensitive</code>, log không bao giờ chứa nội dung</td><td>Transcript/key lọt vào log</td></tr>
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<section class="cols">
+  <div style="display:flex;flex-direction:column;gap:14px">
+    <h2>Còn mở</h2>
+    <ul class="plain">
+      <li><span class="pill spike">spike S8</span> Proxy FLAC có seek mượt trong WebView không; nếu không thì đổi sang AAC</li>
+      <li><span class="pill spike">spike S1</span> Opus chỉ làm được qua libopus (C); cần cân với quy tắc thuần Rust</li>
+      <li><span class="pill spike">spike S2</span> Model <code>*-transcribe</code> nhận audio inline hay phải dùng Files API</li>
+      <li><span class="pill spike">Phase 0</span> tauri-specta 2 vẫn là RC; process tap qua objc2; keyring trong sandbox MAS</li>
+      <li><span class="pill owner">tony</span> Nơi host trang tĩnh; Arm64 có vào bản submit đầu không</li>
+    </ul>
+  </div>
+  <div style="display:flex;flex-direction:column;gap:14px">
+    <h2>Khác với PRD và addendum</h2>
+    <ul class="plain">
+      <li><span class="pill doc">addendum §B</span> Settings lưu trong SQLite, không dùng <code>tauri-plugin-store</code></li>
+      <li><span class="pill doc">addendum §G</span> Tách <code>sessions</code> và <code>transcripts</code>; bỏ bảng <code>jobs</code>; ID là UUIDv7</li>
+      <li><span class="pill doc">addendum §B</span> Trong reqwest 0.13, feature là <code>rustls</code> (xác minh chứng chỉ qua OS); TypeScript pin 6.x</li>
+      <li><span class="pill doc">PRD FR-41</span> v3 không gửi thống kê ẩn danh, chỉ đếm cục bộ</li>
+    </ul>
+  </div>
+</section>
+
+<footer>
+  <span>Nguồn: PRD và addendum ngày 2026-09-17, UX spine ngày 2026-09-18, docs/rebuild-v3/04. Đã qua 5 reviewer độc lập.</span>
+  <span>Bản chuẩn: _bmad-output/planning-artifacts/architecture/architecture-transcriber_kun-2026-09-18/ARCHITECTURE-SPINE.md</span>
+</footer>
+
+</div>

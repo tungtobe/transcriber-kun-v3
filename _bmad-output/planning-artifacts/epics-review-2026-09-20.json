@@ -1,0 +1,380 @@
+[
+  {
+    "lens": "adversarial",
+    "location": "AR-7–14; 4.2, 4.4, 5.3",
+    "trigger_condition": "Spike bắt buộc bị đặt sau nhiều epic triển khai.",
+    "guard_snippet": "Đã thêm Phase 0 cho S1–S6/S8 và chống thu TTS Windows; tích hợp giữ ở epic cũ. Nguồn: addendum §L, Spine Deferred.",
+    "potential_consequence": "Phát hiện rủi ro nền tảng khi đã xây phần lớn sản phẩm."
+  },
+  {
+    "lens": "adversarial",
+    "location": "2.3, 4.10",
+    "trigger_condition": "Transaction được mô tả bao gồm cả DB và filesystem; cleanup quá muộn.",
+    "guard_snippet": "Đã tách transaction DB/publish media, thêm reconciliation idempotent và boot cleanup ngay ở 2.4. Nguồn: AD-16/18.",
+    "potential_consequence": "Crash để file mồ côi hoặc DB trỏ tới file chưa tồn tại."
+  },
+  {
+    "lens": "adversarial",
+    "location": "2.5, 4.11",
+    "trigger_condition": "Retry phần thiếu luôn thay primary dù đích là retranscribe.",
+    "guard_snippet": "Đã thêm transcript_id và validation variant; retry chỉ swap bản đích. Nguồn: FR-15/26, AD-16.",
+    "potential_consequence": "Ghi đè bản live cần giữ."
+  },
+  {
+    "lens": "adversarial",
+    "location": "2.7, 4.9",
+    "trigger_condition": "Sửa Proxy live đòi file nguồn cùng hash vốn không tồn tại.",
+    "guard_snippet": "Đã tách phục hồi file theo hash và live từ Recording. Nguồn: FR-10/23/24.",
+    "potential_consequence": "Có Recording nhưng không thể nghe lại."
+  },
+  {
+    "lens": "adversarial",
+    "location": "4.6, 4.7",
+    "trigger_condition": "Contract connection thiếu trạng thái kết nối thành công.",
+    "guard_snippet": "Đã bổ sung connected sau setupComplete; C6 ghi việc đồng bộ AD-10/addendum §H.",
+    "potential_consequence": "Snapshot/remount không dựng được trạng thái đang transcribe trung thực."
+  },
+  {
+    "lens": "adversarial",
+    "location": "4.6",
+    "trigger_condition": "Test outage ba phút phủ gap cả phần audio còn giữ trong buffer.",
+    "guard_snippet": "Đã tách reconnect ngắn và outage dài; gap chỉ phủ phần bị đẩy khỏi buffer. Nguồn: FR-22, AD-10.",
+    "potential_consequence": "Bỏ audio có thể replay hoặc gap chồng transcript."
+  },
+  {
+    "lens": "adversarial",
+    "location": "4.2, 4.7",
+    "trigger_condition": "Silence bị coi là thiếu quyền; nút vô hiệu có thể chặn prompt lần đầu.",
+    "guard_snippet": "Đã cho mở tap khi quyền chưa biết, chỉ chặn nguồn OS xác nhận từ chối. Nguồn: addendum §F, FR-17.",
+    "potential_consequence": "Lần đầu không thể cấp quyền hoặc nguồn im lặng bị báo lỗi sai."
+  },
+  {
+    "lens": "adversarial",
+    "location": "3.5",
+    "trigger_condition": "Debounce/flush khi đóng không chứng minh không mất notes lúc force-quit.",
+    "guard_snippet": "Đã thêm revision, ACK bền và test kill; OQ10/C7 giữ quyết định durability còn mở. Nguồn: FR-36.",
+    "potential_consequence": "Mất ký tự chưa lưu nhưng story vẫn bị đánh dấu done."
+  },
+  {
+    "lens": "adversarial",
+    "location": "3.7",
+    "trigger_condition": "Schema Memo không có nguồn để hiển thị bản transcript và nhãn stale.",
+    "guard_snippet": "Đã thêm provenance transcript/notes/template/model. Nguồn: FR-38, EXPERIENCE Panel Memo.",
+    "potential_consequence": "Memo bị gán sai bản nguồn sau restart."
+  },
+  {
+    "lens": "adversarial",
+    "location": "3.1, 3.4, 3.7",
+    "trigger_condition": "Xoá dữ liệu không tính request Memo ngoài JobRegistry.",
+    "guard_snippet": "Đã thêm writer guard/generation và bỏ kết quả muộn sau xoá. Nguồn: AD-11, FR-30/40.",
+    "potential_consequence": "Dữ liệu đã xoá xuất hiện lại."
+  },
+  {
+    "lens": "adversarial",
+    "location": "3.6, 1.9",
+    "trigger_condition": "Template mặc định chỉ được nạp theo locale lúc migration.",
+    "guard_snippet": "Đã thêm locale/origin/identity ổn định và quy tắc đổi locale/restore. Nguồn: FR-1/37/47.",
+    "potential_consequence": "Đổi ngôn ngữ không đổi đúng bộ mẫu hoặc sinh bản trùng."
+  },
+  {
+    "lens": "adversarial",
+    "location": "6.1, 6.2",
+    "trigger_condition": "remote nuốt mọi lỗi nhưng preview phải báo lỗi tải/chữ ký.",
+    "guard_snippet": "Đã trả typed provenance/freshness/error; ads fallback, preview không giả báo fresh. Nguồn: AD-14/19, FR-42.",
+    "potential_consequence": "Người dùng áp cấu hình cũ tưởng vừa tải thành công."
+  },
+  {
+    "lens": "adversarial",
+    "location": "6.1, 6.3, 6.5",
+    "trigger_condition": "Chữ ký ảnh không có format tương ứng ở công cụ ký.",
+    "guard_snippet": "Đã ràng buộc bytes ảnh bằng digest trong manifest ký hoặc chữ ký riêng; client/publisher chung format. Nguồn: AD-14, FR-46.",
+    "potential_consequence": "Ảnh bị thay vẫn hiển thị dưới manifest hợp lệ."
+  },
+  {
+    "lens": "adversarial",
+    "location": "2.4, 2.8",
+    "trigger_condition": "Gate key chạy trước nhánh mở file trùng không cần Gemini.",
+    "guard_snippet": "Đã cho hash/Existing sau Consent nhưng trước key gate của Job mới; drop file trùng vẫn mở local. Nguồn: FR-4/11, AD-11.",
+    "potential_consequence": "File đã transcribe không mở lại được sau khi xoá key."
+  },
+  {
+    "lens": "adversarial",
+    "location": "3.7, 4.12, NFR-2",
+    "trigger_condition": "Memo và encode/export dài thiếu cancel/progress.",
+    "guard_snippet": "Đã thêm busy/cancel/deadline, giữ bản cũ và dọn output tạm. Nguồn: NFR-2.",
+    "potential_consequence": "Người dùng không biết tác vụ còn chạy và không huỷ được."
+  },
+  {
+    "lens": "adversarial",
+    "location": "1.4, 1.5, 1.8",
+    "trigger_condition": "Consent từ chối xung đột route guard và smoke test tới Home.",
+    "guard_snippet": "Đã tách trạng thái chưa onboard/từ chối/đồng ý, sửa đích smoke test. Nguồn: FR-2, EXPERIENCE.",
+    "potential_consequence": "Vòng lặp onboarding hoặc vào màn không được phép."
+  },
+  {
+    "lens": "edge-case-hunter",
+    "location": "2.4",
+    "trigger_condition": "Cancel tới lúc request hoàn tất hoặc Job còn chờ.",
+    "guard_snippet": "Đã quy định điểm commit, bỏ kết quả muộn, huỷ Job chờ theo ID.",
+    "potential_consequence": "Job đã huỷ vẫn tiêu token hoặc tạo Phiên."
+  },
+  {
+    "lens": "edge-case-hunter",
+    "location": "2.8",
+    "trigger_condition": "Hai file trùng vào hàng đợi trước commit đầu tiên.",
+    "guard_snippet": "Đã thêm reservation source_hash trong JobRegistry.",
+    "potential_consequence": "Gửi Gemini hai lần trước UNIQUE constraint."
+  },
+  {
+    "lens": "edge-case-hunter",
+    "location": "2.3",
+    "trigger_condition": "Crash giữa publish file và DB commit.",
+    "guard_snippet": "Đã thêm thứ tự publish/commit và boot reconciliation idempotent.",
+    "potential_consequence": "DB thiếu media hoặc file mồ côi."
+  },
+  {
+    "lens": "edge-case-hunter",
+    "location": "2.5, 4.11",
+    "trigger_condition": "Retry gap trong retranscribe của Phiên live.",
+    "guard_snippet": "Đã kiểm ownership transcript_id và swap đúng variant.",
+    "potential_consequence": "Primary live bị ghi đè."
+  },
+  {
+    "lens": "edge-case-hunter",
+    "location": "2.5",
+    "trigger_condition": "Chunk settings đổi trước khi retry.",
+    "guard_snippet": "Đã retry theo gap tuyệt đối, giữ Segment ngoài vùng đích.",
+    "potential_consequence": "Trùng nội dung hoặc bỏ sót gap."
+  },
+  {
+    "lens": "edge-case-hunter",
+    "location": "1.7, 2.2",
+    "trigger_condition": "Alias mặc định hoặc tên model tự nhập không có major version.",
+    "guard_snippet": "Đã yêu cầu capability mapping kiểm chứng S2/S3, không đoán từ tên.",
+    "potential_consequence": "Model hợp lệ nhận cấu hình không hỗ trợ."
+  },
+  {
+    "lens": "edge-case-hunter",
+    "location": "2.2",
+    "trigger_condition": "Timestamp lỗi, không hữu hạn hoặc ngoài Chunk.",
+    "guard_snippet": "Đã validate thời gian, giữ Segment hợp lệ và đánh dấu phần chưa cứu.",
+    "potential_consequence": "Seek/export có timestamp vô nghĩa."
+  },
+  {
+    "lens": "edge-case-hunter",
+    "location": "2.6, 2.7, 2.10",
+    "trigger_condition": "Offset làm timestamp âm hoặc cue SRT rỗng.",
+    "guard_snippet": "Đã dùng chuẩn hoá chung, SRT bỏ cue end<=start; seek dùng thời gian gốc.",
+    "potential_consequence": "SRT lỗi hoặc seek lệch audio."
+  },
+  {
+    "lens": "edge-case-hunter",
+    "location": "2.7",
+    "trigger_condition": "Proxy live thiếu nhưng Recording còn.",
+    "guard_snippet": "Đã cho tái tạo từ Recording trong Container.",
+    "potential_consequence": "Không khôi phục được player dù audio còn."
+  },
+  {
+    "lens": "edge-case-hunter",
+    "location": "3.2",
+    "trigger_condition": "Chọn tag cụ thể cùng Chưa gắn tag.",
+    "guard_snippet": "Đã làm hai lựa chọn loại trừ nhau, giữ query tên.",
+    "potential_consequence": "Bộ lọc không thể có kết quả."
+  },
+  {
+    "lens": "edge-case-hunter",
+    "location": "3.5",
+    "trigger_condition": "Force-quit trước deadline debounce.",
+    "guard_snippet": "Đã nêu ACK bền, test recovery window; OQ10 chưa được tự coi đã duyệt.",
+    "potential_consequence": "Ghi chú vừa gõ biến mất."
+  },
+  {
+    "lens": "edge-case-hunter",
+    "location": "3.1, 3.4, 3.7",
+    "trigger_condition": "Memo hoàn tất sau xoá owner hoặc request sinh lại mới.",
+    "guard_snippet": "Đã guard revision/generation và giữ quyền ghi theo session.",
+    "potential_consequence": "Dữ liệu xoá sống lại hoặc Memo cũ ghi đè mới."
+  },
+  {
+    "lens": "edge-case-hunter",
+    "location": "3.7",
+    "trigger_condition": "Đầu vào đổi lúc Memo đang sinh.",
+    "guard_snippet": "Đã snapshot và lưu provenance của đầu vào thực tế.",
+    "potential_consequence": "Nhãn nguồn và stale không đúng."
+  },
+  {
+    "lens": "edge-case-hunter",
+    "location": "4.5",
+    "trigger_condition": "WAV/DB lỗi sau khi capture mở.",
+    "guard_snippet": "Đã dừng an toàn, bỏ chỉ báo ghi sai, giữ bytes bền; C8 cần đồng bộ nguồn.",
+    "potential_consequence": "UI báo đang ghi trong khi mất audio."
+  },
+  {
+    "lens": "edge-case-hunter",
+    "location": "4.4",
+    "trigger_condition": "Resume handle hết hạn hoặc ACK không rõ.",
+    "guard_snippet": "Đã yêu cầu S3 chứng minh ACK, replay/dedup và fallback kết nối mới.",
+    "potential_consequence": "Replay mất hoặc nhân đôi lời nói."
+  },
+  {
+    "lens": "edge-case-hunter",
+    "location": "4.8",
+    "trigger_condition": "Sửa key sau khi chọn tiếp tục chỉ ghi âm.",
+    "guard_snippet": "Đã nói rõ transcript dừng hết phiên; key mới cho phiên mới, gap tới Dừng.",
+    "potential_consequence": "Hành vi tiếp tục transcript mơ hồ."
+  },
+  {
+    "lens": "edge-case-hunter",
+    "location": "4.6, 4.9",
+    "trigger_condition": "Dừng khi câu cuối chưa có dấu kết câu.",
+    "guard_snippet": "Đã flush phần text hợp lệ cuối và chặn event muộn.",
+    "potential_consequence": "Mất câu cuối."
+  },
+  {
+    "lens": "edge-case-hunter",
+    "location": "4.10",
+    "trigger_condition": "Recovery tạo Proxy đồng thời xoá hoặc retranscribe.",
+    "guard_snippet": "Đã reserve busy, kiểm session/revision trước publish.",
+    "potential_consequence": "Recovery tạo lại file đã xoá."
+  },
+  {
+    "lens": "edge-case-hunter",
+    "location": "5.1, 5.2",
+    "trigger_condition": "Target đổi nhanh, setup lỗi hoặc Dừng khi đang chuẩn bị.",
+    "guard_snippet": "Đã tuần tự hoá, giữ latest intent, rollback và cancel candidate khi Dừng.",
+    "potential_consequence": "Target UI sai hoặc WS mở lại sau Dừng."
+  },
+  {
+    "lens": "edge-case-hunter",
+    "location": "5.1, 5.3",
+    "trigger_condition": "Tắt dịch khi TTS generation cũ còn chờ.",
+    "guard_snippet": "Đã gắn generation, dọn buffer và phục hồi Ducking ngay.",
+    "potential_consequence": "Vẫn đọc ngôn ngữ cũ sau khi tắt."
+  },
+  {
+    "lens": "edge-case-hunter",
+    "location": "5.4",
+    "trigger_condition": "Đổi output hoặc chỉnh tay trước crash.",
+    "guard_snippet": "Đã lưu device/validity và vô hiệu marker khi chỉnh tay.",
+    "potential_consequence": "Phục hồi volume sai thiết bị hoặc sai ý người dùng."
+  },
+  {
+    "lens": "edge-case-hunter",
+    "location": "6.2",
+    "trigger_condition": "Settings đổi sau preview hoặc giá trị ký không hợp lệ.",
+    "guard_snippet": "Đã gắn digest/revision, validate local, preview lại và apply transaction.",
+    "potential_consequence": "Ghi đè lựa chọn mới hoặc lưu cấu hình lỗi."
+  },
+  {
+    "lens": "edge-case-hunter",
+    "location": "6.1",
+    "trigger_condition": "Ảnh URL bị thay hoặc redirect sang scheme khác.",
+    "guard_snippet": "Đã kiểm digest, HTTPS/redirect và allow-list scheme ngoài.",
+    "potential_consequence": "Hiển thị nội dung bị thay hoặc mở URL nguy hiểm."
+  },
+  {
+    "lens": "edge-case-hunter",
+    "location": "6.3",
+    "trigger_condition": "Hết Creative đủ cap hoặc weight không hợp lệ.",
+    "guard_snippet": "Đã validate weight, fallback, persist cap và định nghĩa impression.",
+    "potential_consequence": "Selector lỗi hoặc điều hướng lách cap."
+  },
+  {
+    "lens": "structure",
+    "Pass": "structure",
+    "Original_Text": "Overview → Requirements Inventory → Epic List",
+    "Revised_Text": "MOVE Epic List lên trước; inventory xuống cuối có anchor.",
+    "Changes": "Áp dụng. 9.824 từ inventory không còn chắn đường tới epic; tác động riêng việc di chuyển 0 từ."
+  },
+  {
+    "lens": "structure",
+    "Pass": "structure",
+    "Original_Text": "Frontmatter chỉ hai bước nhưng tuyên bố complete",
+    "Revised_Text": "QUESTION trạng thái review/readiness rõ ràng.",
+    "Changes": "Áp dụng reviewedAt/reviewStatus; không sửa lịch sử stepsCompleted thành đã nghiệm thu."
+  },
+  {
+    "lens": "structure",
+    "Pass": "structure",
+    "Original_Text": "Phụ thuộc nằm rải trong 973 từ Epic List",
+    "Revised_Text": "QUESTION bảng thứ tự và prerequisite mỗi story.",
+    "Changes": "Áp dụng cho 55 story, phân biệt spike Phase 0 với tích hợp."
+  },
+  {
+    "lens": "structure",
+    "Pass": "structure",
+    "Original_Text": "Qn/OQn và ASSUMPTION rải rác",
+    "Revised_Text": "MERGE chỉ mục quyết định và story bị chặn.",
+    "Changes": "Áp dụng bảng OQ1–OQ10 cùng gate spike/nguồn; giữ assumption inline."
+  },
+  {
+    "lens": "structure",
+    "Pass": "structure",
+    "Original_Text": "FR Coverage Map 504 từ dạng dòng liên tiếp",
+    "Revised_Text": "MOVE thành bảng FR | story | nội dung.",
+    "Changes": "Áp dụng 48 FR, bổ sung 12 NFR."
+  },
+  {
+    "lens": "structure",
+    "Pass": "structure",
+    "Original_Text": "Nguồn trong YAML, tiêu đề epic bị lặp",
+    "Revised_Text": "QUESTION liên kết nguồn và anchor chi tiết.",
+    "Changes": "Áp dụng link nguồn và anchor duy nhất từng epic."
+  },
+  {
+    "lens": "structure",
+    "Pass": "structure",
+    "Original_Text": "Giới thiệu tại từng epic lặp lợi ích; 392 từ",
+    "Revised_Text": "PRESERVE ngữ cảnh epic và BDD.",
+    "Changes": "Giữ vì người đọc có thể mở thẳng một epic; không dịch nhãn BDD chỉ vì phong cách."
+  },
+  {
+    "lens": "prose",
+    "Pass": "prose",
+    "Original_Text": "2.4: chunkMinutes và offset đọc từ settings với mặc định 5 phút",
+    "Revised_Text": "chunkMinutes mặc định 5 phút; offset chỉ áp dụng UI/export.",
+    "Changes": "Tách đơn vị và thời điểm áp dụng."
+  },
+  {
+    "lens": "prose",
+    "Pass": "prose",
+    "Original_Text": "2.5: tối đa 4 lần theo chính sách Key pool",
+    "Revised_Text": "Tổng tối đa 4 lần gửi, gồm lần đầu và xoay key.",
+    "Changes": "Tránh lần đầu cộng bốn retry."
+  },
+  {
+    "lens": "prose",
+    "Pass": "prose",
+    "Original_Text": "2.5: commit Phiên ở trạng thái partial",
+    "Revised_Text": "Commit Phiên cùng Transcript có status=partial; sessions.status=complete.",
+    "Changes": "Phân biệt hai state machine."
+  },
+  {
+    "lens": "prose",
+    "Pass": "prose",
+    "Original_Text": "1.7: danh sách code và Tls ... thuộc category network",
+    "Revised_Text": "Chỉ Tls cho CA/proxy thuộc category network.",
+    "Changes": "Làm rõ phạm vi bổ nghĩa."
+  },
+  {
+    "lens": "prose",
+    "Pass": "prose",
+    "Original_Text": "4.5/4.10: tới mốc ≤ 5 s trước khi chết",
+    "Revised_Text": "Phần audio cuối không phát được tối đa 5 s trước khi tiến trình bị kết thúc.",
+    "Changes": "Viết ngưỡng đo được, bớt mơ hồ."
+  },
+  {
+    "lens": "prose",
+    "Pass": "prose",
+    "Original_Text": "4.9: không đổi status của transcript sai",
+    "Revised_Text": "Lỗi finalize/Proxy không đổi complete/partial của Transcript.",
+    "Changes": "Nêu tác nhân và hợp đồng; tách lỗi commit metadata."
+  },
+  {
+    "lens": "prose",
+    "Pass": "prose",
+    "Original_Text": "5.1: speech đã ở Target ... không im lặng",
+    "Revised_Text": "Vẫn hiển thị ở cột Dịch; không đồng nghĩa tự bật TTS.",
+    "Changes": "Tránh nhầm text với âm thanh."
+  }
+]

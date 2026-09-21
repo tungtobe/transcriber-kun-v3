@@ -1,0 +1,207 @@
+{
+ "v": 3,
+ "createdOnFiles": {
+  "v": 1,
+  "at": "2026-09-18T01:30:14Z"
+ },
+ "title": "trans-kun v3 UI Redesign",
+ "launch": {
+  "view": "canvas"
+ },
+ "pages": [],
+ "boards": {
+  "OnboardingLang.dc.html": {
+   "x": 0,
+   "y": 0,
+   "w": 1280,
+   "h": 800,
+   "title": "Onboarding — Ngôn ngữ",
+   "is_interactive": true
+  },
+  "OnboardingConsent.dc.html": {
+   "x": 1360,
+   "y": 0,
+   "w": 1280,
+   "h": 800,
+   "title": "Onboarding — Đồng ý dữ liệu",
+   "is_interactive": true
+  },
+  "OnboardingKey.dc.html": {
+   "x": 2720,
+   "y": 0,
+   "w": 1280,
+   "h": 800,
+   "title": "Onboarding — API key",
+   "is_interactive": true
+  },
+  "HomeEmpty.dc.html": {
+   "x": 0,
+   "y": 1160,
+   "w": 1280,
+   "h": 800,
+   "title": "Home — trống",
+   "is_interactive": true
+  },
+  "Home.dc.html": {
+   "x": 1360,
+   "y": 1160,
+   "w": 1280,
+   "h": 800,
+   "title": "Home — thư viện phiên",
+   "is_interactive": true
+  },
+  "TagPicker.dc.html": {
+   "x": 2720,
+   "y": 1160,
+   "w": 420,
+   "h": 520,
+   "title": "Tag picker (popover)"
+  },
+  "Transcript.dc.html": {
+   "x": 0,
+   "y": 2320,
+   "w": 1280,
+   "h": 860,
+   "title": "Transcript detail",
+   "is_interactive": true
+  },
+  "Settings.dc.html": {
+   "x": 1360,
+   "y": 2320,
+   "w": 1280,
+   "h": 1000,
+   "title": "Cài đặt",
+   "is_interactive": true
+  },
+  "SettingsMemo.dc.html": {
+   "x": 2720,
+   "y": 2320,
+   "w": 1280,
+   "h": 1000,
+   "title": "Cài đặt — Memo (mẫu prompt)",
+   "is_interactive": true
+  },
+  "LiveSetup.dc.html": {
+   "x": 0,
+   "y": 3680,
+   "w": 1280,
+   "h": 920,
+   "title": "Live — bắt đầu",
+   "is_interactive": true
+  },
+  "Live.dc.html": {
+   "x": 1360,
+   "y": 3680,
+   "w": 1280,
+   "h": 800,
+   "title": "Live — đang ghi",
+   "is_interactive": true
+  },
+  "LiveSaving.dc.html": {
+   "x": 2720,
+   "y": 3680,
+   "w": 1280,
+   "h": 800,
+   "title": "Live — đang lưu phiên"
+  },
+  "Components.dc.html": {
+   "x": 0,
+   "y": 4960,
+   "w": 1280,
+   "h": 900,
+   "title": "Thành phần & trạng thái"
+  },
+  "HomeDark.dc.html": {
+   "x": 0,
+   "y": 6220,
+   "w": 1280,
+   "h": 800,
+   "title": "Home — thư viện phiên (dark)"
+  },
+  "TranscriptDark.dc.html": {
+   "x": 1360,
+   "y": 6220,
+   "w": 1280,
+   "h": 860,
+   "title": "Transcript detail (dark)"
+  },
+  "LiveDark.dc.html": {
+   "x": 2720,
+   "y": 6220,
+   "w": 1280,
+   "h": 800,
+   "title": "Live — đang ghi (dark)"
+  },
+  "ComponentsDark.dc.html": {
+   "x": 4080,
+   "y": 6220,
+   "w": 1280,
+   "h": 900,
+   "title": "Thành phần & trạng thái (dark)"
+  }
+ },
+ "order": [
+  "OnboardingLang.dc.html",
+  "OnboardingConsent.dc.html",
+  "OnboardingKey.dc.html",
+  "HomeEmpty.dc.html",
+  "Home.dc.html",
+  "TagPicker.dc.html",
+  "Transcript.dc.html",
+  "Settings.dc.html",
+  "SettingsMemo.dc.html",
+  "LiveSetup.dc.html",
+  "Live.dc.html",
+  "LiveSaving.dc.html",
+  "Components.dc.html",
+  "HomeDark.dc.html",
+  "TranscriptDark.dc.html",
+  "LiveDark.dc.html",
+  "ComponentsDark.dc.html"
+ ],
+ "notes": {
+  "row0": {
+   "x": 0,
+   "y": -240,
+   "text": "Onboarding — 3 bước, không kiểm tra môi trường",
+   "kind": "title1",
+   "maxW": 4000
+  },
+  "row1": {
+   "x": 0,
+   "y": 920,
+   "text": "Home — thư viện phiên",
+   "kind": "title1",
+   "maxW": 3140
+  },
+  "row2": {
+   "x": 0,
+   "y": 2080,
+   "text": "Transcript detail & Cài đặt",
+   "kind": "title1",
+   "maxW": 4000
+  },
+  "row3": {
+   "x": 0,
+   "y": 3440,
+   "text": "Live — không có Ad slot",
+   "kind": "title1",
+   "maxW": 4000
+  },
+  "row4": {
+   "x": 0,
+   "y": 4720,
+   "text": "Thành phần dùng chung",
+   "kind": "title1",
+   "maxW": 1280
+  },
+  "row5": {
+   "x": 0,
+   "y": 5980,
+   "text": "Dark mode — trong bản submit đầu",
+   "kind": "title1",
+   "maxW": 5360
+  }
+ },
+ "designSystems": []
+}
