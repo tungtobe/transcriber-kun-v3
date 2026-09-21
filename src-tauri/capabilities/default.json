@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Capability mặc định cho cửa sổ chính — chỉ core:default (AD-17: không plugin, không entitlement ngoài phạm vi).",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

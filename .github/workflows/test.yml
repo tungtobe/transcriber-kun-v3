@@ -1,0 +1,62 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.18'
+          cache: 'npm'
+
+      # specta 2.0.0-rc.25 dùng `std::fmt::from_fn`, ổn định từ Rust 1.93 — xem
+      # docs/adr/0001-tauri-specta-channel-typed.md. Dùng kênh `stable` thay vì
+      # ghim một bản cụ thể để luôn có Rust đủ mới.
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ matrix.os }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: |
+            ${{ matrix.os }}-cargo-
+
+      - name: npm ci
+        run: npm ci
+
+      - name: check:deps (cổng chặn dependency cấm / externalBin)
+        run: npm run check:deps
+
+      - name: check (svelte-check)
+        run: npm run check
+
+      - name: build frontend
+        run: npm run build
+
+      - name: test (vitest)
+        run: npm test
+
+      - name: cargo test (gồm export_bindings + spike Channel)
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml
+
+      - name: binding drift check (cổng chặn binding lệch)
+        shell: bash
+        run: |
+          git diff --exit-code src/lib/bindings.ts || {
+            echo "::error file=src/lib/bindings.ts::src/lib/bindings.ts lệch bản sinh bởi tauri-specta — chạy 'npm run bindings' rồi commit."
+            exit 1
+          }

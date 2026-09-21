@@ -1,0 +1,26 @@
+import { defineConfig } from 'vitest/config';
+import { svelte } from '@sveltejs/vite-plugin-svelte';
+
+// Tauri cần dev server ở cổng cố định để `beforeDevCommand` khớp `devUrl`.
+const HOST = process.env.TAURI_DEV_HOST;
+
+export default defineConfig({
+  plugins: [svelte()],
+  clearScreen: false,
+  server: {
+    port: 1420,
+    strictPort: true,
+    host: HOST || false,
+    watch: {
+      ignored: ['**/src-tauri/**'],
+    },
+  },
+  build: {
+    outDir: 'dist',
+    emptyOutDir: true,
+  },
+  test: {
+    environment: 'node',
+    include: ['src/**/*.test.ts', 'scripts/**/*.test.mjs'],
+  },
+});
