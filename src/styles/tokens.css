@@ -32,6 +32,7 @@
   --color-warning-border: #f5d9a8;
   --color-info: #1e4e9b;
   --color-info-soft: #e8eef7;
+  --color-info-border: #b9cceb;
   --color-recover: #5b2fa3;
   --color-recover-soft: #f0eafb;
   --color-memo: #0b5d57;
@@ -109,6 +110,7 @@
   --color-warning-border: rgb(245 183 92 / 38%);
   --color-info: #7aa7f0;
   --color-info-soft: rgb(122 167 240 / 14%);
+  --color-info-border: rgb(122 167 240 / 38%);
   --color-recover: #c4a6f5;
   --color-recover-soft: rgb(196 166 245 / 14%);
   --color-memo: #5eead4;

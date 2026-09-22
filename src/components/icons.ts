@@ -11,3 +11,7 @@ export { default as AlertTriangleIcon } from '@lucide/svelte/icons/alert-triangl
 export { default as SparklesIcon } from '@lucide/svelte/icons/sparkles';
 export { default as ChevronRightIcon } from '@lucide/svelte/icons/chevron-right';
 export { default as UploadIcon } from '@lucide/svelte/icons/upload';
+export { default as EyeIcon } from '@lucide/svelte/icons/eye';
+export { default as EyeOffIcon } from '@lucide/svelte/icons/eye-off';
+export { default as CircleCheckIcon } from '@lucide/svelte/icons/circle-check';
+export { default as AlertCircleIcon } from '@lucide/svelte/icons/circle-alert';

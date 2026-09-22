@@ -1,6 +1,37 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
   import { InfoIcon, RadioIcon, UploadIcon } from '../components/icons';
+  import DisabledHint from '../components/DisabledHint.svelte';
+  import BannerStack, { type BannerItem } from '../components/BannerStack.svelte';
   import { i18n } from '../i18n/index.svelte';
+  import { keysStore } from '../lib/stores/keys.svelte';
+
+  onMount(() => {
+    void keysStore.load();
+  });
+
+  // Loading is treated as "not yet confirmed missing" to avoid a flash of
+  // the banner while `keysList` is still in flight; a load error is treated
+  // conservatively as missing (spec I/O Matrix: no banner only once a usable
+  // key is confirmed present).
+  const showKeyBanner = $derived(
+    keysStore.status !== 'idle' && keysStore.status !== 'loading' && !keysStore.hasUsableKey,
+  );
+
+  const banners = $derived.by((): BannerItem[] =>
+    showKeyBanner
+      ? [
+          {
+            id: 'missing-key',
+            variant: 'warning',
+            title: i18n.t('home.banner.keyMissingTitle'),
+            message: i18n.t('home.banner.keyMissingMessage'),
+            actionLabel: i18n.t('home.banner.keyMissingAction'),
+            actionHref: '/settings/gemini',
+          },
+        ]
+      : [],
+  );
 </script>
 
 <svelte:head>
@@ -16,23 +47,27 @@
     <span class="status-pill status-off"><span class="status-dot" aria-hidden="true"></span> {i18n.t('home.header.emptyStatus')}</span>
   </div>
 
+  <div class="key-banner-wrap">
+    <BannerStack {banners} />
+  </div>
+
   <div class="empty-grid">
     <article class="empty-card">
       <div class="empty-icon" aria-hidden="true"><UploadIcon size={18} strokeWidth={1.75} /></div>
       <h2>{i18n.t('home.file.title')}</h2>
       <p>{i18n.t('home.file.description')}</p>
-      <button class="button button-secondary" type="button" aria-disabled="true" title={i18n.t('home.file.unavailable')}>
-        {i18n.t('home.file.action')}
-      </button>
+      <DisabledHint reason={i18n.t('home.file.unavailable')}>
+        <span class="button button-secondary">{i18n.t('home.file.action')}</span>
+      </DisabledHint>
     </article>
 
     <article class="empty-card">
       <div class="empty-icon" aria-hidden="true"><RadioIcon size={18} strokeWidth={1.75} /></div>
       <h2>{i18n.t('home.live.title')}</h2>
       <p>{i18n.t('home.live.description')}</p>
-      <button class="button button-primary" type="button" aria-disabled="true" title={i18n.t('home.live.unavailable')}>
-        {i18n.t('home.live.action')}
-      </button>
+      <DisabledHint reason={i18n.t('home.live.unavailable')}>
+        <span class="button button-primary">{i18n.t('home.live.action')}</span>
+      </DisabledHint>
     </article>
   </div>
 
@@ -101,6 +136,10 @@
     background: var(--color-text-muted);
   }
 
+  .key-banner-wrap:not(:empty) {
+    margin-bottom: var(--space-5);
+  }
+
   .empty-grid {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -135,18 +174,15 @@
   }
 
   .button {
+    display: inline-flex;
     min-height: 36px;
+    align-items: center;
+    justify-content: center;
     padding: 0 14px;
     border: 1px solid transparent;
     border-radius: var(--radius-md);
-    cursor: pointer;
     font-size: var(--text-body-size);
     font-weight: 500;
-  }
-
-  .button[aria-disabled='true'] {
-    cursor: not-allowed;
-    opacity: 0.45;
   }
 
   .button-primary {
