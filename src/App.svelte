@@ -1,22 +1,22 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import { Router } from '@keenmate/svelte-spa-router';
+  import AppShell from './components/AppShell.svelte';
+  import { installKeymap } from './lib/keymap';
+  import { redirectUnknownRoute, routes } from './lib/router';
   import { appStore } from './lib/stores/app.svelte';
+  import { settingsStore } from './lib/stores/settings.svelte';
 
   onMount(() => {
     appStore.loadVersion();
+    const removeKeymap = installKeymap();
+    return () => {
+      removeKeymap();
+      settingsStore.destroy();
+    };
   });
 </script>
 
-<main>
-  <h1>trans-kun</h1>
-  <p>
-    Version:
-    {#if appStore.version.status === 'ok'}
-      {appStore.version.version}
-    {:else if appStore.version.status === 'loading'}
-      …
-    {:else}
-      —
-    {/if}
-  </p>
-</main>
+<AppShell>
+  <Router {routes} restoreScrollState onNotFound={redirectUnknownRoute} />
+</AppShell>

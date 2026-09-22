@@ -6,6 +6,11 @@ const HOST = process.env.TAURI_DEV_HOST;
 
 export default defineConfig({
   plugins: [svelte()],
+  // Testing-library renders Svelte components through the browser runtime;
+  // explicitly prefer its browser condition over Svelte's server entry.
+  resolve: {
+    conditions: ['browser'],
+  },
   clearScreen: false,
   server: {
     port: 1420,

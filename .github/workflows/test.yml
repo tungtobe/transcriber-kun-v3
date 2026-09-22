@@ -41,11 +41,17 @@ jobs:
       - name: check:deps (cổng chặn dependency cấm / externalBin)
         run: npm run check:deps
 
+      - name: check:ui (WCAG contrast / elevation allow-list)
+        run: npm run check:ui
+
       - name: check (svelte-check)
         run: npm run check
 
       - name: build frontend
         run: npm run build
+
+      - name: check:build-assets (local fonts / no remote assets)
+        run: npm run check:build-assets
 
       - name: test (vitest)
         run: npm test
