@@ -35,6 +35,7 @@ regex = "=1.13.1"
 # báo duy nhất, không lặp lại ở dev-dependencies).
 serde_json = { version = "=1.0.151" }
 tokio = { version = "=1.53.1", default-features = false, features = ["macros", "rt", "sync", "time"] }
+reqwest = { version = "=0.13.5", default-features = false, features = ["json", "rustls"] }
 
 # Keyring is intentionally restricted to the two supported desktop stores.
 # Linux is not a supported product target; keeping this dependency target

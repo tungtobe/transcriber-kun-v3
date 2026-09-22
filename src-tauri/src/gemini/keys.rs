@@ -166,6 +166,28 @@ impl KeyPoolHandle {
         response.await.map_err(|_| actor_error())?
     }
 
+    /// Acquire one exact key for a validation request.  A targeted lease
+    /// never falls back to another key, even when the requested key is
+    /// disabled; a successful targeted report is what clears that quarantine.
+    pub async fn acquire_for_key(
+        &self,
+        key_id: &KeyId,
+        priority: Priority,
+        budget: Duration,
+    ) -> Result<KeyLease, AppError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::AcquireForKey {
+                key_id: key_id.clone(),
+                priority,
+                budget,
+                reply,
+            })
+            .await
+            .map_err(|_| actor_error())?;
+        response.await.map_err(|_| actor_error())?
+    }
+
     pub async fn report(
         &self,
         lease: KeyLease,
@@ -174,6 +196,25 @@ impl KeyPoolHandle {
         let (reply, response) = oneshot::channel();
         self.commands
             .send(Command::Report {
+                lease,
+                outcome,
+                reply,
+            })
+            .await
+            .map_err(|_| actor_error())?;
+        response.await.map_err(|_| actor_error())?
+    }
+
+    /// Report the result of an exact-key validation request.  This path only
+    /// changes the state of the leased key and never creates a retry lease.
+    pub async fn report_for_key(
+        &self,
+        lease: KeyLease,
+        outcome: RequestOutcome,
+    ) -> Result<(), AppError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::ReportForKey {
                 lease,
                 outcome,
                 reply,
@@ -210,10 +251,21 @@ enum Command {
         budget: Duration,
         reply: oneshot::Sender<Result<KeyLease, AppError>>,
     },
+    AcquireForKey {
+        key_id: KeyId,
+        priority: Priority,
+        budget: Duration,
+        reply: oneshot::Sender<Result<KeyLease, AppError>>,
+    },
     Report {
         lease: KeyLease,
         outcome: RequestOutcome,
         reply: oneshot::Sender<Result<ReportAction, AppError>>,
+    },
+    ReportForKey {
+        lease: KeyLease,
+        outcome: RequestOutcome,
+        reply: oneshot::Sender<Result<(), AppError>>,
     },
     Cancel {
         request_id: String,
@@ -231,6 +283,7 @@ struct RequestState {
     priority: Priority,
     deadline: Instant,
     attempts: u8,
+    target_key: Option<KeyId>,
 }
 
 struct Pending {
@@ -349,6 +402,30 @@ impl KeyPoolActor {
                         priority,
                         deadline: now + budget,
                         attempts: 0,
+                        target_key: None,
+                    },
+                );
+                self.enqueue(Pending {
+                    request_id,
+                    reply: PendingReply::Acquire(reply),
+                });
+            }
+            Command::AcquireForKey {
+                key_id,
+                priority,
+                budget,
+                reply,
+            } => {
+                let now = self.clock.now();
+                let budget = budget.min(priority.default_budget());
+                let request_id = Uuid::now_v7().to_string();
+                self.requests.insert(
+                    request_id.clone(),
+                    RequestState {
+                        priority,
+                        deadline: now + budget,
+                        attempts: 0,
+                        target_key: Some(key_id),
                     },
                 );
                 self.enqueue(Pending {
@@ -361,12 +438,73 @@ impl KeyPoolActor {
                 outcome,
                 reply,
             } => self.handle_report(lease, outcome, reply),
+            Command::ReportForKey {
+                lease,
+                outcome,
+                reply,
+            } => self.handle_report_for_key(lease, outcome, reply),
             Command::Cancel { request_id, reply } => {
                 self.requests.remove(&request_id);
                 self.cancel_pending(&request_id);
                 let _ = reply.send(());
             }
         }
+    }
+
+    fn handle_report_for_key(
+        &mut self,
+        lease: KeyLease,
+        outcome: RequestOutcome,
+        reply: oneshot::Sender<Result<(), AppError>>,
+    ) {
+        let current = lease.generation == self.generation
+            && self
+                .requests
+                .get(&lease.request_id)
+                .is_some_and(|request| request.target_key.as_ref() == Some(&lease.key_id))
+            && self.keys.iter().any(|key| key.material.id == lease.key_id);
+        if !current {
+            self.requests.remove(&lease.request_id);
+            let _ = reply.send(Err(AppError::new(
+                Code::Auth,
+                "key validation lease is no longer current",
+            )));
+            return;
+        }
+
+        self.requests.remove(&lease.request_id);
+        let key = self
+            .keys
+            .iter_mut()
+            .find(|key| key.material.id == lease.key_id)
+            .expect("current targeted lease must have a matching key");
+
+        let result = match outcome {
+            RequestOutcome::Success => {
+                // A successful check is the only event allowed to restore a
+                // key quarantined by a previous auth failure.
+                key.disabled = false;
+                key.cooldown_until = None;
+                Ok(())
+            }
+            RequestOutcome::Quota => {
+                key.cooldown_until = Some(self.clock.now() + QUOTA_COOLDOWN);
+                Err(AppError::new(Code::Quota, "Gemini key is rate limited"))
+            }
+            RequestOutcome::Auth => {
+                key.disabled = true;
+                Err(AppError::new(Code::Auth, "Gemini key was rejected"))
+            }
+            RequestOutcome::Request => Err(AppError::new(
+                Code::Request,
+                "Gemini key validation request was rejected",
+            )),
+            RequestOutcome::Timeout => Err(AppError::new(
+                Code::Timeout,
+                "Gemini key validation timed out",
+            )),
+        };
+        let _ = reply.send(result);
     }
 
     fn handle_report(
@@ -486,15 +624,36 @@ impl KeyPoolActor {
             let Some(request) = self.requests.get(&pending.request_id) else {
                 continue;
             };
-            if now >= request.deadline {
+            let deadline = request.deadline;
+            let priority = request.priority;
+            let target_key = request.target_key.clone();
+            if now >= deadline {
                 self.requests.remove(&pending.request_id);
                 pending.reply.send(Err(AppError::new(
-                    Code::Quota,
-                    "key request deadline elapsed",
+                    if target_key.is_some() {
+                        Code::Timeout
+                    } else {
+                        Code::Quota
+                    },
+                    if target_key.is_some() {
+                        "key validation deadline elapsed"
+                    } else {
+                        "key request deadline elapsed"
+                    },
                 )));
                 continue;
             }
-            match self.next_key(now) {
+            let key = target_key
+                .as_ref()
+                .and_then(|key_id| self.next_key_for(key_id, now))
+                .or_else(|| {
+                    if target_key.is_none() {
+                        self.next_key(now)
+                    } else {
+                        None
+                    }
+                });
+            match key {
                 Some(material) => {
                     let request = self
                         .requests
@@ -506,11 +665,24 @@ impl KeyPoolActor {
                         key_id: material.id,
                         secret: material.secret,
                         generation: self.generation,
-                        priority: request.priority,
+                        priority,
                     };
                     pending.reply.send(Ok(lease));
                 }
-                None if self.keys.iter().all(|key| key.disabled) => {
+                None if target_key.is_some()
+                    && !self.keys.iter().any(|key| {
+                        target_key
+                            .as_ref()
+                            .is_some_and(|target| &key.material.id == target)
+                    }) =>
+                {
+                    self.requests.remove(&pending.request_id);
+                    pending.reply.send(Err(AppError::new(
+                        Code::Auth,
+                        "requested Gemini key is no longer available",
+                    )));
+                }
+                None if target_key.is_none() && self.keys.iter().all(|key| key.disabled) => {
                     self.requests.remove(&pending.request_id);
                     pending.reply.send(Err(AppError::new(
                         Code::Auth,
@@ -539,6 +711,16 @@ impl KeyPoolActor {
             }
         }
         None
+    }
+
+    fn next_key_for(&self, key_id: &KeyId, now: Instant) -> Option<KeyMaterial> {
+        self.keys.iter().find_map(|key| {
+            if &key.material.id == key_id && !key.cooldown_until.is_some_and(|until| now < until) {
+                Some(key.material.clone())
+            } else {
+                None
+            }
+        })
     }
 
     fn pop_pending(&mut self, now: Instant) -> Option<Pending> {
@@ -774,6 +956,7 @@ mod tests {
                 priority: Priority::Job,
                 deadline: clock.now() + Duration::from_secs(30),
                 attempts: 0,
+                target_key: None,
             },
         );
         let (reply, response) = oneshot::channel();
@@ -953,6 +1136,7 @@ mod tests {
                     priority,
                     deadline,
                     attempts: 0,
+                    target_key: None,
                 },
             );
             let (reply, _response) = oneshot::channel();

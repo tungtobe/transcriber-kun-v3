@@ -1,12 +1,38 @@
-//! Single Gemini gateway seam. Story 1.5 keeps the transport fake, but the
-//! gate is real: no transport closure is invoked until consent is current.
+//! The single Gemini REST gateway.
+//!
+//! Feature code never constructs a URL, adds an API key header, or calls
+//! `reqwest` directly. The gateway owns that contract and receives only a
+//! normalized request at its transport port, which keeps consent, key
+//! rotation, pagination, cancellation, and error redaction in one place.
 
 pub mod keys;
 pub mod params;
 
+use std::collections::HashSet;
+use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+use specta::Type;
+use tokio::sync::Notify;
+use tokio::time::Instant;
+
 use crate::consent;
 use crate::core::error::{AppError, Code};
+use crate::core::Sensitive;
+use crate::secrets::KeyId;
 
+use self::keys::{KeyPoolHandle, Priority, ReportAction, RequestOutcome};
+use self::params::{
+    DEFAULT_MODELS_PAGE_SIZE, GEMINI_BASE_URL, KEY_TEST_TIMEOUT, MODELS_LIST_TIMEOUT, MODELS_PATH,
+};
+
+/// Preserve the Story 1.5 seam for callers that only need a consent-gated
+/// one-shot operation. The real gateway below uses the same invariant.
 pub fn guarded_request<T>(
     accepted_version: u32,
     declined: bool,
@@ -21,9 +47,1130 @@ pub fn guarded_request<T>(
     transport()
 }
 
+/// The small consent snapshot needed by the gateway. IPC reads this from the
+/// durable settings database immediately before invoking a gateway operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConsentSnapshot {
+    pub accepted_version: u32,
+    pub declined: bool,
+}
+
+impl ConsentSnapshot {
+    pub const fn new(accepted_version: u32, declined: bool) -> Self {
+        Self {
+            accepted_version,
+            declined,
+        }
+    }
+
+    pub const fn is_current(self) -> bool {
+        consent::is_current(self.accepted_version, self.declined)
+    }
+}
+
+fn require_consent(snapshot: ConsentSnapshot) -> Result<(), AppError> {
+    if snapshot.is_current() {
+        Ok(())
+    } else {
+        Err(AppError::new(
+            Code::Blocked,
+            "Gemini transport requires current consent",
+        ))
+    }
+}
+
+/// Model families exposed to the rest of the application. Filtering is
+/// performed from API capability metadata, never from a model alias/name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelKind {
+    Transcribe,
+    Live,
+    Memo,
+}
+
+/// Safe model metadata returned to the frontend and later feature modules.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelInfo {
+    pub name: String,
+    pub display_name: String,
+    pub supported_generation_methods: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyTestResult {
+    pub key_id: KeyId,
+    pub valid: bool,
+}
+
+/// A cancellation handle for one foreground gateway operation. It is
+/// notification based (not a timer/poll loop), so dropping a request really
+/// cancels the in-flight transport future.
+#[derive(Clone, Default)]
+pub struct CancellationToken {
+    inner: Arc<CancellationState>,
+}
+
+#[derive(Default)]
+struct CancellationState {
+    cancelled: AtomicBool,
+    notify: Notify,
+}
+
+impl fmt::Debug for CancellationToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CancellationToken")
+            .field("cancelled", &self.is_cancelled())
+            .finish()
+    }
+}
+
+impl CancellationToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        self.inner.cancelled.store(true, Ordering::Release);
+        self.inner.notify.notify_waiters();
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.inner.cancelled.load(Ordering::Acquire)
+    }
+
+    async fn cancelled(&self) {
+        loop {
+            let notified = self.inner.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// The normalized method set accepted by the gateway transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpMethod {
+    Get,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct TransportHeader {
+    pub name: String,
+    pub value: Sensitive<String>,
+}
+
+impl fmt::Debug for TransportHeader {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TransportHeader")
+            .field("name", &self.name)
+            .field("value", &self.value)
+            .finish()
+    }
+}
+
+/// A request contains a path and query only — never a full URL or a key in
+/// query parameters. Header values stay wrapped while crossing the port.
+#[derive(Clone, PartialEq, Eq)]
+pub struct TransportRequest {
+    pub method: HttpMethod,
+    pub path: String,
+    pub query: Vec<(String, String)>,
+    pub headers: Vec<TransportHeader>,
+}
+
+impl fmt::Debug for TransportRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TransportRequest")
+            .field("method", &self.method)
+            .field("path", &self.path)
+            .field("query", &self.query)
+            .field("headers", &self.headers)
+            .finish()
+    }
+}
+
+impl TransportRequest {
+    fn models(secret: Sensitive<String>, page_token: Option<&str>) -> Self {
+        let mut query = vec![("pageSize".to_string(), DEFAULT_MODELS_PAGE_SIZE.to_string())];
+        if let Some(page_token) = page_token {
+            query.push(("pageToken".to_string(), page_token.to_owned()));
+        }
+        Self {
+            method: HttpMethod::Get,
+            path: MODELS_PATH.to_string(),
+            query,
+            headers: vec![TransportHeader {
+                name: "x-goog-api-key".to_string(),
+                value: secret,
+            }],
+        }
+    }
+
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|header| header.name.eq_ignore_ascii_case(name))
+            .map(|header| header.value.expose().as_str())
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct TransportResponse {
+    pub status: u16,
+    pub body: String,
+}
+
+impl fmt::Debug for TransportResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TransportResponse")
+            .field("status", &self.status)
+            .field("body", &"[redacted]")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportError {
+    Tls,
+    Timeout,
+    Network,
+}
+
+pub type TransportFuture =
+    Pin<Box<dyn Future<Output = Result<TransportResponse, TransportError>> + Send>>;
+
+/// Port used by the gateway. Production uses [`ReqwestTransport`]; tests
+/// provide a deterministic fake that can lock method/path/header and return
+/// pages or transport failures without opening a socket.
+pub trait GeminiTransport: Send + Sync + 'static {
+    fn send(&self, request: TransportRequest) -> TransportFuture;
+}
+
+/// Production REST transport. Reqwest's `rustls` feature is configured in
+/// Cargo.toml with its platform verifier, so OS trust stores (including
+/// corporate proxy CAs) are used and bundled WebPKI roots are not.
+#[derive(Clone)]
+pub struct ReqwestTransport {
+    client: reqwest::Client,
+    base_url: reqwest::Url,
+}
+
+impl fmt::Debug for ReqwestTransport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ReqwestTransport { client: [redacted], base_url: [redacted] }")
+    }
+}
+
+impl ReqwestTransport {
+    pub fn new() -> Result<Self, AppError> {
+        let client = reqwest::Client::builder()
+            .build()
+            .map_err(|_| AppError::new(Code::Tls, "Gemini TLS client could not be initialized"))?;
+        let base_url = reqwest::Url::parse(GEMINI_BASE_URL)
+            .map_err(|_| AppError::new(Code::Tls, "Gemini endpoint could not be initialized"))?;
+        Ok(Self { client, base_url })
+    }
+
+    pub fn with_client(client: reqwest::Client) -> Result<Self, AppError> {
+        let base_url = reqwest::Url::parse(GEMINI_BASE_URL)
+            .map_err(|_| AppError::new(Code::Tls, "Gemini endpoint could not be initialized"))?;
+        Ok(Self { client, base_url })
+    }
+}
+
+impl GeminiTransport for ReqwestTransport {
+    fn send(&self, request: TransportRequest) -> TransportFuture {
+        let client = self.client.clone();
+        let base_url = self.base_url.clone();
+        Box::pin(async move {
+            let mut url = base_url
+                .join(&request.path)
+                .map_err(|_| TransportError::Network)?;
+            {
+                let mut pairs = url.query_pairs_mut();
+                for (name, value) in &request.query {
+                    pairs.append_pair(name, value);
+                }
+            }
+
+            let method = match request.method {
+                HttpMethod::Get => reqwest::Method::GET,
+            };
+            let mut builder = client.request(method, url);
+            for header in request.headers {
+                let name = reqwest::header::HeaderName::from_bytes(header.name.as_bytes())
+                    .map_err(|_| TransportError::Network)?;
+                let value = reqwest::header::HeaderValue::from_str(header.value.expose())
+                    .map_err(|_| TransportError::Network)?;
+                builder = builder.header(name, value);
+            }
+
+            let response = builder.send().await.map_err(map_reqwest_error)?;
+            let status = response.status().as_u16();
+            let body = response.text().await.map_err(map_reqwest_error)?;
+            Ok(TransportResponse { status, body })
+        })
+    }
+}
+
+fn map_reqwest_error(error: reqwest::Error) -> TransportError {
+    if error.is_timeout() {
+        return TransportError::Timeout;
+    }
+
+    let diagnostic = format!("{error:?}").to_ascii_lowercase();
+    if [
+        "tls",
+        "rustls",
+        "certificate",
+        "cert verify",
+        "unknown issuer",
+        "invalid peer certificate",
+    ]
+    .iter()
+    .any(|marker| diagnostic.contains(marker))
+    {
+        TransportError::Tls
+    } else {
+        TransportError::Network
+    }
+}
+
+#[derive(Clone)]
+pub struct GeminiGateway {
+    transport: Arc<dyn GeminiTransport>,
+    key_pool: KeyPoolHandle,
+}
+
+impl fmt::Debug for GeminiGateway {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GeminiGateway")
+            .field("transport", &"[redacted]")
+            .field("key_pool", &"[actor]")
+            .finish()
+    }
+}
+
+impl GeminiGateway {
+    pub fn new(transport: Arc<dyn GeminiTransport>, key_pool: KeyPoolHandle) -> Self {
+        Self {
+            transport,
+            key_pool,
+        }
+    }
+
+    pub fn production(key_pool: KeyPoolHandle) -> Result<Self, AppError> {
+        Ok(Self::new(Arc::new(ReqwestTransport::new()?), key_pool))
+    }
+
+    pub async fn models_list(
+        &self,
+        kind: ModelKind,
+        consent: ConsentSnapshot,
+        cancellation: CancellationToken,
+    ) -> Result<Vec<ModelInfo>, AppError> {
+        self.models_list_with_timeout(kind, consent, cancellation, MODELS_LIST_TIMEOUT)
+            .await
+    }
+
+    pub async fn list_models(
+        &self,
+        kind: ModelKind,
+        consent: ConsentSnapshot,
+        cancellation: CancellationToken,
+    ) -> Result<Vec<ModelInfo>, AppError> {
+        self.models_list(kind, consent, cancellation).await
+    }
+
+    pub async fn models_list_with_timeout(
+        &self,
+        kind: ModelKind,
+        consent: ConsentSnapshot,
+        cancellation: CancellationToken,
+        timeout: Duration,
+    ) -> Result<Vec<ModelInfo>, AppError> {
+        require_consent(consent)?;
+        let deadline = Instant::now() + timeout;
+        let priority = priority_for(kind);
+        let mut next_page_token = None;
+        let mut seen_page_tokens = HashSet::new();
+        let mut models = Vec::new();
+        let mut seen_models = HashSet::new();
+
+        loop {
+            let remaining = remaining(deadline)?;
+            let acquire = self.key_pool.acquire_with_budget(priority, remaining);
+            tokio::pin!(acquire);
+            let mut lease = tokio::select! {
+                result = &mut acquire => result?,
+                _ = cancellation.cancelled() => return Err(cancelled_error()),
+            };
+
+            let page = loop {
+                if cancellation.is_cancelled() {
+                    let _ = self.key_pool.cancel(lease.request_id.clone()).await;
+                    return Err(cancelled_error());
+                }
+                let request =
+                    TransportRequest::models(lease.secret.clone(), next_page_token.as_deref());
+                let response = self
+                    .send(request, deadline, &cancellation, &lease.request_id)
+                    .await;
+                let response = match response {
+                    Ok(response) => response,
+                    Err(error) => {
+                        let _ = self.key_pool.report(lease, outcome_for_error(&error)).await;
+                        return Err(error);
+                    }
+                };
+
+                if let Some((outcome, error)) = classify_http_status(response.status) {
+                    match outcome {
+                        RequestOutcome::Quota | RequestOutcome::Auth => {
+                            match self.key_pool.report(lease, outcome).await {
+                                Ok(ReportAction::Retry(next)) => {
+                                    lease = next;
+                                    continue;
+                                }
+                                Ok(ReportAction::Complete) => return Err(error),
+                                Err(report_error) => return Err(report_error),
+                            }
+                        }
+                        RequestOutcome::Request | RequestOutcome::Timeout => {
+                            let _ = self.key_pool.report(lease, outcome).await;
+                            return Err(error);
+                        }
+                        RequestOutcome::Success => unreachable!(),
+                    }
+                }
+
+                let parsed = match parse_models_page(&response.body) {
+                    Ok(parsed) => parsed,
+                    Err(error) => {
+                        let _ = self.key_pool.report(lease, RequestOutcome::Request).await;
+                        return Err(error);
+                    }
+                };
+                let _ = self.key_pool.report(lease, RequestOutcome::Success).await;
+                break parsed;
+            };
+
+            for model in page.models {
+                if supports_kind(&model, kind) && seen_models.insert(model.name.clone()) {
+                    models.push(model);
+                }
+            }
+
+            let Some(token) = page.next_page_token else {
+                break;
+            };
+            if token.is_empty() || !seen_page_tokens.insert(token.clone()) {
+                return Err(AppError::new(
+                    Code::Shape,
+                    "Gemini models pagination token repeated or invalid",
+                ));
+            }
+            next_page_token = Some(token);
+        }
+
+        Ok(models)
+    }
+
+    pub async fn keys_test(
+        &self,
+        key_id: KeyId,
+        consent: ConsentSnapshot,
+        cancellation: CancellationToken,
+    ) -> Result<KeyTestResult, AppError> {
+        self.keys_test_with_timeout(key_id, consent, cancellation, KEY_TEST_TIMEOUT)
+            .await
+    }
+
+    pub async fn keys_test_with_timeout(
+        &self,
+        key_id: KeyId,
+        consent: ConsentSnapshot,
+        cancellation: CancellationToken,
+        timeout: Duration,
+    ) -> Result<KeyTestResult, AppError> {
+        require_consent(consent)?;
+        let deadline = Instant::now() + timeout;
+        let remaining = remaining(deadline)?;
+        let lease = {
+            let acquire = self
+                .key_pool
+                .acquire_for_key(&key_id, Priority::Job, remaining);
+            tokio::pin!(acquire);
+            tokio::select! {
+                result = &mut acquire => result?,
+                _ = cancellation.cancelled() => return Err(cancelled_error()),
+            }
+        };
+        let request = TransportRequest::models(lease.secret.clone(), None);
+        let response = match self
+            .send(request, deadline, &cancellation, &lease.request_id)
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                let _ = self
+                    .key_pool
+                    .report_for_key(lease, outcome_for_error(&error))
+                    .await;
+                return Err(error);
+            }
+        };
+
+        if let Some((outcome, error)) = classify_http_status(response.status) {
+            let report = self.key_pool.report_for_key(lease, outcome).await;
+            return match report {
+                Ok(()) => Err(error),
+                Err(report_error) if report_error.code == Code::Auth => Err(report_error),
+                Err(_) => Err(error),
+            };
+        }
+
+        if let Err(error) = parse_models_page(&response.body) {
+            let _ = self
+                .key_pool
+                .report_for_key(lease, RequestOutcome::Success)
+                .await;
+            return Err(error);
+        }
+        self.key_pool
+            .report_for_key(lease, RequestOutcome::Success)
+            .await?;
+        Ok(KeyTestResult {
+            key_id,
+            valid: true,
+        })
+    }
+
+    async fn send(
+        &self,
+        request: TransportRequest,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+        request_id: &str,
+    ) -> Result<TransportResponse, AppError> {
+        if cancellation.is_cancelled() {
+            let _ = self.key_pool.cancel(request_id.to_owned()).await;
+            return Err(cancelled_error());
+        }
+
+        let transport = self.transport.send(request);
+        tokio::pin!(transport);
+        tokio::select! {
+            result = tokio::time::timeout_at(deadline, &mut transport) => match result {
+                Ok(Ok(response)) => Ok(response),
+                Ok(Err(error)) => Err(transport_error(error)),
+                Err(_) => Err(AppError::new(Code::Timeout, "Gemini request timed out")),
+            },
+            _ = cancellation.cancelled() => {
+                let _ = self.key_pool.cancel(request_id.to_owned()).await;
+                Err(cancelled_error())
+            }
+        }
+    }
+}
+
+fn priority_for(kind: ModelKind) -> Priority {
+    match kind {
+        ModelKind::Live => Priority::Live,
+        ModelKind::Transcribe => Priority::Job,
+        ModelKind::Memo => Priority::Memo,
+    }
+}
+
+fn remaining(deadline: Instant) -> Result<Duration, AppError> {
+    let now = Instant::now();
+    deadline
+        .checked_duration_since(now)
+        .ok_or_else(|| AppError::new(Code::Timeout, "Gemini operation timed out"))
+}
+
+fn cancelled_error() -> AppError {
+    AppError::new(Code::Blocked, "Gemini operation was cancelled")
+}
+
+fn outcome_for_error(error: &AppError) -> RequestOutcome {
+    match error.code {
+        Code::Timeout => RequestOutcome::Timeout,
+        _ => RequestOutcome::Request,
+    }
+}
+
+fn transport_error(error: TransportError) -> AppError {
+    match error {
+        TransportError::Tls => AppError::new(Code::Tls, "Gemini TLS or CA verification failed"),
+        TransportError::Timeout => AppError::new(Code::Timeout, "Gemini request timed out"),
+        TransportError::Network => AppError::new(Code::Network, "Gemini network request failed"),
+    }
+}
+
+fn classify_http_status(status: u16) -> Option<(RequestOutcome, AppError)> {
+    let (outcome, code, detail) = match status {
+        401 | 403 => (
+            RequestOutcome::Auth,
+            Code::Auth,
+            "Gemini authentication failed",
+        ),
+        404 => (
+            RequestOutcome::Request,
+            Code::Model,
+            "Gemini model endpoint was not found",
+        ),
+        429 => (
+            RequestOutcome::Quota,
+            Code::Quota,
+            "Gemini quota was exhausted",
+        ),
+        451 => (
+            RequestOutcome::Request,
+            Code::Blocked,
+            "Gemini request was blocked",
+        ),
+        400..=499 => (
+            RequestOutcome::Request,
+            Code::Request,
+            "Gemini request was rejected",
+        ),
+        500..=599 => (
+            RequestOutcome::Request,
+            Code::Network,
+            "Gemini service is unavailable",
+        ),
+        _ => return None,
+    };
+    Some((outcome, AppError::new(code, detail)))
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelsPageDto {
+    models: Option<Vec<ModelDto>>,
+    #[serde(rename = "nextPageToken")]
+    next_page_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelDto {
+    name: Option<String>,
+    #[serde(rename = "displayName")]
+    display_name: Option<String>,
+    #[serde(rename = "supportedGenerationMethods", default)]
+    supported_generation_methods: Vec<String>,
+}
+
+#[derive(Debug)]
+struct ModelsPage {
+    models: Vec<ModelInfo>,
+    next_page_token: Option<String>,
+}
+
+fn parse_models_page(body: &str) -> Result<ModelsPage, AppError> {
+    let dto: ModelsPageDto = serde_json::from_str(body)
+        .map_err(|_| AppError::new(Code::Shape, "Gemini models response has invalid shape"))?;
+    let models = dto
+        .models
+        .ok_or_else(|| AppError::new(Code::Shape, "Gemini models response omitted models"))?
+        .into_iter()
+        .map(|model| {
+            let name = model
+                .name
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| AppError::new(Code::Shape, "Gemini model omitted its name"))?;
+            Ok(ModelInfo {
+                display_name: model.display_name.unwrap_or_else(|| name.clone()),
+                name,
+                supported_generation_methods: model.supported_generation_methods,
+            })
+        })
+        .collect::<Result<Vec<_>, AppError>>()?;
+    Ok(ModelsPage {
+        models,
+        next_page_token: dto.next_page_token,
+    })
+}
+
+fn supports_kind(model: &ModelInfo, kind: ModelKind) -> bool {
+    let allowed = match kind {
+        ModelKind::Transcribe | ModelKind::Memo => &["generateContent"][..],
+        ModelKind::Live => &["bidiGenerateContent"][..],
+    };
+    model
+        .supported_generation_methods
+        .iter()
+        .any(|method| allowed.iter().any(|allowed| method == allowed))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gemini::keys::{Clock, KeyPoolHandle, KeyProvider};
+    use crate::secrets::KeyMaterial;
+    use std::sync::Mutex;
+    use tokio::sync::Notify;
+
+    struct FakeProvider {
+        keys: Mutex<Vec<KeyMaterial>>,
+    }
+
+    impl KeyProvider for FakeProvider {
+        fn load_keys(&self) -> Result<Vec<KeyMaterial>, AppError> {
+            Ok(self.keys.lock().unwrap().clone())
+        }
+    }
+
+    struct FakeClock {
+        now: Mutex<Instant>,
+        changed: Notify,
+    }
+
+    impl FakeClock {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                now: Mutex::new(Instant::now()),
+                changed: Notify::new(),
+            })
+        }
+    }
+
+    impl Clock for FakeClock {
+        fn now(&self) -> Instant {
+            *self.now.lock().unwrap()
+        }
+
+        fn sleep_until(&self, deadline: Instant) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            Box::pin(async move {
+                while self.now() < deadline {
+                    self.changed.notified().await;
+                }
+            })
+        }
+    }
+
+    fn key(id: &str, secret: &str) -> KeyMaterial {
+        KeyMaterial::new(KeyId::from_opaque(id), secret.to_string())
+    }
+
+    async fn gateway_with(
+        keys: Vec<KeyMaterial>,
+        transport: Arc<dyn GeminiTransport>,
+    ) -> GeminiGateway {
+        let provider = Arc::new(FakeProvider {
+            keys: Mutex::new(keys),
+        });
+        let clock = FakeClock::new();
+        let (pool, actor) = KeyPoolHandle::channel(provider, clock);
+        tokio::spawn(actor.run());
+        pool.refresh().await.unwrap();
+        GeminiGateway::new(transport, pool)
+    }
+
+    #[derive(Clone)]
+    struct FakeTransport {
+        responses: Arc<Mutex<Vec<Result<TransportResponse, TransportError>>>>,
+        requests: Arc<Mutex<Vec<TransportRequest>>>,
+    }
+
+    impl FakeTransport {
+        fn new(responses: Vec<Result<TransportResponse, TransportError>>) -> Arc<Self> {
+            Arc::new(Self {
+                responses: Arc::new(Mutex::new(responses)),
+                requests: Arc::new(Mutex::new(Vec::new())),
+            })
+        }
+
+        fn requests(&self) -> Vec<TransportRequest> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    impl GeminiTransport for FakeTransport {
+        fn send(&self, request: TransportRequest) -> TransportFuture {
+            self.requests.lock().unwrap().push(request);
+            let response = self.responses.lock().unwrap().remove(0);
+            Box::pin(async move { response })
+        }
+    }
+
+    #[derive(Default)]
+    struct PendingTransport {
+        requests: Mutex<Vec<TransportRequest>>,
+    }
+
+    impl GeminiTransport for PendingTransport {
+        fn send(&self, request: TransportRequest) -> TransportFuture {
+            self.requests.lock().unwrap().push(request);
+            Box::pin(std::future::pending())
+        }
+    }
+
+    fn page(models: &str, token: Option<&str>) -> TransportResponse {
+        let token = token
+            .map(|token| format!(",\"nextPageToken\":\"{token}\""))
+            .unwrap_or_default();
+        TransportResponse {
+            status: 200,
+            body: format!("{{\"models\":[{models}]{token}}}"),
+        }
+    }
+
+    fn model(name: &str, methods: &str) -> String {
+        format!(
+            "{{\"name\":\"{name}\",\"displayName\":\"{name}\",\"supportedGenerationMethods\":[{methods}]}}"
+        )
+    }
+
+    #[tokio::test]
+    async fn consent_blocks_before_pool_or_transport() {
+        let transport = FakeTransport::new(vec![]);
+        let gateway = gateway_with(vec![key("a", "AIzaA123456789")], transport.clone()).await;
+        let error = gateway
+            .models_list(
+                ModelKind::Transcribe,
+                ConsentSnapshot::new(0, false),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, Code::Blocked);
+        assert!(transport.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_reads_pages_dedupes_and_filters_only_metadata_capabilities() {
+        let transport = FakeTransport::new(vec![
+            Ok(page(
+                &format!(
+                    "{},{}",
+                    model("models/a", "\"generateContent\""),
+                    model("models/live", "\"bidiGenerateContent\"")
+                ),
+                Some("page-2"),
+            )),
+            Ok(page(
+                &format!(
+                    "{},{}",
+                    model("models/a", "\"generateContent\""),
+                    model("models/b", "\"countTokens\"")
+                ),
+                None,
+            )),
+        ]);
+        let gateway = gateway_with(vec![key("a", "AIzaA123456789")], transport.clone()).await;
+        let models = gateway
+            .models_list(
+                ModelKind::Transcribe,
+                ConsentSnapshot::new(1, false),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.name.as_str())
+                .collect::<Vec<_>>(),
+            ["models/a"]
+        );
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].method, HttpMethod::Get);
+        assert_eq!(requests[0].path, MODELS_PATH);
+        assert_eq!(requests[0].header("x-goog-api-key"), Some("AIzaA123456789"));
+        assert!(requests[0].query.iter().all(|(name, _)| name != "key"));
+        assert_eq!(
+            requests[1]
+                .query
+                .iter()
+                .find(|(name, _)| name == "pageToken")
+                .map(|(_, value)| value.as_str()),
+            Some("page-2")
+        );
+    }
+
+    #[tokio::test]
+    async fn live_filter_uses_capability_metadata_not_model_name() {
+        let transport = FakeTransport::new(vec![Ok(page(
+            &format!(
+                "{},{}",
+                model("models/name-says-live-but-is-rest", "\"generateContent\""),
+                model("models/opaque-alias", "\"bidiGenerateContent\"")
+            ),
+            None,
+        ))]);
+        let gateway = gateway_with(vec![key("a", "AIzaA123456789")], transport).await;
+        let models = gateway
+            .models_list(
+                ModelKind::Live,
+                ConsentSnapshot::new(1, false),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.name.as_str())
+                .collect::<Vec<_>>(),
+            ["models/opaque-alias"]
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_page_token_is_shape_error() {
+        let transport = FakeTransport::new(vec![
+            Ok(page(
+                &model("models/a", "\"generateContent\""),
+                Some("same"),
+            )),
+            Ok(page(
+                &model("models/b", "\"generateContent\""),
+                Some("same"),
+            )),
+        ]);
+        let gateway = gateway_with(vec![key("a", "AIzaA123456789")], transport).await;
+        let error = gateway
+            .models_list(
+                ModelKind::Transcribe,
+                ConsentSnapshot::new(1, false),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, Code::Shape);
+    }
+
+    #[tokio::test]
+    async fn quota_rotates_to_the_next_key() {
+        let transport = FakeTransport::new(vec![
+            Ok(TransportResponse {
+                status: 429,
+                body: "quota body containing AIzaSECRET".to_string(),
+            }),
+            Ok(page(&model("models/a", "\"generateContent\""), None)),
+        ]);
+        let gateway = gateway_with(
+            vec![key("a", "AIzaA123456789"), key("b", "AQ.B123456789")],
+            transport.clone(),
+        )
+        .await;
+        let models = gateway
+            .models_list(
+                ModelKind::Transcribe,
+                ConsentSnapshot::new(1, false),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(models.len(), 1);
+        let requests = transport.requests();
+        assert_eq!(requests[0].header("x-goog-api-key"), Some("AIzaA123456789"));
+        assert_eq!(requests[1].header("x-goog-api-key"), Some("AQ.B123456789"));
+    }
+
+    #[tokio::test]
+    async fn cancellation_and_transport_failures_are_typed_and_redacted() {
+        for (transport_error, code) in [
+            (TransportError::Tls, Code::Tls),
+            (TransportError::Timeout, Code::Timeout),
+            (TransportError::Network, Code::Network),
+        ] {
+            let transport = FakeTransport::new(vec![Err(transport_error)]);
+            let gateway = gateway_with(vec![key("a", "AIzaA123456789")], transport).await;
+            let error = gateway
+                .models_list(
+                    ModelKind::Transcribe,
+                    ConsentSnapshot::new(1, false),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, code);
+            assert!(!error.detail_redacted.contains("AIza"));
+        }
+
+        let transport = FakeTransport::new(vec![]);
+        let gateway = gateway_with(vec![key("a", "AIzaA123456789")], transport).await;
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let error = gateway
+            .models_list(
+                ModelKind::Transcribe,
+                ConsentSnapshot::new(1, false),
+                cancellation,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, Code::Blocked);
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_an_inflight_transport() {
+        let transport = Arc::new(PendingTransport::default());
+        let gateway = gateway_with(vec![key("a", "AIzaA123456789")], transport.clone()).await;
+        let cancellation = CancellationToken::new();
+        let operation_cancellation = cancellation.clone();
+        let operation = tokio::spawn(async move {
+            gateway
+                .models_list(
+                    ModelKind::Transcribe,
+                    ConsentSnapshot::new(1, false),
+                    operation_cancellation,
+                )
+                .await
+        });
+        while transport.requests.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+        cancellation.cancel();
+        let error = tokio::time::timeout(Duration::from_millis(100), operation)
+            .await
+            .expect("cancellation must interrupt transport")
+            .expect("gateway task must not panic")
+            .unwrap_err();
+        assert_eq!(error.code, Code::Blocked);
+        assert_eq!(transport.requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn key_test_isolated_to_target() {
+        let transport = FakeTransport::new(vec![Ok(page(
+            &model("models/a", "\"generateContent\""),
+            None,
+        ))]);
+        let gateway = gateway_with(
+            vec![key("a", "AIzaA123456789"), key("b", "AQ.B123456789")],
+            transport.clone(),
+        )
+        .await;
+        let result = gateway
+            .keys_test(
+                KeyId::from_opaque("b"),
+                ConsentSnapshot::new(1, false),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.key_id, KeyId::from_opaque("b"));
+        assert_eq!(
+            transport.requests()[0].header("x-goog-api-key"),
+            Some("AQ.B123456789")
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_target_key_never_falls_back_and_only_success_restores_it() {
+        let transport = FakeTransport::new(vec![
+            Ok(TransportResponse {
+                status: 401,
+                body: "rejected".to_string(),
+            }),
+            Ok(page(&model("models/a", "\"generateContent\""), None)),
+            Ok(page(&model("models/b", "\"generateContent\""), None)),
+        ]);
+        let gateway = gateway_with(
+            vec![key("a", "AIzaA123456789"), key("b", "AQ.B123456789")],
+            transport.clone(),
+        )
+        .await;
+
+        let error = gateway
+            .keys_test(
+                KeyId::from_opaque("b"),
+                ConsentSnapshot::new(1, false),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, Code::Auth);
+
+        gateway
+            .models_list(
+                ModelKind::Transcribe,
+                ConsentSnapshot::new(1, false),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        gateway
+            .keys_test(
+                KeyId::from_opaque("b"),
+                ConsentSnapshot::new(1, false),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0].header("x-goog-api-key"), Some("AQ.B123456789"));
+        assert_eq!(requests[1].header("x-goog-api-key"), Some("AIzaA123456789"));
+        assert_eq!(requests[2].header("x-goog-api-key"), Some("AQ.B123456789"));
+    }
+
+    #[test]
+    fn http_statuses_and_default_models_are_stable() {
+        for (status, code) in [
+            (401, Code::Auth),
+            (403, Code::Auth),
+            (404, Code::Model),
+            (429, Code::Quota),
+            (451, Code::Blocked),
+            (400, Code::Request),
+            (503, Code::Network),
+        ] {
+            assert_eq!(classify_http_status(status).unwrap().1.code, code);
+        }
+        assert!(classify_http_status(200).is_none());
+        assert_eq!(params::DEFAULT_TRANSCRIBE_MODEL, "gemini-flash-lite-latest");
+        assert_eq!(params::DEFAULT_MEMO_MODEL, "gemini-flash-lite-latest");
+        assert_eq!(
+            params::DEFAULT_LIVE_MODEL,
+            "gemini-3.5-live-translate-preview"
+        );
+    }
+
+    #[test]
+    fn transport_debug_never_reveals_key_or_response_body() {
+        let request =
+            TransportRequest::models(Sensitive::new("AIzaSECRET123456".to_string()), None);
+        let response = TransportResponse {
+            status: 200,
+            body: "body containing AIzaSECRET".to_string(),
+        };
+        assert!(!format!("{request:?}").contains("AIzaSECRET"));
+        assert!(!format!("{response:?}").contains("body containing"));
+    }
+}
+
+#[cfg(test)]
+mod consent_tests {
+    use super::*;
+
+    #[test]
+    fn current_consent_opens_transport_once() {
+        let mut calls = 0;
+        let result = guarded_request(1, false, || {
+            calls += 1;
+            Ok::<_, AppError>("fake response")
+        });
+        assert_eq!(result.unwrap(), "fake response");
+        assert_eq!(calls, 1);
+    }
 
     #[test]
     fn pending_declined_and_stale_never_open_transport() {
@@ -36,16 +1183,5 @@ mod tests {
             assert!(result.is_err());
             assert_eq!(calls, 0);
         }
-    }
-
-    #[test]
-    fn current_consent_opens_transport_once() {
-        let mut calls = 0;
-        let result = guarded_request(1, false, || {
-            calls += 1;
-            Ok::<_, AppError>("fake response")
-        });
-        assert_eq!(result.unwrap(), "fake response");
-        assert_eq!(calls, 1);
     }
 }

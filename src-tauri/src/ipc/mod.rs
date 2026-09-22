@@ -15,6 +15,7 @@ use tauri_specta::{collect_commands, collect_events, Builder, Event};
 use crate::consent::{self, ConsentPolicy};
 use crate::core::error::{AppError, Code};
 use crate::db::Db;
+use crate::gemini::{CancellationToken, ConsentSnapshot, KeyTestResult, ModelInfo, ModelKind};
 use crate::secrets::{KeyId, KeyMetadata};
 use crate::settings::{self, Settings, SettingsChanged};
 use boot::AppState;
@@ -40,6 +41,14 @@ fn get_settings(db: &Result<Arc<Db>, AppError>) -> Result<Settings, AppError> {
 fn get_consent_policy(db: &Result<Arc<Db>, AppError>) -> Result<ConsentPolicy, AppError> {
     let settings = get_settings(db)?;
     Ok(consent::policy(
+        settings.consent_accepted_version,
+        settings.consent_declined,
+    ))
+}
+
+fn get_gemini_consent(db: &Result<Arc<Db>, AppError>) -> Result<ConsentSnapshot, AppError> {
+    let settings = get_settings(db)?;
+    Ok(ConsentSnapshot::new(
         settings.consent_accepted_version,
         settings.consent_declined,
     ))
@@ -205,6 +214,42 @@ async fn keys_delete(
     Ok(metadata)
 }
 
+/// List models through the one Gemini gateway. Consent is read server-side
+/// for every call so a stale frontend snapshot can never open transport.
+#[tauri::command]
+#[specta::specta]
+async fn models_list(
+    state: tauri::State<'_, AppState>,
+    kind: ModelKind,
+) -> Result<Vec<ModelInfo>, AppError> {
+    let db = state.db.clone();
+    let consent = tauri::async_runtime::spawn_blocking(move || get_gemini_consent(&db))
+        .await
+        .map_err(|err| AppError::new(Code::Storage, err.to_string()))??;
+    let gateway = state.gateway.clone()?;
+    gateway
+        .models_list(kind, consent, CancellationToken::new())
+        .await
+}
+
+/// Validate one opaque key ID through a target-key lease. The actor path
+/// deliberately cannot fall back to another key after a 401/403 or quota.
+#[tauri::command]
+#[specta::specta]
+async fn keys_test(
+    state: tauri::State<'_, AppState>,
+    id: KeyId,
+) -> Result<KeyTestResult, AppError> {
+    let db = state.db.clone();
+    let consent = tauri::async_runtime::spawn_blocking(move || get_gemini_consent(&db))
+        .await
+        .map_err(|err| AppError::new(Code::Storage, err.to_string()))??;
+    let gateway = state.gateway.clone()?;
+    gateway
+        .keys_test(id, consent, CancellationToken::new())
+        .await
+}
+
 /// Danh sách command/event production — nguồn duy nhất, dùng chung cho
 /// `lib.rs` (đăng ký `invoke_handler`/`mount_events` thật) và test
 /// `export_bindings` (sinh `src/lib/bindings.ts`). Không đăng ký gì từ
@@ -220,7 +265,9 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             consent_decline,
             keys_list,
             keys_set,
-            keys_delete
+            keys_delete,
+            models_list,
+            keys_test
         ])
         .events(collect_events![SettingsChanged])
 }

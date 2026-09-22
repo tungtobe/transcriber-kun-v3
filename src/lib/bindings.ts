@@ -44,6 +44,16 @@ export const commands = {
 	keysSet: (keys: string) => typedError<KeyMetadata[], AppError>(__TAURI_INVOKE("keys_set", { keys })),
 	/**  Delete one native credential entry by opaque ID and invalidate old leases. */
 	keysDelete: (id: KeyId) => typedError<KeyMetadata[], AppError>(__TAURI_INVOKE("keys_delete", { id })),
+	/**
+	 *  List models through the one Gemini gateway. Consent is read server-side
+	 *  for every call so a stale frontend snapshot can never open transport.
+	 */
+	modelsList: (kind: ModelKind) => typedError<ModelInfo[], AppError>(__TAURI_INVOKE("models_list", { kind })),
+	/**
+	 *  Validate one opaque key ID through a target-key lease. The actor path
+	 *  deliberately cannot fall back to another key after a 401/403 or quota.
+	 */
+	keysTest: (id: KeyId) => typedError<KeyTestResult, AppError>(__TAURI_INVOKE("keys_test", { id })),
 };
 
 /** Events */
@@ -103,6 +113,24 @@ export type KeyMetadata = {
 	id: KeyId,
 	label: string,
 };
+
+export type KeyTestResult = {
+	keyId: KeyId,
+	valid: boolean,
+};
+
+/**  Safe model metadata returned to the frontend and later feature modules. */
+export type ModelInfo = {
+	name: string,
+	displayName: string,
+	supportedGenerationMethods: string[],
+};
+
+/**
+ *  Model families exposed to the rest of the application. Filtering is
+ *  performed from API capability metadata, never from a model alias/name.
+ */
+export type ModelKind = "transcribe" | "live" | "memo";
 
 export type Settings = {
 	theme: Theme,

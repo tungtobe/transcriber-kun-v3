@@ -9,6 +9,7 @@ use tauri::Manager;
 use crate::core::error::{AppError, Code};
 use crate::db::Db;
 use crate::gemini::keys::{KeyPoolHandle, KeyProvider, SystemClock};
+use crate::gemini::GeminiGateway;
 use crate::secrets::{NativeCredentialStore, SecretService};
 
 /// State managed toàn app. `db` là `Err` khi thư mục dữ liệu không mở được —
@@ -18,6 +19,9 @@ pub struct AppState {
     pub db: Result<Arc<Db>, AppError>,
     pub secrets: Arc<SecretService<NativeCredentialStore>>,
     pub key_pool: KeyPoolHandle,
+    /// One process-wide HTTP client/gateway. A client-construction failure is
+    /// retained as a typed error so boot still reaches the UI.
+    pub gateway: Result<Arc<GeminiGateway>, AppError>,
     // Giữ sống suốt vòng đời app — drop sớm sẽ ngắt worker ghi log không
     // đồng bộ của `tracing-appender`. Không đọc trực tiếp ở đâu khác nên
     // đặt `_` để không bị cảnh báo "chưa dùng", nhưng vẫn public để test có
@@ -71,10 +75,16 @@ pub fn boot<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
         }
     });
 
+    let gateway = GeminiGateway::production(key_pool.clone()).map(Arc::new);
+    if let Err(err) = &gateway {
+        tracing::error!(error = %err, "không khởi tạo được Gemini gateway");
+    }
+
     AppState {
         db,
         secrets,
         key_pool,
+        gateway,
         _log_guard: log_guard,
     }
 }
