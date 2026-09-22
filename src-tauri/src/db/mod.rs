@@ -1,1 +1,141 @@
-//! DB: một connection SQLite (WAL) duy nhất, migration chỉ tiến, repo theo entity (chưa cài đặt).
+//! DB: một `rusqlite::Connection` (WAL) duy nhất, do module này giữ và cấp
+//! phát truy cập tuần tự qua [`Db::with_connection`]. SQL chỉ nằm trong
+//! `repo/<entity>.rs` và `migrations/mod.rs` (spec Boundaries) — mọi nơi
+//! khác gọi qua các hàm ở đây hoặc ở `repo::*`, không tự viết SQL.
+//!
+//! Command Tauri chạy đồng bộ trên main thread; command nào chạm DB phải bọc
+//! lời gọi vào `tauri::async_runtime::spawn_blocking` ở tầng `ipc::` (Code
+//! Map) — `Db` chỉ cần `Send + Sync` để việc đó an toàn, đã thoả vì
+//! `Mutex<Connection>` là `Sync` khi `Connection: Send`.
+
+pub mod migrations;
+pub mod repo;
+
+use std::path::Path;
+use std::sync::Mutex;
+
+use rusqlite::Connection;
+
+use crate::core::error::{AppError, Code};
+
+const DB_FILE_NAME: &str = "app.db";
+
+#[derive(Debug)]
+pub struct Db {
+    conn: Mutex<Connection>,
+}
+
+impl Db {
+    /// Mở (hoặc tạo) `<dir>/app.db`, bật WAL, chạy migration tới bản mới
+    /// nhất. `dir` phải đã tồn tại hoặc tạo được — lỗi tạo thư mục/mở DB/
+    /// migration đều quy về category `storage`.
+    pub fn open(dir: &Path) -> Result<Self, AppError> {
+        std::fs::create_dir_all(dir)?;
+
+        let mut conn = Connection::open(dir.join(DB_FILE_NAME))?;
+
+        // `PRAGMA journal_mode = WAL` luôn trả một hàng kết quả (chế độ áp
+        // dụng được) kể cả khi dùng để "set" — phải `query_row`, không
+        // `pragma_update`, nếu không rusqlite sẽ coi là lỗi "unexpected row".
+        let mode: String = conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
+        if !mode.eq_ignore_ascii_case("wal") {
+            return Err(AppError::new(
+                Code::Storage,
+                format!("không bật được WAL, journal_mode hiện tại: {mode}"),
+            ));
+        }
+
+        migrations::run(&mut conn)?;
+
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
+    /// Truy cập tuần tự tới connection duy nhất. `mutex` bị poison (một
+    /// closure trước đó panic khi đang giữ lock) cũng quy về `storage` thay
+    /// vì panic tiếp — DB không mở được không được phép làm sập app (spec
+    /// I/O Matrix).
+    pub fn with_connection<T>(
+        &self,
+        f: impl FnOnce(&mut Connection) -> Result<T, AppError>,
+    ) -> Result<T, AppError> {
+        let mut guard = self
+            .conn
+            .lock()
+            .map_err(|_| AppError::new(Code::Storage, "db mutex poisoned"))?;
+        f(&mut guard)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn open_creates_db_file_with_wal_and_user_version_one() {
+        let dir = tempdir().unwrap();
+        let db = Db::open(dir.path()).expect("phải mở được DB trên thư mục ghi được");
+
+        assert!(dir.path().join("app.db").exists());
+        // WAL mode luôn kèm file `-wal` sau lần ghi đầu (ở đây migration đã
+        // tạo bảng `settings` nên file `-wal`/`-shm` đã tồn tại) — Acceptance
+        // Criteria kiểm rõ sự tồn tại của `app.db-wal`.
+        assert!(dir.path().join("app.db-wal").exists());
+        db.with_connection(|conn| {
+            let mode: String = conn
+                .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(mode.to_lowercase(), "wal");
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, 1);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn reopening_existing_db_is_a_noop_and_keeps_data() {
+        let dir = tempdir().unwrap();
+        {
+            let db = Db::open(dir.path()).unwrap();
+            db.with_connection(|conn| {
+                conn.execute(
+                    "INSERT INTO settings (key, value) VALUES ('theme', '\"dark\"')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        }
+
+        let db = Db::open(dir.path()).expect("mở lại DB đã tồn tại phải thành công");
+        let value: String = db
+            .with_connection(|conn| {
+                Ok(conn.query_row(
+                    "SELECT value FROM settings WHERE key = 'theme'",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(value, "\"dark\"");
+    }
+
+    #[test]
+    fn open_fails_with_storage_category_when_dir_not_writable() {
+        // Dựng một đường dẫn cha không tồn tại và không thể tạo được: dùng
+        // một file thường làm "thư mục cha" — `create_dir_all` phải lỗi vì
+        // đường dẫn đó đã bị chiếm bởi một file.
+        let dir = tempdir().unwrap();
+        let blocking_file = dir.path().join("not-a-dir");
+        std::fs::write(&blocking_file, b"x").unwrap();
+        let target = blocking_file.join("nested");
+
+        let err = Db::open(&target).expect_err("phải lỗi khi thư mục cha là một file");
+        assert_eq!(err.category, crate::core::error::Category::Storage);
+    }
+}

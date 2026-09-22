@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 09-22-2026 06:12
-last_updated: 09-22-2026 08:00
+last_updated: 09-22-2026 08:21
 project: transcriber_kun
 project_key: NOKEY
 tracking_system: file-system
@@ -37,7 +37,7 @@ story_location: _bmad-output/implementation-artifacts
 development_status:
   epic-1: in-progress
   1-1-dựng-repo-greenfield-ci-hai-os-và-binding-ipc-typed: review
-  1-2-nền-lưu-trữ-lỗi-có-category-và-log-content-free: backlog
+  1-2-nền-lưu-trữ-lỗi-có-category-và-log-content-free: in-progress
   1-3-token-thị-giác-theme-sáng-tối-và-app-shell: backlog
   1-4-i18n-vi-en-ja-và-onboarding-chọn-ngôn-ngữ: backlog
   1-5-onboarding-consent: backlog

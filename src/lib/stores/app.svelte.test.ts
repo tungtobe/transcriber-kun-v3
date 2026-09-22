@@ -23,21 +23,22 @@ describe('store app', () => {
     expect(appStore.version).toEqual({ status: 'ok', version: '0.1.0' });
   });
 
-  it('chuyển sang trạng thái error khi binding trả lỗi, không throw', async () => {
-    appVersion.mockResolvedValue({ status: 'error', error: 'boom' });
+  it('chuyển sang trạng thái error kèm AppError typed khi binding trả lỗi, không throw', async () => {
+    const appError = { category: 'storage', code: 'storage', detailRedacted: 'boom' };
+    appVersion.mockResolvedValue({ status: 'error', error: appError });
     const { appStore } = await import('./app.svelte');
 
     await appStore.loadVersion();
 
-    expect(appStore.version).toEqual({ status: 'error' });
+    expect(appStore.version).toEqual({ status: 'error', error: appError });
   });
 
-  it('chuyển sang trạng thái error khi invoke ném exception', async () => {
+  it('chuyển sang trạng thái error với error null khi invoke ném exception', async () => {
     appVersion.mockRejectedValue(new Error('ipc unavailable'));
     const { appStore } = await import('./app.svelte');
 
     await appStore.loadVersion();
 
-    expect(appStore.version).toEqual({ status: 'error' });
+    expect(appStore.version).toEqual({ status: 'error', error: null });
   });
 });

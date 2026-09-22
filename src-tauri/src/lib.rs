@@ -17,6 +17,8 @@ pub mod secrets;
 pub mod settings;
 pub mod transcribe;
 
+use tauri::Manager;
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let builder = ipc::specta_builder();
@@ -25,6 +27,8 @@ pub fn run() {
         .invoke_handler(builder.invoke_handler())
         .setup(move |app| {
             builder.mount_events(app);
+            let state = ipc::boot::boot(app.handle());
+            app.manage(state);
             Ok(())
         })
         .run(tauri::generate_context!())
