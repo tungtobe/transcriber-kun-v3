@@ -49,6 +49,8 @@ export type Code = "quota" | "auth" | "model" | "request" | "shape" | "timeout" 
 
 export type Settings = {
 	theme: Theme,
+	uiLanguage: UiLanguage,
+	onboardingCompleted: boolean,
 };
 
 /**
@@ -59,6 +61,12 @@ export type SettingsChanged = Settings;
 
 /**  `theme: 'system' | 'light' | 'dark'`, mặc định `system` (spec Decisions). */
 export type Theme = "system" | "light" | "dark";
+
+/**
+ *  Preference ngôn ngữ UI. `System` resolve ở frontend từ locale của WebView;
+ *  Rust chỉ sở hữu giá trị persisted và không đoán locale hệ điều hành.
+ */
+export type UiLanguage = "system" | "vi" | "en" | "ja";
 
 /* Tauri Specta runtime */
 async function typedError<T, E>(result: Promise<T>): Promise<{ status: "ok"; data: T } | { status: "error"; error: E }> {

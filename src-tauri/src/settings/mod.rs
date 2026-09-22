@@ -1,7 +1,7 @@
 //! Settings: service typed sở hữu cấu hình app, có mặc định cho từng khoá,
 //! đọc/ghi qua `db::repo::settings` (giá trị lưu dạng JSON text), phát event
-//! khi đổi (AD-8). Story này chỉ có một khoá `theme`; story sau thêm khoá
-//! mới vào struct `Settings` mà không đổi shape đã có (spec Decisions).
+//! khi đổi (AD-8). Mỗi khoá được parse/fallback độc lập để một giá trị hỏng
+//! không làm mất các preference còn lại.
 
 use serde::{Deserialize, Serialize};
 use specta::Type;
@@ -19,10 +19,24 @@ pub enum Theme {
     Dark,
 }
 
+/// Preference ngôn ngữ UI. `System` resolve ở frontend từ locale của WebView;
+/// Rust chỉ sở hữu giá trị persisted và không đoán locale hệ điều hành.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, Type)]
+#[serde(rename_all = "lowercase")]
+pub enum UiLanguage {
+    #[default]
+    System,
+    Vi,
+    En,
+    Ja,
+}
+
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
     pub theme: Theme,
+    pub ui_language: UiLanguage,
+    pub onboarding_completed: bool,
 }
 
 /// Phát khi `save` ghi bền thành công — đúng một lần, mang giá trị mới toàn
@@ -31,6 +45,8 @@ pub struct Settings {
 pub struct SettingsChanged(pub Settings);
 
 const KEY_THEME: &str = "theme";
+const KEY_UI_LANGUAGE: &str = "uiLanguage";
+const KEY_ONBOARDING_COMPLETED: &str = "onboardingCompleted";
 
 /// Đọc toàn bộ settings từ DB. Khoá thiếu hoặc value không parse được (hỏng)
 /// dùng mặc định của khoá đó, khoá khác giữ nguyên (spec I/O Matrix). Không
@@ -60,7 +76,33 @@ pub fn load(db: &Db) -> Settings {
         }),
     };
 
-    Settings { theme }
+    let ui_language = match raw.get(KEY_UI_LANGUAGE) {
+        None => UiLanguage::default(),
+        Some(value) => serde_json::from_str::<UiLanguage>(value).unwrap_or_else(|_| {
+            tracing::warn!(
+                key = KEY_UI_LANGUAGE,
+                "giá trị settings không parse được, dùng mặc định"
+            );
+            UiLanguage::default()
+        }),
+    };
+
+    let onboarding_completed = match raw.get(KEY_ONBOARDING_COMPLETED) {
+        None => false,
+        Some(value) => serde_json::from_str::<bool>(value).unwrap_or_else(|_| {
+            tracing::warn!(
+                key = KEY_ONBOARDING_COMPLETED,
+                "giá trị settings không parse được, dùng mặc định"
+            );
+            false
+        }),
+    };
+
+    Settings {
+        theme,
+        ui_language,
+        onboarding_completed,
+    }
 }
 
 /// Ghi toàn bộ settings trong một transaction (spec Boundaries). Lỗi ghi trả
@@ -69,11 +111,19 @@ pub fn load(db: &Db) -> Settings {
 pub fn save(db: &Db, settings: &Settings) -> Result<(), AppError> {
     let theme_json = serde_json::to_string(&settings.theme)
         .map_err(|err| AppError::new(Code::Format, err.to_string()))?;
+    let ui_language_json = serde_json::to_string(&settings.ui_language)
+        .map_err(|err| AppError::new(Code::Format, err.to_string()))?;
+    let onboarding_completed_json = serde_json::to_string(&settings.onboarding_completed)
+        .map_err(|err| AppError::new(Code::Format, err.to_string()))?;
 
     db.with_connection(|conn| {
         Ok(repo::settings::upsert_many(
             conn,
-            &[(KEY_THEME, theme_json)],
+            &[
+                (KEY_THEME, theme_json),
+                (KEY_UI_LANGUAGE, ui_language_json),
+                (KEY_ONBOARDING_COMPLETED, onboarding_completed_json),
+            ],
         )?)
     })
 }
@@ -126,22 +176,29 @@ mod tests {
         Db::open(&dir.keep()).unwrap()
     }
 
+    fn default_settings_with_theme(theme: Theme) -> Settings {
+        Settings {
+            theme,
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn load_on_empty_table_returns_defaults() {
         let db = open_db();
-        assert_eq!(
-            load(&db),
-            Settings {
-                theme: Theme::System
-            }
-        );
+        assert_eq!(load(&db), default_settings_with_theme(Theme::System));
     }
 
     #[test]
     fn save_then_load_round_trips() {
         let db = open_db();
-        save(&db, &Settings { theme: Theme::Dark }).unwrap();
-        assert_eq!(load(&db), Settings { theme: Theme::Dark });
+        let expected = Settings {
+            theme: Theme::Dark,
+            ui_language: UiLanguage::Ja,
+            onboarding_completed: true,
+        };
+        save(&db, &expected).unwrap();
+        assert_eq!(load(&db), expected);
     }
 
     #[test]
@@ -156,12 +213,7 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(
-            load(&db),
-            Settings {
-                theme: Theme::System
-            }
-        );
+        assert_eq!(load(&db), default_settings_with_theme(Theme::System));
     }
 
     /// I/O Matrix "Settings hỏng", cột "Log cảnh báo không chứa value": khi
@@ -190,12 +242,7 @@ mod tests {
 
         let settings = tracing::subscriber::with_default(subscriber, || load(&db));
 
-        assert_eq!(
-            settings,
-            Settings {
-                theme: Theme::System
-            }
-        );
+        assert_eq!(settings, default_settings_with_theme(Theme::System));
 
         let captured = buf.contents();
         assert!(
@@ -214,5 +261,100 @@ mod tests {
         assert_eq!(serde_json::to_string(&Theme::System).unwrap(), "\"system\"");
         assert_eq!(serde_json::to_string(&Theme::Light).unwrap(), "\"light\"");
         assert_eq!(serde_json::to_string(&Theme::Dark).unwrap(), "\"dark\"");
+    }
+
+    #[test]
+    fn ui_language_serializes_lowercase() {
+        assert_eq!(
+            serde_json::to_string(&UiLanguage::System).unwrap(),
+            "\"system\""
+        );
+        assert_eq!(serde_json::to_string(&UiLanguage::Vi).unwrap(), "\"vi\"");
+        assert_eq!(serde_json::to_string(&UiLanguage::En).unwrap(), "\"en\"");
+        assert_eq!(serde_json::to_string(&UiLanguage::Ja).unwrap(), "\"ja\"");
+    }
+
+    #[test]
+    fn corrupt_language_falls_back_without_losing_other_fields() {
+        let db = open_db();
+        save(
+            &db,
+            &Settings {
+                theme: Theme::Dark,
+                ui_language: UiLanguage::Vi,
+                onboarding_completed: true,
+            },
+        )
+        .unwrap();
+        db.with_connection(|conn| {
+            conn.execute(
+                "UPDATE settings SET value = 'not-json' WHERE key = 'uiLanguage'",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(
+            load(&db),
+            Settings {
+                theme: Theme::Dark,
+                ui_language: UiLanguage::System,
+                onboarding_completed: true,
+            }
+        );
+    }
+
+    #[test]
+    fn legacy_rows_default_missing_language_and_onboarding_only() {
+        let db = open_db();
+        db.with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO settings (key, value) VALUES ('theme', '\"dark\"')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(
+            load(&db),
+            Settings {
+                theme: Theme::Dark,
+                ui_language: UiLanguage::System,
+                onboarding_completed: false,
+            }
+        );
+    }
+
+    #[test]
+    fn corrupt_onboarding_falls_back_without_losing_theme_or_language() {
+        let db = open_db();
+        save(
+            &db,
+            &Settings {
+                theme: Theme::Light,
+                ui_language: UiLanguage::Ja,
+                onboarding_completed: true,
+            },
+        )
+        .unwrap();
+        db.with_connection(|conn| {
+            conn.execute(
+                "UPDATE settings SET value = 'not-json' WHERE key = 'onboardingCompleted'",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(
+            load(&db),
+            Settings {
+                theme: Theme::Light,
+                ui_language: UiLanguage::Ja,
+                onboarding_completed: false,
+            }
+        );
     }
 }

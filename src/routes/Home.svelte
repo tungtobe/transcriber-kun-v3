@@ -1,43 +1,44 @@
 <script lang="ts">
   import { InfoIcon, RadioIcon, UploadIcon } from '../components/icons';
+  import { i18n } from '../i18n/index.svelte';
 </script>
 
 <svelte:head>
-  <title>Trang chủ · trans-kun</title>
+  <title>{i18n.t('app.meta.homeTitle')}</title>
 </svelte:head>
 
 <section class="route-screen" aria-labelledby="home-title">
   <div class="screen-header">
     <div>
-      <p class="route-kicker">Thư viện</p>
-      <h1 id="home-title">Trang chủ</h1>
+      <p class="route-kicker">{i18n.t('home.header.kicker')}</p>
+      <h1 id="home-title">{i18n.t('home.header.title')}</h1>
     </div>
-    <span class="status-pill status-off"><span class="status-dot" aria-hidden="true"></span> Chưa có phiên</span>
+    <span class="status-pill status-off"><span class="status-dot" aria-hidden="true"></span> {i18n.t('home.header.emptyStatus')}</span>
   </div>
 
   <div class="empty-grid">
     <article class="empty-card">
       <div class="empty-icon" aria-hidden="true"><UploadIcon size={18} strokeWidth={1.75} /></div>
-      <h2>Kéo file vào đây</h2>
-      <p>Hoặc chọn file để tạo transcript. Hỗ trợ mp4, m4a và mp3.</p>
-      <button class="button button-secondary" type="button" aria-disabled="true" title="Chọn file sẽ có ở story transcribe file">
-        Chọn file
+      <h2>{i18n.t('home.file.title')}</h2>
+      <p>{i18n.t('home.file.description')}</p>
+      <button class="button button-secondary" type="button" aria-disabled="true" title={i18n.t('home.file.unavailable')}>
+        {i18n.t('home.file.action')}
       </button>
     </article>
 
     <article class="empty-card">
       <div class="empty-icon" aria-hidden="true"><RadioIcon size={18} strokeWidth={1.75} /></div>
-      <h2>Bắt đầu Live</h2>
-      <p>Ghi âm và dịch realtime sẽ được thêm ở story Live.</p>
-      <button class="button button-primary" type="button" aria-disabled="true" title="Live sẽ có ở story Live">
-        Bắt đầu Live
+      <h2>{i18n.t('home.live.title')}</h2>
+      <p>{i18n.t('home.live.description')}</p>
+      <button class="button button-primary" type="button" aria-disabled="true" title={i18n.t('home.live.unavailable')}>
+        {i18n.t('home.live.action')}
       </button>
     </article>
   </div>
 
   <div class="empty-note" role="status">
     <InfoIcon size={18} strokeWidth={1.75} aria-hidden="true" />
-    <p>Shell, theme và điều hướng đã sẵn sàng cho các màn hình tiếp theo.</p>
+    <p>{i18n.t('home.note.ready')}</p>
   </div>
 </section>
 

@@ -1,31 +1,32 @@
 <script lang="ts">
   import { link } from '@keenmate/svelte-spa-router';
   import { routePaths } from '../lib/router';
+  import { i18n, type TranslationKey } from '../i18n/index.svelte';
 
   type RouteParams = { group?: string };
   let { routeParams = {} }: { routeParams?: RouteParams } = $props();
 
-  const groups = [
-    { key: 'general', label: 'Chung' },
-    { key: 'gemini', label: 'Gemini' },
-    { key: 'diagnostics', label: 'Chẩn đoán' },
-    { key: 'about', label: 'Giới thiệu & Quyền riêng tư' },
+  const groups: Array<{ key: string; labelKey: TranslationKey }> = [
+    { key: 'general', labelKey: 'settings.group.general' },
+    { key: 'gemini', labelKey: 'settings.group.gemini' },
+    { key: 'diagnostics', labelKey: 'settings.group.diagnostics' },
+    { key: 'about', labelKey: 'settings.group.about' },
   ];
 
   let group = $derived(routeParams.group ?? 'general');
-  let groupLabel = $derived(groups.find((item) => item.key === group)?.label ?? 'Chung');
+  let groupLabel = $derived(i18n.t(groups.find((item) => item.key === group)?.labelKey ?? 'settings.group.general'));
 </script>
 
 <svelte:head>
-  <title>{groupLabel} · Cài đặt · trans-kun</title>
+  <title>{i18n.t('settings.meta.title', { group: groupLabel })}</title>
 </svelte:head>
 
 <section class="route-screen" aria-labelledby="settings-title">
-  <div class="route-kicker">Cấu hình</div>
-  <h1 id="settings-title">Cài đặt</h1>
+  <div class="route-kicker">{i18n.t('settings.header.kicker')}</div>
+  <h1 id="settings-title">{i18n.t('settings.header.title')}</h1>
 
   <div class="settings-layout">
-    <nav class="settings-nav" aria-label="Nhóm cài đặt">
+    <nav class="settings-nav" aria-label={i18n.t('settings.navigation.label')}>
       {#each groups as item}
         <a
           use:link
@@ -33,19 +34,16 @@
           href={routePaths.settings({ group: item.key })}
           aria-current={item.key === group ? 'page' : undefined}
         >
-          {item.label}
+          {i18n.t(item.labelKey)}
         </a>
       {/each}
     </nav>
 
     <div class="settings-panel">
       <h2>{groupLabel}</h2>
-      <p>
-        Nhóm cài đặt này là placeholder có thật trong shell. Các trường cấu hình sẽ được
-        bổ sung ở các story Settings tương ứng.
-      </p>
+      <p>{i18n.t('settings.placeholder.description')}</p>
       <div class="settings-row">
-        <span class="settings-label">Đường dẫn route</span>
+        <span class="settings-label">{i18n.t('settings.placeholder.routePath')}</span>
         <code>/settings/{group}</code>
       </div>
     </div>

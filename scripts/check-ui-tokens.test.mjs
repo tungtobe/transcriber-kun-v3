@@ -160,4 +160,11 @@ describe('UI token guard', () => {
       },
     ]);
   });
+
+  it('locks onboarding card width and flexible translated controls', () => {
+    const onboarding = readFileSync(join(root, 'src/routes/Onboarding.svelte'), 'utf8');
+    expect(onboarding).toContain('width: min(100%, 600px);');
+    expect(onboarding).toContain('min-width: max-content;');
+    expect(onboarding).toContain('min-width: 112px;');
+  });
 });

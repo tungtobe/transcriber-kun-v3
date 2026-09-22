@@ -12,6 +12,7 @@
   } from './icons';
   import { appStore } from '../lib/stores/app.svelte';
   import { settingsStore } from '../lib/stores/settings.svelte';
+  import { i18n } from '../i18n/index.svelte';
   import type { Theme } from '../lib/bindings';
 
   let { children }: { children?: Snippet } = $props();
@@ -19,10 +20,10 @@
   const currentPath = $derived(location());
   const pageTitle = $derived(
     currentPath.startsWith('/settings')
-      ? 'Cài đặt'
+      ? i18n.t('app.shell.settings')
       : currentPath === '/onboarding'
-        ? 'Onboarding'
-        : 'Trang chủ',
+        ? i18n.t('app.shell.onboarding')
+        : i18n.t('app.shell.home'),
   );
 
   function changeTheme(event: Event): void {
@@ -32,16 +33,16 @@
 </script>
 
 <div class="app-shell">
-  <aside class="sidebar" aria-label="Thanh điều hướng chính">
+  <aside class="sidebar" aria-label={i18n.t('app.shell.primaryNavLabel')}>
     <div class="brand-lockup">
       <span class="brand-mark" aria-hidden="true">tk</span>
       <div>
         <p class="brand-name">trans-kun</p>
-        <p class="brand-caption">quiet utility</p>
+        <p class="brand-caption">{i18n.t('app.shell.brandCaption')}</p>
       </div>
     </div>
 
-    <nav class="primary-nav" aria-label="Điều hướng">
+    <nav class="primary-nav" aria-label={i18n.t('app.shell.navigationLabel')}>
       <a
         href="/home"
         use:link
@@ -49,18 +50,18 @@
         aria-current={currentPath === '/home' || currentPath === '/' ? 'page' : undefined}
       >
         <HomeIcon size={18} strokeWidth={1.75} aria-hidden="true" />
-        <span>Trang chủ</span>
+        <span>{i18n.t('app.shell.home')}</span>
       </a>
 
       <button
         class="nav-disabled"
         type="button"
         aria-disabled="true"
-        title="Live sẽ có ở story Live"
-        aria-label="Live — sẽ có ở story Live"
+        title={i18n.t('app.shell.liveUnavailable')}
+        aria-label={i18n.t('app.shell.liveUnavailable')}
       >
         <RadioIcon size={18} strokeWidth={1.75} aria-hidden="true" />
-        <span>Live</span>
+        <span>{i18n.t('app.shell.live')}</span>
       </button>
 
       <a
@@ -70,22 +71,22 @@
         aria-current={currentPath.startsWith('/settings') ? 'page' : undefined}
       >
         <SettingsIcon size={18} strokeWidth={1.75} aria-hidden="true" />
-        <span>Cài đặt</span>
+        <span>{i18n.t('app.shell.settings')}</span>
       </a>
     </nav>
 
-    <section class="job-placeholder" aria-label="Công việc đang chạy">
+    <section class="job-placeholder" aria-label={i18n.t('app.shell.runningJobs')}>
       <div class="job-heading">
-        <span>Job đang chạy</span>
+        <span>{i18n.t('app.shell.runningJobs')}</span>
         <span class="job-count">0</span>
       </div>
-      <p>Không có job nào đang chạy.</p>
+      <p>{i18n.t('app.shell.noRunningJobs')}</p>
     </section>
 
     <div class="sidebar-spacer"></div>
 
-    <section class="sidebar-footer" aria-label="Trạng thái ứng dụng">
-      <p class="version-label">Phiên bản</p>
+    <section class="sidebar-footer" aria-label={i18n.t('app.shell.statusLabel')}>
+      <p class="version-label">{i18n.t('app.version.label')}</p>
       <p class="version-value mono">
         {#if appStore.version.status === 'ok'}
           {appStore.version.version}
@@ -107,7 +108,7 @@
 
       <div class="header-controls">
         <label class="theme-control" for="theme-select">
-          <span class="sr-only">Chủ đề giao diện</span>
+          <span class="sr-only">{i18n.t('app.theme.label')}</span>
           {#if settingsStore.theme === 'system'}
             <MonitorIcon size={16} strokeWidth={1.75} aria-hidden="true" />
           {:else if settingsStore.theme === 'dark'}
@@ -117,13 +118,13 @@
           {/if}
           <select
             id="theme-select"
-            aria-label="Chủ đề giao diện"
+            aria-label={i18n.t('app.theme.label')}
             value={settingsStore.theme}
             onchange={changeTheme}
           >
-            <option value="system">Theo hệ thống</option>
-            <option value="light">Sáng</option>
-            <option value="dark">Tối</option>
+            <option value="system">{i18n.t('app.theme.system')}</option>
+            <option value="light">{i18n.t('app.theme.light')}</option>
+            <option value="dark">{i18n.t('app.theme.dark')}</option>
           </select>
         </label>
       </div>
@@ -133,10 +134,10 @@
       <div class="shell-error" role="status">
         <AlertTriangleIcon size={18} strokeWidth={1.75} aria-hidden="true" />
         <div>
-          <strong>Không thể đồng bộ cài đặt</strong>
-          <p>Giá trị hiển thị có thể chưa được lưu. Tải lại để đồng bộ cài đặt.</p>
+          <strong>{i18n.t('app.error.syncTitle')}</strong>
+          <p>{i18n.t('app.error.syncBody')}</p>
         </div>
-        <button type="button" onclick={() => void settingsStore.load()}>Tải lại</button>
+        <button type="button" onclick={() => void settingsStore.load()}>{i18n.t('app.error.reload')}</button>
       </div>
     {/if}
 

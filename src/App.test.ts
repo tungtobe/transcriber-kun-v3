@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, render, screen } from '@testing-library/svelte';
 import App from './App.svelte';
 import { configureRouter } from './lib/router';
+import { i18n } from './i18n/index.svelte';
 
 const mocks = vi.hoisted(() => ({
   removeKeymap: vi.fn(),
@@ -29,6 +30,7 @@ vi.mock('./lib/stores/app.svelte', () => ({ appStore: mocks.appStore }));
 afterEach(() => cleanup());
 
 beforeEach(() => {
+  i18n.applyPreference('vi');
   configureRouter();
   window.scrollTo = vi.fn();
   window.history.replaceState({}, '', '/home');

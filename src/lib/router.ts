@@ -31,3 +31,24 @@ export function configureRouter(): void {
 export function redirectUnknownRoute(): void {
   void replace('/home');
 }
+
+/**
+ * Startup access owned by Story 1.4. Story 1.5 inserts versioned Consent
+ * precedence before this completion decision; no Consent state is invented here.
+ */
+export function startupRedirectPath(
+  onboardingCompleted: boolean,
+  currentPath = typeof window === 'undefined' ? '/home' : window.location.pathname,
+): '/onboarding' | '/home' | null {
+  if (!onboardingCompleted && currentPath !== '/onboarding') return '/onboarding';
+  if (onboardingCompleted && currentPath === '/onboarding') return '/home';
+  return null;
+}
+
+export async function enforceStartupRoute(
+  onboardingCompleted: boolean,
+  replaceRoute: (path: '/onboarding' | '/home') => Promise<unknown> = replace,
+): Promise<void> {
+  const target = startupRedirectPath(onboardingCompleted);
+  if (target) await replaceRoute(target);
+}

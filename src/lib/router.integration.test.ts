@@ -3,11 +3,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, render, screen, waitFor } from '@testing-library/svelte';
 import { Router, push } from '@keenmate/svelte-spa-router';
 import { configureRouter, redirectUnknownRoute, routes } from './router';
+import { i18n } from '../i18n/index.svelte';
 
 afterEach(() => cleanup());
 
 describe('history router runtime', () => {
   beforeEach(() => {
+    i18n.applyPreference('vi');
     configureRouter();
     window.scrollTo = vi.fn();
     window.history.replaceState({}, '', '/home');

@@ -1,28 +1,37 @@
-// Theme is a domain store: components talk to this module and never to the
-// generated IPC binding directly. It owns persistence, backend events, and
-// the OS colour-scheme listener in one lifecycle.
-import { commands, events, type AppError, type Theme } from '../bindings';
+// Domain settings store: the only frontend owner of typed settings IPC,
+// optimistic persistence, backend events, and preference side effects.
+import { i18n, isUiLanguage } from '../../i18n/index.svelte';
+import {
+  commands,
+  events,
+  type AppError,
+  type Settings,
+  type Theme,
+  type UiLanguage,
+} from '../bindings';
 
 export type ResolvedTheme = 'light' | 'dark';
 export type SettingsStatus = 'idle' | 'loading' | 'ready' | 'error';
 
-export type SettingsState = {
-  theme: Theme;
+export type SettingsState = Settings & {
   resolvedTheme: ResolvedTheme;
   status: SettingsStatus;
   error: AppError | null;
 };
 
 const THEME_CACHE_KEY = 'trans-kun.theme';
+const DEFAULT_SETTINGS: Settings = {
+  theme: 'system',
+  uiLanguage: 'system',
+  onboardingCompleted: false,
+};
 
 function isTheme(value: unknown): value is Theme {
   return value === 'system' || value === 'light' || value === 'dark';
 }
 
 function systemTheme(): ResolvedTheme {
-  if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') {
-    return 'light';
-  }
+  if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return 'light';
   return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
 }
 
@@ -39,7 +48,7 @@ function cacheTheme(theme: Theme): void {
   try {
     globalThis.localStorage?.setItem(THEME_CACHE_KEY, theme);
   } catch {
-    // The cache is only a first-paint hint. Persistence still belongs to IPC.
+    // Rust settings remain authoritative; this is only a first-render hint.
   }
 }
 
@@ -52,6 +61,16 @@ function applyTheme(theme: Theme): ResolvedTheme {
   return resolved;
 }
 
+function normalizeSettings(value: Partial<Settings> | null | undefined): Settings {
+  return {
+    theme: isTheme(value?.theme) ? value.theme : 'system',
+    uiLanguage: isUiLanguage(value?.uiLanguage) ? value.uiLanguage : 'system',
+    onboardingCompleted: typeof value?.onboardingCompleted === 'boolean'
+      ? value.onboardingCompleted
+      : false,
+  };
+}
+
 type MediaQueryListWithLegacyListener = MediaQueryList & {
   addListener?: (listener: (event: MediaQueryListEvent) => void) => void;
   removeListener?: (listener: (event: MediaQueryListEvent) => void) => void;
@@ -60,9 +79,11 @@ type MediaQueryListWithLegacyListener = MediaQueryList & {
 export function createSettingsStore() {
   let theme = $state<Theme>('system');
   let resolvedTheme = $state<ResolvedTheme>('light');
+  let uiLanguage = $state<UiLanguage>('system');
+  let onboardingCompleted = $state(false);
   let status = $state<SettingsStatus>('idle');
   let error = $state<AppError | null>(null);
-  let persistedTheme = $state<Theme>('system');
+  let persistedSettings: Settings = { ...DEFAULT_SETTINGS };
 
   let mediaQuery: MediaQueryListWithLegacyListener | undefined;
   let removeMediaListener: (() => void) | undefined;
@@ -71,22 +92,37 @@ export function createSettingsStore() {
   let backendListenerGeneration = 0;
   let listenersReady = false;
   let saveGeneration = 0;
+  let activeLoad: Promise<void> | undefined;
+  let saveQueue: Promise<void> = Promise.resolve();
+  let pendingSaveCount = 0;
 
-  function renderTheme(next: Theme): void {
-    resolvedTheme = applyTheme(next);
+  function transportSaveError(): AppError {
+    return {
+      category: 'storage',
+      code: 'storage',
+      detailRedacted: 'settings save unavailable',
+    };
+  }
+
+  function snapshot(): Settings {
+    return { theme, uiLanguage, onboardingCompleted };
+  }
+
+  function applySettings(next: Settings): void {
+    theme = next.theme;
+    uiLanguage = next.uiLanguage;
+    onboardingCompleted = next.onboardingCompleted;
+    cacheTheme(theme);
+    resolvedTheme = applyTheme(theme);
+    i18n.applyPreference(uiLanguage);
   }
 
   function onSystemThemeChanged(): void {
-    if (theme === 'system') {
-      renderTheme(theme);
-    }
+    if (theme === 'system') resolvedTheme = applyTheme(theme);
   }
 
   function installMediaListener(): void {
-    if (listenersReady || typeof window === 'undefined' || typeof window.matchMedia !== 'function') {
-      return;
-    }
-
+    if (listenersReady || typeof window === 'undefined' || typeof window.matchMedia !== 'function') return;
     mediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
     const listener = () => onSystemThemeChanged();
     if (typeof mediaQuery.addEventListener === 'function') {
@@ -96,31 +132,24 @@ export function createSettingsStore() {
       mediaQuery.addListener(listener);
       removeMediaListener = () => mediaQuery?.removeListener?.(listener);
     }
-
     listenersReady = true;
   }
 
   function installBackendListener(): void {
-    if (backendListenerPromise || !events?.settingsChanged?.listen) {
-      return;
-    }
-
+    if (backendListenerPromise || !events?.settingsChanged?.listen) return;
     const generation = backendListenerGeneration;
     backendListenerPromise = Promise.resolve()
       .then(() => events.settingsChanged.listen(({ payload }) => {
-        if (generation !== backendListenerGeneration) {
-          return;
-        }
-        const next = payload?.theme;
-        if (!isTheme(next)) {
-          return;
-        }
-        persistedTheme = next;
-        theme = next;
+        if (generation !== backendListenerGeneration) return;
+        // Local saves are authoritative while queued. Their command results
+        // advance `persistedSettings`; replaying their events here could
+        // overwrite a newer optimistic snapshot with an older queued one.
+        if (pendingSaveCount > 0) return;
+        const next = normalizeSettings(payload);
+        persistedSettings = next;
+        applySettings(next);
         error = null;
         status = 'ready';
-        cacheTheme(next);
-        renderTheme(next);
       }))
       .then((unlisten) => {
         if (generation !== backendListenerGeneration) {
@@ -139,103 +168,131 @@ export function createSettingsStore() {
       installBackendListener();
       return;
     }
-
-    const cached = readCachedTheme() ?? 'system';
-    theme = cached;
-    persistedTheme = cached;
-    renderTheme(cached);
+    const cached: Settings = {
+      theme: readCachedTheme() ?? 'system',
+      uiLanguage: i18n.preference,
+      onboardingCompleted: false,
+    };
+    persistedSettings = cached;
+    applySettings(cached);
     installMediaListener();
     installBackendListener();
   }
 
-  async function load(): Promise<void> {
+  function load(): Promise<void> {
+    if (activeLoad) return activeLoad;
     bootstrap();
     const generation = saveGeneration;
     status = 'loading';
     error = null;
-
-    try {
-      const result = await commands.settingsGet();
-      if (generation !== saveGeneration) {
-        return;
-      }
-
-      if (result.status === 'ok' && isTheme(result.data.theme)) {
-        persistedTheme = result.data.theme;
-        theme = result.data.theme;
-        cacheTheme(theme);
-        renderTheme(theme);
-        status = 'ready';
-        return;
-      }
-
-      persistedTheme = 'system';
-      theme = 'system';
-      cacheTheme('system');
-      renderTheme(theme);
-      if (result.status === 'error') {
+    let request: Promise<void>;
+    request = (async () => {
+      try {
+        const result = await commands.settingsGet();
+        if (generation !== saveGeneration) return;
+        if (result.status === 'ok') {
+          const next = normalizeSettings(result.data);
+          persistedSettings = next;
+          applySettings(next);
+          status = 'ready';
+          return;
+        }
+        persistedSettings = { ...DEFAULT_SETTINGS };
+        applySettings(persistedSettings);
         error = result.error;
+      } catch {
+        if (generation !== saveGeneration) return;
+        persistedSettings = { ...DEFAULT_SETTINGS };
+        applySettings(persistedSettings);
+        error = null;
       }
-    } catch {
-      if (generation !== saveGeneration) {
+      status = error ? 'error' : 'ready';
+    })().finally(() => {
+      if (activeLoad === request) activeLoad = undefined;
+    });
+    activeLoad = request;
+    return request;
+  }
+
+  function ensureReady(): Promise<void> | undefined {
+    bootstrap();
+    if (activeLoad) return activeLoad;
+    if (status === 'idle') return load();
+    return undefined;
+  }
+
+  function persist(next: Settings): Promise<void> {
+    const generation = ++saveGeneration;
+    pendingSaveCount += 1;
+    applySettings(next);
+    error = null;
+    status = 'ready';
+    const operation = saveQueue.then(async () => {
+      let failure: AppError | null = null;
+      try {
+        const result = await commands.settingsSave(next);
+        if (result.status === 'error') failure = result.error;
+      } catch {
+        failure = transportSaveError();
+      }
+
+      if (!failure) {
+        persistedSettings = { ...next };
+        if (generation === saveGeneration) {
+          // Re-apply because a backend event from this queued save may have
+          // arrived while a newer optimistic snapshot was visible.
+          applySettings(next);
+          error = null;
+          status = 'ready';
+        }
         return;
       }
 
-      persistedTheme = 'system';
-      theme = 'system';
-      cacheTheme('system');
-      renderTheme(theme);
-      error = null;
-    }
-
-    status = error ? 'error' : 'ready';
+      // A superseded failure must not disturb a newer optimistic save. The
+      // latest successful snapshot is still the rollback anchor for that save.
+      if (generation !== saveGeneration) return;
+      applySettings(persistedSettings);
+      error = failure;
+      status = 'error';
+    }).finally(() => {
+      pendingSaveCount -= 1;
+    });
+    saveQueue = operation.catch(() => undefined);
+    return operation;
   }
 
   async function setTheme(next: Theme): Promise<void> {
-    if (!isTheme(next)) {
-      return;
-    }
-
-    bootstrap();
-    const previousPersisted = persistedTheme;
-    const generation = ++saveGeneration;
-    theme = next;
+    if (!isTheme(next)) return;
+    const waiting = ensureReady();
+    applySettings({ ...snapshot(), theme: next });
     error = null;
     status = 'ready';
-    cacheTheme(next);
-    renderTheme(next);
+    if (waiting) await waiting;
+    return persist({ ...snapshot(), theme: next });
+  }
 
-    try {
-      const result = await commands.settingsSave({ theme: next });
-      if (generation !== saveGeneration) {
-        return;
-      }
+  async function setUiLanguage(next: UiLanguage): Promise<void> {
+    if (!isUiLanguage(next)) return;
+    const waiting = ensureReady();
+    applySettings({ ...snapshot(), uiLanguage: next });
+    error = null;
+    status = 'ready';
+    if (waiting) await waiting;
+    return persist({ ...snapshot(), uiLanguage: next });
+  }
 
-      if (result.status === 'ok') {
-        persistedTheme = next;
-        status = 'ready';
-        return;
-      }
-
-      theme = previousPersisted;
-      error = result.error;
-      status = 'error';
-      cacheTheme(previousPersisted);
-      renderTheme(previousPersisted);
-    } catch {
-      if (generation !== saveGeneration) {
-        return;
-      }
-      theme = previousPersisted;
-      error = null;
-      status = 'error';
-      cacheTheme(previousPersisted);
-      renderTheme(previousPersisted);
-    }
+  async function setOnboardingCompleted(next: boolean): Promise<void> {
+    const waiting = ensureReady();
+    applySettings({ ...snapshot(), onboardingCompleted: next });
+    error = null;
+    status = 'ready';
+    if (waiting) await waiting;
+    return persist({ ...snapshot(), onboardingCompleted: next });
   }
 
   function destroy(): void {
     saveGeneration += 1;
+    activeLoad = undefined;
     backendListenerGeneration += 1;
     removeMediaListener?.();
     removeMediaListener = undefined;
@@ -246,29 +303,23 @@ export function createSettingsStore() {
     backendListenerPromise = undefined;
   }
 
-  // Set a useful first-paint value even when a caller mounts the store
-  // directly in a test or a non-Tauri browser preview.
   bootstrap();
 
   return {
-    get theme() {
-      return theme;
-    },
-    get resolvedTheme() {
-      return resolvedTheme;
-    },
-    get status() {
-      return status;
-    },
-    get error() {
-      return error;
-    },
+    get theme() { return theme; },
+    get resolvedTheme() { return resolvedTheme; },
+    get uiLanguage() { return uiLanguage; },
+    get onboardingCompleted() { return onboardingCompleted; },
+    get status() { return status; },
+    get error() { return error; },
     get state(): SettingsState {
-      return { theme, resolvedTheme, status, error };
+      return { ...snapshot(), resolvedTheme, status, error };
     },
     bootstrap,
     load,
     setTheme,
+    setUiLanguage,
+    setOnboardingCompleted,
     destroy,
   };
 }

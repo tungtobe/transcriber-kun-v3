@@ -41,6 +41,9 @@ jobs:
       - name: check:deps (cổng chặn dependency cấm / externalBin)
         run: npm run check:deps
 
+      - name: check:i18n (vi/en/ja key parity)
+        run: npm run check:i18n
+
       - name: check:ui (WCAG contrast / elevation allow-list)
         run: npm run check:ui
 

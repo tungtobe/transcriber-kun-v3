@@ -129,9 +129,15 @@ mod tests {
         let db_state: Result<Arc<Db>, AppError> = Err(AppError::new(Code::Storage, "disk full"));
         let mut calls = 0u32;
 
-        let err =
-            save_settings_and_notify(&db_state, Settings { theme: Theme::Dark }, |_| calls += 1)
-                .expect_err("DB lỗi từ boot phải trả lỗi ngay, không phát event");
+        let err = save_settings_and_notify(
+            &db_state,
+            Settings {
+                theme: Theme::Dark,
+                ..Default::default()
+            },
+            |_| calls += 1,
+        )
+        .expect_err("DB lỗi từ boot phải trả lỗi ngay, không phát event");
 
         assert_eq!(err.category, Category::Storage);
         assert_eq!(calls, 0, "không được gọi callback khi DB không mở được");
@@ -146,12 +152,23 @@ mod tests {
         let db: Result<Arc<Db>, AppError> = Ok(Arc::new(Db::open(dir.path()).unwrap()));
         let mut calls: Vec<Settings> = Vec::new();
 
-        save_settings_and_notify(&db, Settings { theme: Theme::Dark }, |saved| {
-            calls.push(saved.clone())
-        })
+        save_settings_and_notify(
+            &db,
+            Settings {
+                theme: Theme::Dark,
+                ..Default::default()
+            },
+            |saved| calls.push(saved.clone()),
+        )
         .expect("ghi thành công phải trả Ok");
 
-        assert_eq!(calls, vec![Settings { theme: Theme::Dark }]);
+        assert_eq!(
+            calls,
+            vec![Settings {
+                theme: Theme::Dark,
+                ..Default::default()
+            }]
+        );
     }
 
     #[test]
@@ -170,8 +187,15 @@ mod tests {
         let db: Result<Arc<Db>, AppError> = Ok(Arc::new(db_inner));
         let mut calls = 0u32;
 
-        let err = save_settings_and_notify(&db, Settings { theme: Theme::Dark }, |_| calls += 1)
-            .expect_err("ghi lỗi (bảng đã bị xoá) phải trả Err, không gọi callback");
+        let err = save_settings_and_notify(
+            &db,
+            Settings {
+                theme: Theme::Dark,
+                ..Default::default()
+            },
+            |_| calls += 1,
+        )
+        .expect_err("ghi lỗi (bảng đã bị xoá) phải trả Err, không gọi callback");
 
         assert_eq!(err.category, Category::Storage);
         assert_eq!(calls, 0, "không được gọi callback khi ghi lỗi");

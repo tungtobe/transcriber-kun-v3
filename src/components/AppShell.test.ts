@@ -2,6 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { fireEvent, cleanup, render, screen } from '@testing-library/svelte';
 import AppShell from './AppShell.svelte';
+import { i18n } from '../i18n/index.svelte';
 
 const mocks = vi.hoisted(() => ({
   settingsStore: {
@@ -21,6 +22,7 @@ vi.mock('../lib/stores/app.svelte', () => ({ appStore: mocks.appStore }));
 afterEach(() => cleanup());
 
 beforeEach(() => {
+  i18n.applyPreference('vi');
   window.history.replaceState({}, '', '/home');
   window.dispatchEvent(new PopStateEvent('popstate', { state: {} }));
   mocks.settingsStore.theme = 'system';
@@ -62,6 +64,18 @@ describe('AppShell', () => {
     });
 
     expect(mocks.settingsStore.setTheme).toHaveBeenCalledWith('dark');
+  });
+
+  it.each([
+    ['en', 'Primary navigation sidebar', 'Home', 'quiet utility'],
+    ['ja', 'メインナビゲーションのサイドバー', 'ホーム', '静かなユーティリティ'],
+  ] as const)('renders shell copy and landmarks in %s', (locale, navLabel, heading, caption) => {
+    i18n.applyPreference(locale);
+    render(AppShell);
+
+    expect(screen.getByRole('complementary', { name: navLabel })).toBeTruthy();
+    expect(screen.getByRole('heading', { name: heading })).toBeTruthy();
+    expect(screen.getByText(caption)).toBeTruthy();
   });
 
 });
