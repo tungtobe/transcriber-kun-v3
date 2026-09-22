@@ -12,14 +12,18 @@ import {
   type AppError,
   type KeyId,
   type KeyMetadata,
+  type ModelInfo,
+  type ModelKind,
 } from '../bindings';
 
 export type KeysStatus = 'idle' | 'loading' | 'ready' | 'error';
 export type CheckStatus = 'idle' | 'checking' | 'done';
+export type ModelListStatus = 'idle' | 'loading' | 'ready' | 'error';
 
 export type ApiKeyCheckOutcome =
   | { kind: 'success'; validCount: number; rejectedCount: number; modelCount: number | null }
   | { kind: 'error'; error: AppError };
+
 
 /** Synthesized locally so an empty submission never reaches IPC (spec Always). */
 const EMPTY_INPUT_ERROR: AppError = {
@@ -41,7 +45,24 @@ export function createKeysStore() {
   let testedResults = $state<Map<KeyId, boolean>>(new Map());
   let checkStatus = $state<CheckStatus>('idle');
   let checkResult = $state<ApiKeyCheckOutcome | null>(null);
+  // Local time of the most recent "Kiểm tra key" completion (success or
+  // error) so Settings → Gemini can render it next to the status region
+  // (spec I/O Matrix: "Key hợp lệ, N model khả dụng · HH:MM").
+  let lastCheckedAt = $state<Date | null>(null);
   let activeLoad: Promise<void> | undefined;
+  // Session-only, per model kind (spec Design Notes: "Danh sách đã tải chỉ
+  // giữ trong phiên chạy") — never persisted, cleared by `reset()`.
+  let modelLists = $state<Record<ModelKind, ModelInfo[]>>({ transcribe: [], live: [], memo: [] });
+  let modelListStatus = $state<Record<ModelKind, ModelListStatus>>({
+    transcribe: 'idle',
+    live: 'idle',
+    memo: 'idle',
+  });
+  let modelListError = $state<Record<ModelKind, AppError | null>>({
+    transcribe: null,
+    live: null,
+    memo: null,
+  });
 
   const hasUsableKey = $derived.by(() => {
     if (keys.length === 0) return false;
@@ -76,18 +97,25 @@ export function createKeysStore() {
     return request;
   }
 
+  /** Every `checkKeys` exit path goes through here so `lastCheckedAt` always
+   * reflects the most recent completed check, success or error alike. */
+  function finishCheck(outcome: ApiKeyCheckOutcome): ApiKeyCheckOutcome {
+    checkStatus = 'done';
+    checkResult = outcome;
+    lastCheckedAt = new Date();
+    return outcome;
+  }
+
   /**
-   * The Onboarding "Kiểm tra key" flow: `keysSet(input)` → `keysTest` per
-   * returned id → if ≥1 valid, `modelsList('transcribe')` for the count
-   * (spec Always). Returns the outcome so the caller can render it without
-   * depending on this store being reactive in every consumer.
+   * The Onboarding "Kiểm tra key" flow, reused as-is by Settings → Gemini:
+   * `keysSet(input)` → `keysTest` per returned id → if ≥1 valid,
+   * `modelsList('transcribe')` for the count (spec Always). Returns the
+   * outcome so the caller can render it without depending on this store
+   * being reactive in every consumer.
    */
   async function checkKeys(rawInput: string): Promise<ApiKeyCheckOutcome> {
     if (!hasNonEmptySegment(rawInput)) {
-      const outcome: ApiKeyCheckOutcome = { kind: 'error', error: EMPTY_INPUT_ERROR };
-      checkStatus = 'done';
-      checkResult = outcome;
-      return outcome;
+      return finishCheck({ kind: 'error', error: EMPTY_INPUT_ERROR });
     }
 
     checkStatus = 'checking';
@@ -95,10 +123,7 @@ export function createKeysStore() {
 
     const setResult = await commands.keysSet(rawInput);
     if (setResult.status === 'error') {
-      const outcome: ApiKeyCheckOutcome = { kind: 'error', error: setResult.error };
-      checkStatus = 'done';
-      checkResult = outcome;
-      return outcome;
+      return finishCheck({ kind: 'error', error: setResult.error });
     }
 
     keys = setResult.data;
@@ -128,21 +153,61 @@ export function createKeysStore() {
     const rejectedCount = keys.length - validCount;
 
     if (validCount === 0) {
-      const outcome: ApiKeyCheckOutcome = {
-        kind: 'error',
-        error: lastError ?? EMPTY_INPUT_ERROR,
-      };
-      checkStatus = 'done';
-      checkResult = outcome;
-      return outcome;
+      return finishCheck({ kind: 'error', error: lastError ?? EMPTY_INPUT_ERROR });
     }
 
     const modelsResult = await commands.modelsList('transcribe');
     const modelCount = modelsResult.status === 'ok' ? modelsResult.data.length : null;
-    const outcome: ApiKeyCheckOutcome = { kind: 'success', validCount, rejectedCount, modelCount };
-    checkStatus = 'done';
-    checkResult = outcome;
-    return outcome;
+    return finishCheck({ kind: 'success', validCount, rejectedCount, modelCount });
+  }
+
+  /**
+   * Delete one stored key from the real OS key store (spec Always: "mỗi key
+   * có nút xoá gọi `keysDelete` (xoá khỏi kho khoá OS thật)"). On success the
+   * list and `hasUsableKey` recompute from the server's authoritative
+   * remaining list; on error nothing here changes so the list "giữ nguyên"
+   * (spec I/O Matrix "Xoá key").
+   */
+  async function deleteKey(id: KeyId): Promise<AppError | null> {
+    const result = await commands.keysDelete(id);
+    if (result.status === 'error') {
+      error = result.error;
+      return result.error;
+    }
+    keys = result.data;
+    const nextTested = new Map(testedResults);
+    nextTested.delete(id);
+    testedResults = nextTested;
+    error = null;
+    return null;
+  }
+
+  /**
+   * "Tải danh sách" gọi `modelsList(kind)` theo từng select (spec Always).
+   * Busy state is scoped to the one kind so the other two selects stay
+   * unaffected; a load failure never touches the currently configured model
+   * value (spec I/O Matrix "Tải lỗi").
+   */
+  async function loadModelList(kind: ModelKind): Promise<void> {
+    if (modelListStatus[kind] === 'loading') return;
+    modelListStatus = { ...modelListStatus, [kind]: 'loading' };
+    modelListError = { ...modelListError, [kind]: null };
+    try {
+      const result = await commands.modelsList(kind);
+      if (result.status === 'ok') {
+        modelLists = { ...modelLists, [kind]: result.data };
+        modelListStatus = { ...modelListStatus, [kind]: 'ready' };
+      } else {
+        modelListError = { ...modelListError, [kind]: result.error };
+        modelListStatus = { ...modelListStatus, [kind]: 'error' };
+      }
+    } catch {
+      modelListError = {
+        ...modelListError,
+        [kind]: { category: 'network', code: 'network', detailRedacted: 'models list unavailable' },
+      };
+      modelListStatus = { ...modelListStatus, [kind]: 'error' };
+    }
   }
 
   /** Test-only seam: clears all session state between isolated test cases. */
@@ -153,7 +218,11 @@ export function createKeysStore() {
     testedResults = new Map();
     checkStatus = 'idle';
     checkResult = null;
+    lastCheckedAt = null;
     activeLoad = undefined;
+    modelLists = { transcribe: [], live: [], memo: [] };
+    modelListStatus = { transcribe: 'idle', live: 'idle', memo: 'idle' };
+    modelListError = { transcribe: null, live: null, memo: null };
   }
 
   return {
@@ -162,9 +231,15 @@ export function createKeysStore() {
     get error() { return error; },
     get checkStatus() { return checkStatus; },
     get checkResult() { return checkResult; },
+    get lastCheckedAt() { return lastCheckedAt; },
     get hasUsableKey() { return hasUsableKey; },
+    get modelLists() { return modelLists; },
+    get modelListStatus() { return modelListStatus; },
+    get modelListError() { return modelListError; },
     load,
     checkKeys,
+    deleteKey,
+    loadModelList,
     reset,
   };
 }

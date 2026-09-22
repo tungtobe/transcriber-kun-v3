@@ -11,8 +11,11 @@ function settings(
   theme: 'system' | 'light' | 'dark' = 'system',
   uiLanguage: 'system' | 'vi' | 'en' | 'ja' = 'system',
   onboardingCompleted = false,
+  transcribeModel = 'gemini-flash-lite-latest',
+  liveModel = 'gemini-3.5-live-translate-preview',
+  memoModel = 'gemini-flash-lite-latest',
 ) {
-  return { theme, uiLanguage, onboardingCompleted };
+  return { theme, uiLanguage, onboardingCompleted, transcribeModel, liveModel, memoModel };
 }
 
 vi.mock('../../lib/bindings', () => ({
@@ -367,5 +370,113 @@ describe('settingsStore', () => {
     expect(activeUnlisten).not.toHaveBeenCalled();
     store.destroy();
     expect(activeUnlisten).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('settingsStore.setModel', () => {
+  beforeEach(() => {
+    vi.resetModules();
+    mocks.settingsGet.mockReset();
+    mocks.settingsSave.mockReset();
+    mocks.listen.mockReset().mockResolvedValue(() => undefined);
+    localStorage.clear();
+    document.documentElement.removeAttribute('data-theme');
+    document.documentElement.removeAttribute('data-theme-preference');
+    installMatchMedia(false);
+  });
+
+  it('optimistically persists a custom transcribe model name not in any loaded list', async () => {
+    mocks.settingsGet.mockResolvedValue({ status: 'ok', data: settings() });
+    mocks.settingsSave.mockResolvedValue({ status: 'ok', data: null });
+    const { createSettingsStore } = await import('./settings.svelte');
+    const store = createSettingsStore();
+    await store.load();
+
+    await store.setModel('transcribe', 'my-custom-model');
+
+    expect(store.transcribeModel).toBe('my-custom-model');
+    expect(mocks.settingsSave).toHaveBeenCalledWith(settings('system', 'system', false, 'my-custom-model'));
+  });
+
+  it('persists the live and memo models independently of each other', async () => {
+    mocks.settingsGet.mockResolvedValue({ status: 'ok', data: settings() });
+    mocks.settingsSave.mockResolvedValue({ status: 'ok', data: null });
+    const { createSettingsStore } = await import('./settings.svelte');
+    const store = createSettingsStore();
+    await store.load();
+
+    await store.setModel('live', 'my-live-model');
+    await store.setModel('memo', 'my-memo-model');
+
+    expect(store.liveModel).toBe('my-live-model');
+    expect(store.memoModel).toBe('my-memo-model');
+    expect(store.transcribeModel).toBe('gemini-flash-lite-latest');
+    expect(mocks.settingsSave).toHaveBeenLastCalledWith(
+      settings('system', 'system', false, 'gemini-flash-lite-latest', 'my-live-model', 'my-memo-model'),
+    );
+  });
+
+  it('never calls settingsSave for an empty or whitespace-only model name', async () => {
+    mocks.settingsGet.mockResolvedValue({ status: 'ok', data: settings() });
+    const { createSettingsStore } = await import('./settings.svelte');
+    const store = createSettingsStore();
+    await store.load();
+
+    await store.setModel('transcribe', '   ');
+
+    expect(mocks.settingsSave).not.toHaveBeenCalled();
+    expect(store.transcribeModel).toBe('gemini-flash-lite-latest');
+  });
+
+  it('trims surrounding whitespace before saving', async () => {
+    mocks.settingsGet.mockResolvedValue({ status: 'ok', data: settings() });
+    mocks.settingsSave.mockResolvedValue({ status: 'ok', data: null });
+    const { createSettingsStore } = await import('./settings.svelte');
+    const store = createSettingsStore();
+    await store.load();
+
+    await store.setModel('memo', '  spaced-model  ');
+
+    expect(store.memoModel).toBe('spaced-model');
+    expect(mocks.settingsSave).toHaveBeenCalledWith(
+      settings('system', 'system', false, 'gemini-flash-lite-latest', 'gemini-3.5-live-translate-preview', 'spaced-model'),
+    );
+  });
+
+  it('rolls back to the last persisted model name on a typed save failure', async () => {
+    mocks.settingsGet.mockResolvedValue({
+      status: 'ok',
+      data: settings('system', 'system', false, 'original-model'),
+    });
+    mocks.settingsSave.mockResolvedValue({
+      status: 'error',
+      error: { category: 'format', code: 'format', detailRedacted: 'rejected' },
+    });
+    const { createSettingsStore } = await import('./settings.svelte');
+    const store = createSettingsStore();
+    await store.load();
+
+    const pending = store.setModel('transcribe', 'attempted-model');
+    expect(store.transcribeModel).toBe('attempted-model');
+    await pending;
+
+    expect(store.transcribeModel).toBe('original-model');
+    expect(store.status).toBe('error');
+    expect(store.error?.category).toBe('format');
+  });
+
+  it('falls back a missing or blank model field to the shared Gemini default on load', async () => {
+    mocks.settingsGet.mockResolvedValue({
+      status: 'ok',
+      data: { theme: 'system', uiLanguage: 'system', onboardingCompleted: false, liveModel: '   ' },
+    });
+    const { createSettingsStore } = await import('./settings.svelte');
+    const store = createSettingsStore();
+
+    await store.load();
+
+    expect(store.transcribeModel).toBe('gemini-flash-lite-latest');
+    expect(store.liveModel).toBe('gemini-3.5-live-translate-preview');
+    expect(store.memoModel).toBe('gemini-flash-lite-latest');
   });
 });

@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use specta::Type;
 
 use crate::core::error::{AppError, Code};
+use crate::core::model_defaults::{DEFAULT_LIVE_MODEL, DEFAULT_MEMO_MODEL, DEFAULT_TRANSCRIBE_MODEL};
 use crate::db::{repo, Db};
 
 /// `theme: 'system' | 'light' | 'dark'`, mặc định `system` (spec Decisions).
@@ -31,7 +32,7 @@ pub enum UiLanguage {
     Ja,
 }
 
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, Type)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
     pub theme: Theme,
@@ -43,6 +44,35 @@ pub struct Settings {
     /// A separate decision bit lets the router distinguish a deliberate
     /// decline from a first-run pending state.
     pub consent_declined: bool,
+    /// Free-text model name used by file transcription. Never validated
+    /// against a loaded model list (spec Always: "Tên không có trong danh
+    /// sách đã tải vẫn lưu được"); only non-empty-after-trim is enforced.
+    pub transcribe_model: String,
+    /// Free-text model name used by Live.
+    pub live_model: String,
+    /// Free-text model name used by Memo.
+    pub memo_model: String,
+}
+
+/// Derived manually (not `#[derive(Default)]`) so the three model fields
+/// default to the shared Gemini defaults instead of an empty string — an
+/// empty string is rejected by [`save`], so `Settings::default()` must
+/// already be a value `save` accepts (spec: "mặc định lấy từ
+/// `gemini::params::DEFAULT_*` (hoặc ... định nghĩa default trong
+/// `core`/settings)").
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            theme: Theme::default(),
+            ui_language: UiLanguage::default(),
+            onboarding_completed: false,
+            consent_accepted_version: 0,
+            consent_declined: false,
+            transcribe_model: DEFAULT_TRANSCRIBE_MODEL.to_string(),
+            live_model: DEFAULT_LIVE_MODEL.to_string(),
+            memo_model: DEFAULT_MEMO_MODEL.to_string(),
+        }
+    }
 }
 
 /// Phát khi `save` ghi bền thành công — đúng một lần, mang giá trị mới toàn
@@ -55,6 +85,26 @@ const KEY_UI_LANGUAGE: &str = "uiLanguage";
 const KEY_ONBOARDING_COMPLETED: &str = "onboardingCompleted";
 const KEY_CONSENT_ACCEPTED_VERSION: &str = "consentAcceptedVersion";
 const KEY_CONSENT_DECLINED: &str = "consentDeclined";
+const KEY_TRANSCRIBE_MODEL: &str = "transcribeModel";
+const KEY_LIVE_MODEL: &str = "liveModel";
+const KEY_MEMO_MODEL: &str = "memoModel";
+
+/// Shared by `load`'s three model branches: missing key, corrupt JSON, and a
+/// parsed-but-blank string (e.g. a hand-edited DB row) all fall back to
+/// `default` the same way (spec: "load fallback về mặc định khi thiếu hoặc
+/// hỏng").
+fn load_model_field(raw: &std::collections::HashMap<String, String>, key: &str, default: &str) -> String {
+    match raw.get(key) {
+        None => default.to_string(),
+        Some(value) => match serde_json::from_str::<String>(value) {
+            Ok(parsed) if !parsed.trim().is_empty() => parsed,
+            _ => {
+                tracing::warn!(key, "giá trị settings không parse được, dùng mặc định");
+                default.to_string()
+            }
+        },
+    }
+}
 
 /// Đọc toàn bộ settings từ DB. Khoá thiếu hoặc value không parse được (hỏng)
 /// dùng mặc định của khoá đó, khoá khác giữ nguyên (spec I/O Matrix). Không
@@ -128,19 +178,43 @@ pub fn load(db: &Db) -> Settings {
         }),
     };
 
+    let transcribe_model = load_model_field(&raw, KEY_TRANSCRIBE_MODEL, DEFAULT_TRANSCRIBE_MODEL);
+    let live_model = load_model_field(&raw, KEY_LIVE_MODEL, DEFAULT_LIVE_MODEL);
+    let memo_model = load_model_field(&raw, KEY_MEMO_MODEL, DEFAULT_MEMO_MODEL);
+
     Settings {
         theme,
         ui_language,
         onboarding_completed,
         consent_accepted_version,
         consent_declined,
+        transcribe_model,
+        live_model,
+        memo_model,
     }
+}
+
+/// Từ chối một trường model rỗng hoặc chỉ khoảng trắng trước khi ghi (spec
+/// Always: "Rust `save` cũng từ chối rỗng (`format`)") — kiểm tra độc lập
+/// với validation inline ở frontend, không tin tưởng một mình phía UI.
+fn require_non_blank_model(field: &str, value: &str) -> Result<(), AppError> {
+    if value.trim().is_empty() {
+        return Err(AppError::new(
+            Code::Format,
+            format!("{field} không được để trống"),
+        ));
+    }
+    Ok(())
 }
 
 /// Ghi toàn bộ settings trong một transaction (spec Boundaries). Lỗi ghi trả
 /// `AppError` category `storage`; người gọi (ipc) chỉ phát `SettingsChanged`
 /// khi hàm này trả `Ok`.
 pub fn save(db: &Db, settings: &Settings) -> Result<(), AppError> {
+    require_non_blank_model(KEY_TRANSCRIBE_MODEL, &settings.transcribe_model)?;
+    require_non_blank_model(KEY_LIVE_MODEL, &settings.live_model)?;
+    require_non_blank_model(KEY_MEMO_MODEL, &settings.memo_model)?;
+
     let theme_json = serde_json::to_string(&settings.theme)
         .map_err(|err| AppError::new(Code::Format, err.to_string()))?;
     let ui_language_json = serde_json::to_string(&settings.ui_language)
@@ -152,6 +226,12 @@ pub fn save(db: &Db, settings: &Settings) -> Result<(), AppError> {
             .map_err(|err| AppError::new(Code::Format, err.to_string()))?;
     let consent_declined_json = serde_json::to_string(&settings.consent_declined)
         .map_err(|err| AppError::new(Code::Format, err.to_string()))?;
+    let transcribe_model_json = serde_json::to_string(&settings.transcribe_model)
+        .map_err(|err| AppError::new(Code::Format, err.to_string()))?;
+    let live_model_json = serde_json::to_string(&settings.live_model)
+        .map_err(|err| AppError::new(Code::Format, err.to_string()))?;
+    let memo_model_json = serde_json::to_string(&settings.memo_model)
+        .map_err(|err| AppError::new(Code::Format, err.to_string()))?;
 
     db.with_connection(|conn| {
         Ok(repo::settings::upsert_many(
@@ -162,6 +242,9 @@ pub fn save(db: &Db, settings: &Settings) -> Result<(), AppError> {
                 (KEY_ONBOARDING_COMPLETED, onboarding_completed_json),
                 (KEY_CONSENT_ACCEPTED_VERSION, consent_accepted_version_json),
                 (KEY_CONSENT_DECLINED, consent_declined_json),
+                (KEY_TRANSCRIBE_MODEL, transcribe_model_json),
+                (KEY_LIVE_MODEL, live_model_json),
+                (KEY_MEMO_MODEL, memo_model_json),
             ],
         )?)
     })
@@ -170,6 +253,7 @@ pub fn save(db: &Db, settings: &Settings) -> Result<(), AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::error::Category;
     use std::io;
     use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
@@ -412,6 +496,7 @@ mod tests {
             onboarding_completed: false,
             consent_accepted_version: 1,
             consent_declined: false,
+            ..Default::default()
         };
 
         save(&db, &expected).unwrap();
@@ -430,6 +515,7 @@ mod tests {
                 onboarding_completed: true,
                 consent_accepted_version: 1,
                 consent_declined: true,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -454,6 +540,7 @@ mod tests {
                 onboarding_completed: true,
                 consent_accepted_version: 0,
                 consent_declined: false,
+                ..Default::default()
             }
         );
     }
@@ -477,5 +564,177 @@ mod tests {
                 ..Default::default()
             }
         );
+    }
+
+    // Story 1.9 I/O Matrix "Settings cũ": DB thiếu khoá model -> load trả
+    // mặc định `gemini::params`/`core::model_defaults`, không lỗi.
+    #[test]
+    fn default_settings_use_gemini_model_defaults() {
+        let defaults = Settings::default();
+        assert_eq!(defaults.transcribe_model, DEFAULT_TRANSCRIBE_MODEL);
+        assert_eq!(defaults.live_model, DEFAULT_LIVE_MODEL);
+        assert_eq!(defaults.memo_model, DEFAULT_MEMO_MODEL);
+    }
+
+    #[test]
+    fn load_on_empty_table_defaults_model_fields() {
+        let db = open_db();
+        let loaded = load(&db);
+        assert_eq!(loaded.transcribe_model, DEFAULT_TRANSCRIBE_MODEL);
+        assert_eq!(loaded.live_model, DEFAULT_LIVE_MODEL);
+        assert_eq!(loaded.memo_model, DEFAULT_MEMO_MODEL);
+    }
+
+    #[test]
+    fn model_fields_round_trip_a_custom_name_not_in_any_loaded_list() {
+        let db = open_db();
+        let expected = Settings {
+            transcribe_model: "my-custom-model".to_string(),
+            live_model: "another-custom-model".to_string(),
+            memo_model: "third-custom-model".to_string(),
+            ..Default::default()
+        };
+
+        save(&db, &expected).unwrap();
+
+        assert_eq!(load(&db), expected);
+    }
+
+    #[test]
+    fn save_rejects_empty_or_whitespace_only_transcribe_model() {
+        let db = open_db();
+        let err = save(
+            &db,
+            &Settings {
+                transcribe_model: "   ".to_string(),
+                ..Default::default()
+            },
+        )
+        .expect_err("model rỗng (hoặc chỉ khoảng trắng) phải bị từ chối");
+
+        assert_eq!(err.category, Category::Format);
+    }
+
+    #[test]
+    fn save_rejects_empty_live_model() {
+        let db = open_db();
+        let err = save(
+            &db,
+            &Settings {
+                live_model: String::new(),
+                ..Default::default()
+            },
+        )
+        .expect_err("liveModel rỗng phải bị từ chối");
+
+        assert_eq!(err.category, Category::Format);
+    }
+
+    #[test]
+    fn save_rejects_empty_memo_model() {
+        let db = open_db();
+        let err = save(
+            &db,
+            &Settings {
+                memo_model: String::new(),
+                ..Default::default()
+            },
+        )
+        .expect_err("memoModel rỗng phải bị từ chối");
+
+        assert_eq!(err.category, Category::Format);
+    }
+
+    #[test]
+    fn save_rejecting_an_empty_model_does_not_write_any_row() {
+        let db = open_db();
+        // A prior valid save must not be overwritten by a rejected one (spec
+        // Boundaries parity with existing settings: reject before touching
+        // the DB at all).
+        save(&db, &Settings::default()).unwrap();
+
+        let err = save(
+            &db,
+            &Settings {
+                transcribe_model: String::new(),
+                ..Default::default()
+            },
+        )
+        .expect_err("phải từ chối trước khi ghi");
+        assert_eq!(err.category, Category::Format);
+
+        assert_eq!(load(&db), Settings::default());
+    }
+
+    #[test]
+    fn corrupt_model_fields_fall_back_without_losing_other_fields() {
+        let db = open_db();
+        save(
+            &db,
+            &Settings {
+                theme: Theme::Dark,
+                transcribe_model: "custom-transcribe".to_string(),
+                live_model: "custom-live".to_string(),
+                memo_model: "custom-memo".to_string(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.with_connection(|conn| {
+            conn.execute(
+                "UPDATE settings SET value = 'not-json' WHERE key = 'transcribeModel'",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(
+            load(&db),
+            Settings {
+                theme: Theme::Dark,
+                transcribe_model: DEFAULT_TRANSCRIBE_MODEL.to_string(),
+                live_model: "custom-live".to_string(),
+                memo_model: "custom-memo".to_string(),
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn blank_model_row_falls_back_to_default_like_corrupt_json() {
+        // A row that parses fine as JSON but is blank after trim (e.g. a
+        // hand-edited DB) must fall back the same way as a parse failure —
+        // `save` can never write it, but `load` must still be defensive.
+        let db = open_db();
+        db.with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO settings (key, value) VALUES ('liveModel', '\"   \"')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(load(&db).live_model, DEFAULT_LIVE_MODEL);
+    }
+
+    #[test]
+    fn legacy_rows_default_missing_model_fields_without_changing_others() {
+        let db = open_db();
+        db.with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO settings (key, value) VALUES ('theme', '\"dark\"')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let loaded = load(&db);
+        assert_eq!(loaded.theme, Theme::Dark);
+        assert_eq!(loaded.transcribe_model, DEFAULT_TRANSCRIBE_MODEL);
+        assert_eq!(loaded.live_model, DEFAULT_LIVE_MODEL);
+        assert_eq!(loaded.memo_model, DEFAULT_MEMO_MODEL);
     }
 }

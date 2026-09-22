@@ -3,6 +3,7 @@
 // trace ever passes through here — only `error.<category>.title|hint`
 // strings looked up by category (spec Boundaries).
 import { i18n, type TranslationKey } from '../i18n/index.svelte';
+import type { BannerItem } from '../components/BannerStack.svelte';
 import type { AppError, Category } from './bindings';
 
 const CATEGORY_COPY: Record<Category, { title: TranslationKey; hint: TranslationKey }> = {
@@ -24,4 +25,26 @@ export function errorTitle(error: AppError): string {
 /** One actionable sentence — never the raw `detailRedacted`, a key, or a URL. */
 export function errorHint(error: AppError): string {
   return i18n.t(CATEGORY_COPY[error.category].hint);
+}
+
+/**
+ * Reusable banner for any error that involves the model settings area (a
+ * `models_list`/`model`-category failure, in this story specifically the
+ * Settings → Gemini "Tải danh sách" flow). Always a warning with a shortcut
+ * to Settings → Gemini and never changes the user's configured model itself
+ * (spec Always: "Helper `modelErrorBanner(error)` tạo `BannerItem` warning
+ * với lối tắt `/settings/gemini`, không bao giờ tự đổi model").
+ *
+ * `scope` disambiguates the `BannerItem.id` when more than one such banner
+ * can be visible at once (e.g. the three "Tải danh sách" rows).
+ */
+export function modelErrorBanner(error: AppError, scope = 'model'): BannerItem {
+  return {
+    id: `model-error-${scope}`,
+    variant: 'warning',
+    title: errorTitle(error),
+    message: errorHint(error),
+    actionLabel: i18n.t('settings.help.modelBannerAction'),
+    actionHref: '/settings/gemini',
+  };
 }

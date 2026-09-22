@@ -146,6 +146,16 @@ export type Settings = {
 	 *  decline from a first-run pending state.
 	 */
 	consentDeclined: boolean,
+	/**
+	 *  Free-text model name used by file transcription. Never validated
+	 *  against a loaded model list (spec Always: "Tên không có trong danh
+	 *  sách đã tải vẫn lưu được"); only non-empty-after-trim is enforced.
+	 */
+	transcribeModel: string,
+	/**  Free-text model name used by Live. */
+	liveModel: string,
+	/**  Free-text model name used by Memo. */
+	memoModel: string,
 };
 
 /**

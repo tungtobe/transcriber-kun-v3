@@ -3,6 +3,8 @@
   import { routePaths } from '../lib/router';
   import { i18n, type TranslationKey } from '../i18n/index.svelte';
   import { settingsStore } from '../lib/stores/settings.svelte';
+  import SettingsGeneral from './settings/SettingsGeneral.svelte';
+  import SettingsGemini from './settings/SettingsGemini.svelte';
 
   type RouteParams = { group?: string };
   let { routeParams = {} }: { routeParams?: RouteParams } = $props();
@@ -45,11 +47,17 @@
 
     <div class="settings-panel">
       <h2>{groupLabel}</h2>
-      <p>{i18n.t('settings.placeholder.description')}</p>
-      <div class="settings-row">
-        <span class="settings-label">{i18n.t('settings.placeholder.routePath')}</span>
-        <code>/settings/{group}</code>
-      </div>
+      {#if group === 'general'}
+        <SettingsGeneral />
+      {:else if group === 'gemini'}
+        <SettingsGemini />
+      {:else}
+        <p>{i18n.t('settings.placeholder.description')}</p>
+        <div class="settings-row">
+          <span class="settings-label">{i18n.t('settings.placeholder.routePath')}</span>
+          <code>/settings/{group}</code>
+        </div>
+      {/if}
     </div>
   </div>
 </section>

@@ -7,6 +7,7 @@ import {
   type AppError,
   type ConsentPolicy,
   type ConsentStatus,
+  type ModelKind,
   type Settings,
   type Theme,
   type UiLanguage,
@@ -22,12 +23,21 @@ export type SettingsState = Settings & {
 };
 
 const THEME_CACHE_KEY = 'trans-kun.theme';
+// Mirrors `core::model_defaults` (Rust): duplicated here only as an
+// offline-first fallback before the real settings snapshot loads, exactly
+// like the other `DEFAULT_SETTINGS` fields already do for theme/uiLanguage.
+const DEFAULT_TRANSCRIBE_MODEL = 'gemini-flash-lite-latest';
+const DEFAULT_LIVE_MODEL = 'gemini-3.5-live-translate-preview';
+const DEFAULT_MEMO_MODEL = 'gemini-flash-lite-latest';
 const DEFAULT_SETTINGS: Settings = {
   theme: 'system',
   uiLanguage: 'system',
   onboardingCompleted: false,
   consentAcceptedVersion: 0,
   consentDeclined: false,
+  transcribeModel: DEFAULT_TRANSCRIBE_MODEL,
+  liveModel: DEFAULT_LIVE_MODEL,
+  memoModel: DEFAULT_MEMO_MODEL,
 };
 
 function isTheme(value: unknown): value is Theme {
@@ -65,6 +75,10 @@ function applyTheme(theme: Theme): ResolvedTheme {
   return resolved;
 }
 
+function isNonEmptyModelName(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
 function normalizeSettings(value: Partial<Settings> | null | undefined): Settings {
   return {
     theme: isTheme(value?.theme) ? value.theme : 'system',
@@ -78,6 +92,11 @@ function normalizeSettings(value: Partial<Settings> | null | undefined): Setting
       ? value.consentAcceptedVersion
       : 0,
     consentDeclined: typeof value?.consentDeclined === 'boolean' ? value.consentDeclined : false,
+    transcribeModel: isNonEmptyModelName(value?.transcribeModel)
+      ? value.transcribeModel
+      : DEFAULT_TRANSCRIBE_MODEL,
+    liveModel: isNonEmptyModelName(value?.liveModel) ? value.liveModel : DEFAULT_LIVE_MODEL,
+    memoModel: isNonEmptyModelName(value?.memoModel) ? value.memoModel : DEFAULT_MEMO_MODEL,
   };
 }
 
@@ -108,6 +127,9 @@ export function createSettingsStore() {
   let onboardingCompleted = $state(false);
   let consentAcceptedVersion = $state(0);
   let consentDeclined = $state(false);
+  let transcribeModel = $state(DEFAULT_TRANSCRIBE_MODEL);
+  let liveModel = $state(DEFAULT_LIVE_MODEL);
+  let memoModel = $state(DEFAULT_MEMO_MODEL);
   let consentPolicy = $state<ConsentPolicy | null>(null);
   let status = $state<SettingsStatus>('idle');
   let error = $state<AppError | null>(null);
@@ -133,7 +155,14 @@ export function createSettingsStore() {
   }
 
   function snapshot(): Settings {
-    const base = { theme, uiLanguage, onboardingCompleted } as Settings;
+    const base = {
+      theme,
+      uiLanguage,
+      onboardingCompleted,
+      transcribeModel,
+      liveModel,
+      memoModel,
+    } as Settings;
     // Keep compatibility with pre-consent test doubles/older WebViews while
     // the real Rust snapshot always includes these fields after load.
     if (consentPolicy || consentAcceptedVersion !== 0 || consentDeclined) {
@@ -149,6 +178,9 @@ export function createSettingsStore() {
     onboardingCompleted = next.onboardingCompleted;
     consentAcceptedVersion = next.consentAcceptedVersion;
     consentDeclined = next.consentDeclined;
+    transcribeModel = next.transcribeModel;
+    liveModel = next.liveModel;
+    memoModel = next.memoModel;
     cacheTheme(theme);
     resolvedTheme = applyTheme(theme);
     i18n.applyPreference(uiLanguage);
@@ -211,6 +243,9 @@ export function createSettingsStore() {
       onboardingCompleted: false,
       consentAcceptedVersion: 0,
       consentDeclined: false,
+      transcribeModel: DEFAULT_TRANSCRIBE_MODEL,
+      liveModel: DEFAULT_LIVE_MODEL,
+      memoModel: DEFAULT_MEMO_MODEL,
     };
     persistedSettings = cached;
     applySettings(cached);
@@ -335,6 +370,36 @@ export function createSettingsStore() {
     return persist({ ...snapshot(), uiLanguage: next });
   }
 
+  function withModel(base: Settings, kind: ModelKind, name: string): Settings {
+    switch (kind) {
+      case 'transcribe':
+        return { ...base, transcribeModel: name };
+      case 'live':
+        return { ...base, liveModel: name };
+      case 'memo':
+        return { ...base, memoModel: name };
+    }
+  }
+
+  /**
+   * Persist a free-text model name for one of the three kinds, following the
+   * same optimistic/persist/rollback shape as `setTheme`/`setUiLanguage`.
+   * Empty or whitespace-only input is blocked here too (spec Always: "rỗng
+   * hoặc chỉ khoảng trắng bị chặn inline ngay khi nhập (không lưu)") — the
+   * primary inline block lives in the Settings → Gemini UI, this is defense
+   * in depth so the store itself never sends a blank value to `settingsSave`.
+   */
+  async function setModel(kind: ModelKind, name: string): Promise<void> {
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    const waiting = ensureReady();
+    applySettings(withModel(snapshot(), kind, trimmed));
+    error = null;
+    status = 'ready';
+    if (waiting) await waiting;
+    return persist(withModel(snapshot(), kind, trimmed));
+  }
+
   async function setOnboardingCompleted(next: boolean): Promise<void> {
     const waiting = ensureReady();
     applySettings({ ...snapshot(), onboardingCompleted: next });
@@ -380,6 +445,9 @@ export function createSettingsStore() {
     get onboardingCompleted() { return onboardingCompleted; },
     get consentAcceptedVersion() { return consentAcceptedVersion; },
     get consentDeclined() { return consentDeclined; },
+    get transcribeModel() { return transcribeModel; },
+    get liveModel() { return liveModel; },
+    get memoModel() { return memoModel; },
     get consentPolicy() { return consentPolicy; },
     get consentStatus(): ConsentStatus { return consentPolicy?.status ?? 'pending'; },
     get status() { return status; },
@@ -391,6 +459,7 @@ export function createSettingsStore() {
     load,
     setTheme,
     setUiLanguage,
+    setModel,
     setOnboardingCompleted,
     acceptConsent,
     declineConsent,

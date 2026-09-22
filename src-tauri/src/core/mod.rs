@@ -5,6 +5,7 @@
 pub mod error;
 pub mod id;
 pub mod log;
+pub mod model_defaults;
 pub mod paths;
 pub mod sensitive;
 

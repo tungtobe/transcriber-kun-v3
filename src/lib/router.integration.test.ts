@@ -20,13 +20,13 @@ describe('history router runtime', () => {
     render(Router, { props: { routes } });
 
     expect(await screen.findByRole('heading', { name: 'Cài đặt' })).toBeTruthy();
-    expect(screen.getByText('/settings/gemini')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Kiểm tra key' })).toBeTruthy();
 
     await push('/home');
     expect(await screen.findByRole('heading', { name: 'Trang chủ' })).toBeTruthy();
     window.history.back();
     await waitFor(() => expect(window.location.pathname).toBe('/settings/gemini'));
-    expect(screen.getByText('/settings/gemini')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Kiểm tra key' })).toBeTruthy();
     window.history.forward();
     await waitFor(() => expect(window.location.pathname).toBe('/home'));
     expect(screen.getByText('Kéo file vào đây')).toBeTruthy();

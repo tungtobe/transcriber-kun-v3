@@ -11,9 +11,11 @@ pub const MODELS_PATH: &str = "/v1beta/models";
 pub const DEFAULT_MODELS_PAGE_SIZE: u32 = 10;
 pub const MODELS_LIST_TIMEOUT: Duration = Duration::from_secs(15);
 pub const KEY_TEST_TIMEOUT: Duration = Duration::from_secs(10);
-pub const DEFAULT_TRANSCRIBE_MODEL: &str = "gemini-flash-lite-latest";
-pub const DEFAULT_MEMO_MODEL: &str = "gemini-flash-lite-latest";
-pub const DEFAULT_LIVE_MODEL: &str = "gemini-3.5-live-translate-preview";
+// Owned by `core::model_defaults` so `settings` can fall back to the same
+// strings without a feature-to-feature import (Story 1.9 Code Map).
+pub use crate::core::model_defaults::{
+    DEFAULT_LIVE_MODEL, DEFAULT_MEMO_MODEL, DEFAULT_TRANSCRIBE_MODEL,
+};
 
 pub const QUOTA_COOLDOWN: Duration = Duration::from_secs(60);
 pub const JOB_MAX_WAIT: Duration = Duration::from_secs(180);
