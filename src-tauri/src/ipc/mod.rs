@@ -15,6 +15,7 @@ use tauri_specta::{collect_commands, collect_events, Builder, Event};
 use crate::consent::{self, ConsentPolicy};
 use crate::core::error::{AppError, Code};
 use crate::db::Db;
+use crate::secrets::{KeyId, KeyMetadata};
 use crate::settings::{self, Settings, SettingsChanged};
 use boot::AppState;
 
@@ -163,6 +164,47 @@ async fn consent_decline(
     .map_err(|err| AppError::new(Code::Storage, err.to_string()))?
 }
 
+/// Return only opaque IDs and masked labels; key material never crosses IPC.
+#[tauri::command]
+#[specta::specta]
+async fn keys_list(state: tauri::State<'_, AppState>) -> Result<Vec<KeyMetadata>, AppError> {
+    let secrets = state.secrets.clone();
+    tauri::async_runtime::spawn_blocking(move || secrets.list())
+        .await
+        .map_err(|err| AppError::new(Code::Storage, err.to_string()))?
+}
+
+/// Replace the complete native-store key list, then refresh the actor before
+/// replying so no removed key can be allocated after command completion.
+#[tauri::command]
+#[specta::specta]
+async fn keys_set(
+    state: tauri::State<'_, AppState>,
+    keys: String,
+) -> Result<Vec<KeyMetadata>, AppError> {
+    let secrets = state.secrets.clone();
+    let metadata = tauri::async_runtime::spawn_blocking(move || secrets.set(&keys))
+        .await
+        .map_err(|err| AppError::new(Code::Storage, err.to_string()))??;
+    state.key_pool.refresh().await?;
+    Ok(metadata)
+}
+
+/// Delete one native credential entry by opaque ID and invalidate old leases.
+#[tauri::command]
+#[specta::specta]
+async fn keys_delete(
+    state: tauri::State<'_, AppState>,
+    id: KeyId,
+) -> Result<Vec<KeyMetadata>, AppError> {
+    let secrets = state.secrets.clone();
+    let metadata = tauri::async_runtime::spawn_blocking(move || secrets.delete(&id))
+        .await
+        .map_err(|err| AppError::new(Code::Storage, err.to_string()))??;
+    state.key_pool.refresh().await?;
+    Ok(metadata)
+}
+
 /// Danh sách command/event production — nguồn duy nhất, dùng chung cho
 /// `lib.rs` (đăng ký `invoke_handler`/`mount_events` thật) và test
 /// `export_bindings` (sinh `src/lib/bindings.ts`). Không đăng ký gì từ
@@ -175,7 +217,10 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             settings_save,
             consent_policy,
             consent_accept,
-            consent_decline
+            consent_decline,
+            keys_list,
+            keys_set,
+            keys_delete
         ])
         .events(collect_events![SettingsChanged])
 }

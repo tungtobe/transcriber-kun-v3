@@ -8,12 +8,16 @@ use tauri::Manager;
 
 use crate::core::error::{AppError, Code};
 use crate::db::Db;
+use crate::gemini::keys::{KeyPoolHandle, KeyProvider, SystemClock};
+use crate::secrets::{NativeCredentialStore, SecretService};
 
 /// State managed toàn app. `db` là `Err` khi thư mục dữ liệu không mở được —
 /// app vẫn khởi động bình thường, mọi command chạm DB trả lại đúng lỗi này
 /// (spec I/O Matrix: "App vẫn khởi động; ... trả AppError category storage").
 pub struct AppState {
     pub db: Result<Arc<Db>, AppError>,
+    pub secrets: Arc<SecretService<NativeCredentialStore>>,
+    pub key_pool: KeyPoolHandle,
     // Giữ sống suốt vòng đời app — drop sớm sẽ ngắt worker ghi log không
     // đồng bộ của `tracing-appender`. Không đọc trực tiếp ở đâu khác nên
     // đặt `_` để không bị cảnh báo "chưa dùng", nhưng vẫn public để test có
@@ -53,8 +57,24 @@ pub fn boot<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
         tracing::error!(error = %err, "DB không mở được, app vẫn khởi động");
     }
 
+    let secrets = Arc::new(SecretService::new(NativeCredentialStore));
+    let provider: Arc<dyn KeyProvider> = secrets.clone();
+    let (key_pool, key_pool_actor) = KeyPoolHandle::channel(provider, Arc::new(SystemClock));
+    tauri::async_runtime::spawn(key_pool_actor.run());
+
+    // Native credential-store access is deliberately lazy and fallible: a
+    // locked/unavailable Keychain or Credential Manager must not stop boot.
+    let initial_pool = key_pool.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Err(err) = initial_pool.refresh().await {
+            tracing::warn!(error = %err, "kho khoá OS chưa sẵn sàng; app vẫn tiếp tục");
+        }
+    });
+
     AppState {
         db,
+        secrets,
+        key_pool,
         _log_guard: log_guard,
     }
 }

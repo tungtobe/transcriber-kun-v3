@@ -1,6 +1,9 @@
 //! Single Gemini gateway seam. Story 1.5 keeps the transport fake, but the
 //! gate is real: no transport closure is invoked until consent is current.
 
+pub mod keys;
+pub mod params;
+
 use crate::consent;
 use crate::core::error::{AppError, Code};
 

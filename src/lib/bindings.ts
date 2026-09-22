@@ -35,6 +35,15 @@ export const commands = {
 	 *  field, then emit the same full snapshot contract as settings_save.
 	 */
 	consentDecline: (settings: Settings) => typedError<Settings, AppError>(__TAURI_INVOKE("consent_decline", { settings })),
+	/**  Return only opaque IDs and masked labels; key material never crosses IPC. */
+	keysList: () => typedError<KeyMetadata[], AppError>(__TAURI_INVOKE("keys_list")),
+	/**
+	 *  Replace the complete native-store key list, then refresh the actor before
+	 *  replying so no removed key can be allocated after command completion.
+	 */
+	keysSet: (keys: string) => typedError<KeyMetadata[], AppError>(__TAURI_INVOKE("keys_set", { keys })),
+	/**  Delete one native credential entry by opaque ID and invalidate old leases. */
+	keysDelete: (id: KeyId) => typedError<KeyMetadata[], AppError>(__TAURI_INVOKE("keys_delete", { id })),
 };
 
 /** Events */
@@ -78,6 +87,22 @@ export type ConsentPolicy = {
 
 /**  The state used by both routing and the Gemini transport gate. */
 export type ConsentStatus = "pending" | "declined" | "stale" | "current";
+
+/**
+ *  An opaque identifier for one stored API key. The secret is never part of
+ *  this value; IDs are UUIDv7 so they are safe to pass through IPC and logs.
+ */
+export type KeyId = string;
+
+/**
+ *  Metadata safe to return to the frontend. `label` is intentionally masked;
+ *  neither this type nor its serialized representation contains the
+ *  credential itself.
+ */
+export type KeyMetadata = {
+	id: KeyId,
+	label: string,
+};
 
 export type Settings = {
 	theme: Theme,

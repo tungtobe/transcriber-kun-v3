@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 09-22-2026 06:12
-last_updated: 09-22-2026 22:00
+last_updated: 09-22-2026 23:35
 project: transcriber_kun
 project_key: NOKEY
 tracking_system: file-system
@@ -41,7 +41,7 @@ development_status:
   1-3-token-thị-giác-theme-sáng-tối-và-app-shell: review
   1-4-i18n-vi-en-ja-và-onboarding-chọn-ngôn-ngữ: review
   1-5-onboarding-consent: review
-  1-6-kho-khoá-os-và-key-pool: backlog
+  1-6-kho-khoá-os-và-key-pool: review
   1-7-cổng-gemini-duy-nhất-và-liệt-kê-model: backlog
   1-8-onboarding-nhập-key-và-home-khởi-đầu-khi-chưa-có-key: backlog
   1-9-settings-khung-chung-và-gemini: backlog
