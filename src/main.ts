@@ -9,11 +9,14 @@ import { settingsStore } from './lib/stores/settings.svelte';
 type BootstrapDependencies = {
   settings: {
     readonly onboardingCompleted: boolean;
+    readonly consentAcceptedVersion?: number;
+    readonly consentDeclined?: boolean;
+    readonly consentPolicy?: { currentVersion: number } | null;
     bootstrap: () => void;
     load: () => Promise<void>;
   };
   configure: typeof configureRouter;
-  enforce: typeof enforceStartupRoute;
+  enforce: (state: any) => Promise<unknown>;
   mountApp: (component: typeof App, options: { target: HTMLElement }) => unknown;
 };
 
@@ -34,7 +37,15 @@ export async function bootstrapApp(
   dependencies.settings.bootstrap();
   dependencies.configure();
   await dependencies.settings.load();
-  await dependencies.enforce(dependencies.settings.onboardingCompleted);
+  const hasConsentState = typeof dependencies.settings.consentAcceptedVersion === 'number';
+  await dependencies.enforce(hasConsentState
+    ? {
+      onboardingCompleted: dependencies.settings.onboardingCompleted,
+      consentAcceptedVersion: dependencies.settings.consentAcceptedVersion ?? 0,
+      consentDeclined: dependencies.settings.consentDeclined ?? false,
+      currentConsentVersion: dependencies.settings.consentPolicy?.currentVersion ?? 0,
+    }
+    : dependencies.settings.onboardingCompleted);
   return dependencies.mountApp(App, { target });
 }
 

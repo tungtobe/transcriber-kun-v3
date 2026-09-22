@@ -3,5 +3,11 @@
   "identifier": "default",
   "description": "Capability mặc định cho cửa sổ chính — chỉ core:default (AD-17: không plugin, không entitlement ngoài phạm vi).",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": [
+    "core:default",
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [{ "url": "https://transkun.app/*" }]
+    }
+  ]
 }

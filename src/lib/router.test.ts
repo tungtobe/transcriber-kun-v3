@@ -44,4 +44,21 @@ describe('frontend router', () => {
     await enforceStartupRoute(true, replaceRoute);
     expect(replaced).toEqual(['/onboarding', '/home']);
   });
+
+  it('puts pending and stale consent before onboarding completion', async () => {
+    const { startupRedirectPath } = await import('./router');
+    const state = { onboardingCompleted: true, consentAcceptedVersion: 0, consentDeclined: false, currentConsentVersion: 1 };
+    expect(startupRedirectPath(state, '/home')).toBe('/onboarding');
+    expect(startupRedirectPath({ ...state, consentAcceptedVersion: 0 }, '/settings/gemini')).toBe('/onboarding');
+    expect(startupRedirectPath({ ...state, consentAcceptedVersion: 2 }, '/home')).toBe('/onboarding');
+  });
+
+  it('restricts a declined decision to About and the consent return path', async () => {
+    const { startupRedirectPath } = await import('./router');
+    const state = { onboardingCompleted: false, consentAcceptedVersion: 0, consentDeclined: true, currentConsentVersion: 1 };
+    expect(startupRedirectPath(state, '/home')).toBe('/settings/about');
+    expect(startupRedirectPath(state, '/settings/gemini')).toBe('/settings/about');
+    expect(startupRedirectPath(state, '/settings/about')).toBeNull();
+    expect(startupRedirectPath(state, '/onboarding')).toBeNull();
+  });
 });

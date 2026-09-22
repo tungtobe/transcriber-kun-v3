@@ -19,6 +19,22 @@ export const commands = {
 	 *  đã ghi bền xong, chỉ log cảnh báo.
 	 */
 	settingsSave: (settings: Settings) => typedError<null, AppError>(__TAURI_INVOKE("settings_save", { settings })),
+	/**
+	 *  Return the Rust-owned consent policy and the durable decision in one
+	 *  typed snapshot. A policy read failure is a storage error; no fallback
+	 *  version is invented in the frontend.
+	 */
+	consentPolicy: () => typedError<ConsentPolicy, AppError>(__TAURI_INVOKE("consent_policy")),
+	/**
+	 *  Persist acceptance at the current Rust-owned version and emit the full
+	 *  settings snapshot only after the durable write succeeds.
+	 */
+	consentAccept: (settings: Settings) => typedError<Settings, AppError>(__TAURI_INVOKE("consent_accept", { settings })),
+	/**
+	 *  Persist a deliberate decline independently from the accepted-version
+	 *  field, then emit the same full snapshot contract as settings_save.
+	 */
+	consentDecline: (settings: Settings) => typedError<Settings, AppError>(__TAURI_INVOKE("consent_decline", { settings })),
 };
 
 /** Events */
@@ -47,10 +63,36 @@ export type Category = "quota" | "auth" | "model" | "network" | "format" | "perm
  */
 export type Code = "quota" | "auth" | "model" | "request" | "shape" | "timeout" | "network" | "tls" | "blocked" | "format" | "permission" | "storage";
 
+/**
+ *  Rust-owned metadata needed to render the consent step. The accepted
+ *  version and declined bit are included so the frontend never needs a
+ *  second source of truth or a duplicated version constant.
+ */
+export type ConsentPolicy = {
+	currentVersion: number,
+	privacyUrl: string,
+	acceptedVersion: number,
+	declined: boolean,
+	status: ConsentStatus,
+};
+
+/**  The state used by both routing and the Gemini transport gate. */
+export type ConsentStatus = "pending" | "declined" | "stale" | "current";
+
 export type Settings = {
 	theme: Theme,
 	uiLanguage: UiLanguage,
 	onboardingCompleted: boolean,
+	/**
+	 *  The only consent version the user has accepted. `0` means never
+	 *  accepted; this is intentionally independent from `consent_declined`.
+	 */
+	consentAcceptedVersion: number,
+	/**
+	 *  A separate decision bit lets the router distinguish a deliberate
+	 *  decline from a first-run pending state.
+	 */
+	consentDeclined: boolean,
 };
 
 /**

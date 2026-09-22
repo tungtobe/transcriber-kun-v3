@@ -5,6 +5,8 @@ import {
   commands,
   events,
   type AppError,
+  type ConsentPolicy,
+  type ConsentStatus,
   type Settings,
   type Theme,
   type UiLanguage,
@@ -24,6 +26,8 @@ const DEFAULT_SETTINGS: Settings = {
   theme: 'system',
   uiLanguage: 'system',
   onboardingCompleted: false,
+  consentAcceptedVersion: 0,
+  consentDeclined: false,
 };
 
 function isTheme(value: unknown): value is Theme {
@@ -68,6 +72,27 @@ function normalizeSettings(value: Partial<Settings> | null | undefined): Setting
     onboardingCompleted: typeof value?.onboardingCompleted === 'boolean'
       ? value.onboardingCompleted
       : false,
+    consentAcceptedVersion: typeof value?.consentAcceptedVersion === 'number'
+      && Number.isInteger(value.consentAcceptedVersion)
+      && value.consentAcceptedVersion >= 0
+      ? value.consentAcceptedVersion
+      : 0,
+    consentDeclined: typeof value?.consentDeclined === 'boolean' ? value.consentDeclined : false,
+  };
+}
+
+function policyForSettings(policy: ConsentPolicy | null, settings: Settings): ConsentPolicy | null {
+  if (!policy) return null;
+  const status: ConsentStatus = settings.consentDeclined
+    ? 'declined'
+    : settings.consentAcceptedVersion === policy.currentVersion
+      ? 'current'
+      : settings.consentAcceptedVersion === 0 ? 'pending' : 'stale';
+  return {
+    ...policy,
+    acceptedVersion: settings.consentAcceptedVersion,
+    declined: settings.consentDeclined,
+    status,
   };
 }
 
@@ -81,6 +106,9 @@ export function createSettingsStore() {
   let resolvedTheme = $state<ResolvedTheme>('light');
   let uiLanguage = $state<UiLanguage>('system');
   let onboardingCompleted = $state(false);
+  let consentAcceptedVersion = $state(0);
+  let consentDeclined = $state(false);
+  let consentPolicy = $state<ConsentPolicy | null>(null);
   let status = $state<SettingsStatus>('idle');
   let error = $state<AppError | null>(null);
   let persistedSettings: Settings = { ...DEFAULT_SETTINGS };
@@ -105,13 +133,22 @@ export function createSettingsStore() {
   }
 
   function snapshot(): Settings {
-    return { theme, uiLanguage, onboardingCompleted };
+    const base = { theme, uiLanguage, onboardingCompleted } as Settings;
+    // Keep compatibility with pre-consent test doubles/older WebViews while
+    // the real Rust snapshot always includes these fields after load.
+    if (consentPolicy || consentAcceptedVersion !== 0 || consentDeclined) {
+      base.consentAcceptedVersion = consentAcceptedVersion;
+      base.consentDeclined = consentDeclined;
+    }
+    return base;
   }
 
   function applySettings(next: Settings): void {
     theme = next.theme;
     uiLanguage = next.uiLanguage;
     onboardingCompleted = next.onboardingCompleted;
+    consentAcceptedVersion = next.consentAcceptedVersion;
+    consentDeclined = next.consentDeclined;
     cacheTheme(theme);
     resolvedTheme = applyTheme(theme);
     i18n.applyPreference(uiLanguage);
@@ -172,6 +209,8 @@ export function createSettingsStore() {
       theme: readCachedTheme() ?? 'system',
       uiLanguage: i18n.preference,
       onboardingCompleted: false,
+      consentAcceptedVersion: 0,
+      consentDeclined: false,
     };
     persistedSettings = cached;
     applySettings(cached);
@@ -188,17 +227,24 @@ export function createSettingsStore() {
     let request: Promise<void>;
     request = (async () => {
       try {
-        const result = await commands.settingsGet();
+        const [result, policyResult] = await Promise.all([
+          commands.settingsGet(),
+          typeof commands.consentPolicy === 'function'
+            ? commands.consentPolicy()
+            : Promise.resolve(null),
+        ]);
         if (generation !== saveGeneration) return;
         if (result.status === 'ok') {
           const next = normalizeSettings(result.data);
           persistedSettings = next;
           applySettings(next);
+          consentPolicy = policyResult && policyResult.status === 'ok' ? policyResult.data : null;
           status = 'ready';
           return;
         }
         persistedSettings = { ...DEFAULT_SETTINGS };
         applySettings(persistedSettings);
+        consentPolicy = null;
         error = result.error;
       } catch {
         if (generation !== saveGeneration) return;
@@ -221,7 +267,12 @@ export function createSettingsStore() {
     return undefined;
   }
 
-  function persist(next: Settings): Promise<void> {
+  function persist(
+    next: Settings,
+    saveCommand: (settings: Settings) => Promise<
+      { status: 'ok'; data: unknown } | { status: 'error'; error: AppError }
+    > = commands.settingsSave,
+  ): Promise<void> {
     const generation = ++saveGeneration;
     pendingSaveCount += 1;
     applySettings(next);
@@ -229,19 +280,22 @@ export function createSettingsStore() {
     status = 'ready';
     const operation = saveQueue.then(async () => {
       let failure: AppError | null = null;
+      let savedSettings = next;
       try {
-        const result = await commands.settingsSave(next);
+        const result = await saveCommand(next);
         if (result.status === 'error') failure = result.error;
+        else if (result.data && typeof result.data === 'object') savedSettings = normalizeSettings(result.data);
       } catch {
         failure = transportSaveError();
       }
 
       if (!failure) {
-        persistedSettings = { ...next };
+        persistedSettings = { ...savedSettings };
+        consentPolicy = policyForSettings(consentPolicy, savedSettings);
         if (generation === saveGeneration) {
           // Re-apply because a backend event from this queued save may have
           // arrived while a newer optimistic snapshot was visible.
-          applySettings(next);
+          applySettings(savedSettings);
           error = null;
           status = 'ready';
         }
@@ -290,6 +344,20 @@ export function createSettingsStore() {
     return persist({ ...snapshot(), onboardingCompleted: next });
   }
 
+  async function acceptConsent(): Promise<void> {
+    const waiting = ensureReady();
+    if (waiting) await waiting;
+    const next = snapshot();
+    return persist(next, commands.consentAccept);
+  }
+
+  async function declineConsent(): Promise<void> {
+    const waiting = ensureReady();
+    if (waiting) await waiting;
+    const next = snapshot();
+    return persist(next, commands.consentDecline);
+  }
+
   function destroy(): void {
     saveGeneration += 1;
     activeLoad = undefined;
@@ -310,6 +378,10 @@ export function createSettingsStore() {
     get resolvedTheme() { return resolvedTheme; },
     get uiLanguage() { return uiLanguage; },
     get onboardingCompleted() { return onboardingCompleted; },
+    get consentAcceptedVersion() { return consentAcceptedVersion; },
+    get consentDeclined() { return consentDeclined; },
+    get consentPolicy() { return consentPolicy; },
+    get consentStatus(): ConsentStatus { return consentPolicy?.status ?? 'pending'; },
     get status() { return status; },
     get error() { return error; },
     get state(): SettingsState {
@@ -320,6 +392,8 @@ export function createSettingsStore() {
     setTheme,
     setUiLanguage,
     setOnboardingCompleted,
+    acceptConsent,
+    declineConsent,
     destroy,
   };
 }

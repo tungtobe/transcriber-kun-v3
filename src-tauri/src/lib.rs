@@ -4,6 +4,7 @@
 
 pub mod ads;
 pub mod audio;
+pub mod consent;
 pub mod core;
 pub mod db;
 pub mod gemini;
@@ -24,6 +25,7 @@ pub fn run() {
     let builder = ipc::specta_builder();
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
         .invoke_handler(builder.invoke_handler())
         .setup(move |app| {
             builder.mount_events(app);

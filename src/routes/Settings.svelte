@@ -2,6 +2,7 @@
   import { link } from '@keenmate/svelte-spa-router';
   import { routePaths } from '../lib/router';
   import { i18n, type TranslationKey } from '../i18n/index.svelte';
+  import { settingsStore } from '../lib/stores/settings.svelte';
 
   type RouteParams = { group?: string };
   let { routeParams = {} }: { routeParams?: RouteParams } = $props();
@@ -14,6 +15,9 @@
   ];
 
   let group = $derived(routeParams.group ?? 'general');
+  let visibleGroups = $derived(settingsStore.consentStatus === 'declined'
+    ? groups.filter((item) => item.key === 'about')
+    : groups);
   let groupLabel = $derived(i18n.t(groups.find((item) => item.key === group)?.labelKey ?? 'settings.group.general'));
 </script>
 
@@ -27,7 +31,7 @@
 
   <div class="settings-layout">
     <nav class="settings-nav" aria-label={i18n.t('settings.navigation.label')}>
-      {#each groups as item}
+      {#each visibleGroups as item}
         <a
           use:link
           class:active={item.key === group}

@@ -37,6 +37,12 @@ pub struct Settings {
     pub theme: Theme,
     pub ui_language: UiLanguage,
     pub onboarding_completed: bool,
+    /// The only consent version the user has accepted. `0` means never
+    /// accepted; this is intentionally independent from `consent_declined`.
+    pub consent_accepted_version: u32,
+    /// A separate decision bit lets the router distinguish a deliberate
+    /// decline from a first-run pending state.
+    pub consent_declined: bool,
 }
 
 /// Phát khi `save` ghi bền thành công — đúng một lần, mang giá trị mới toàn
@@ -47,6 +53,8 @@ pub struct SettingsChanged(pub Settings);
 const KEY_THEME: &str = "theme";
 const KEY_UI_LANGUAGE: &str = "uiLanguage";
 const KEY_ONBOARDING_COMPLETED: &str = "onboardingCompleted";
+const KEY_CONSENT_ACCEPTED_VERSION: &str = "consentAcceptedVersion";
+const KEY_CONSENT_DECLINED: &str = "consentDeclined";
 
 /// Đọc toàn bộ settings từ DB. Khoá thiếu hoặc value không parse được (hỏng)
 /// dùng mặc định của khoá đó, khoá khác giữ nguyên (spec I/O Matrix). Không
@@ -98,10 +106,34 @@ pub fn load(db: &Db) -> Settings {
         }),
     };
 
+    let consent_accepted_version = match raw.get(KEY_CONSENT_ACCEPTED_VERSION) {
+        None => 0,
+        Some(value) => serde_json::from_str::<u32>(value).unwrap_or_else(|_| {
+            tracing::warn!(
+                key = KEY_CONSENT_ACCEPTED_VERSION,
+                "giá trị settings không parse được, dùng mặc định"
+            );
+            0
+        }),
+    };
+
+    let consent_declined = match raw.get(KEY_CONSENT_DECLINED) {
+        None => false,
+        Some(value) => serde_json::from_str::<bool>(value).unwrap_or_else(|_| {
+            tracing::warn!(
+                key = KEY_CONSENT_DECLINED,
+                "giá trị settings không parse được, dùng mặc định"
+            );
+            false
+        }),
+    };
+
     Settings {
         theme,
         ui_language,
         onboarding_completed,
+        consent_accepted_version,
+        consent_declined,
     }
 }
 
@@ -115,6 +147,11 @@ pub fn save(db: &Db, settings: &Settings) -> Result<(), AppError> {
         .map_err(|err| AppError::new(Code::Format, err.to_string()))?;
     let onboarding_completed_json = serde_json::to_string(&settings.onboarding_completed)
         .map_err(|err| AppError::new(Code::Format, err.to_string()))?;
+    let consent_accepted_version_json =
+        serde_json::to_string(&settings.consent_accepted_version)
+            .map_err(|err| AppError::new(Code::Format, err.to_string()))?;
+    let consent_declined_json = serde_json::to_string(&settings.consent_declined)
+        .map_err(|err| AppError::new(Code::Format, err.to_string()))?;
 
     db.with_connection(|conn| {
         Ok(repo::settings::upsert_many(
@@ -123,6 +160,8 @@ pub fn save(db: &Db, settings: &Settings) -> Result<(), AppError> {
                 (KEY_THEME, theme_json),
                 (KEY_UI_LANGUAGE, ui_language_json),
                 (KEY_ONBOARDING_COMPLETED, onboarding_completed_json),
+                (KEY_CONSENT_ACCEPTED_VERSION, consent_accepted_version_json),
+                (KEY_CONSENT_DECLINED, consent_declined_json),
             ],
         )?)
     })
@@ -196,6 +235,7 @@ mod tests {
             theme: Theme::Dark,
             ui_language: UiLanguage::Ja,
             onboarding_completed: true,
+            ..Default::default()
         };
         save(&db, &expected).unwrap();
         assert_eq!(load(&db), expected);
@@ -283,6 +323,7 @@ mod tests {
                 theme: Theme::Dark,
                 ui_language: UiLanguage::Vi,
                 onboarding_completed: true,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -301,6 +342,7 @@ mod tests {
                 theme: Theme::Dark,
                 ui_language: UiLanguage::System,
                 onboarding_completed: true,
+                ..Default::default()
             }
         );
     }
@@ -323,6 +365,7 @@ mod tests {
                 theme: Theme::Dark,
                 ui_language: UiLanguage::System,
                 onboarding_completed: false,
+                ..Default::default()
             }
         );
     }
@@ -336,6 +379,7 @@ mod tests {
                 theme: Theme::Light,
                 ui_language: UiLanguage::Ja,
                 onboarding_completed: true,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -354,6 +398,83 @@ mod tests {
                 theme: Theme::Light,
                 ui_language: UiLanguage::Ja,
                 onboarding_completed: false,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn consent_round_trip_is_independent_from_completion() {
+        let db = open_db();
+        let expected = Settings {
+            theme: Theme::Dark,
+            ui_language: UiLanguage::En,
+            onboarding_completed: false,
+            consent_accepted_version: 1,
+            consent_declined: false,
+        };
+
+        save(&db, &expected).unwrap();
+
+        assert_eq!(load(&db), expected);
+    }
+
+    #[test]
+    fn corrupt_consent_fields_fall_back_without_losing_other_fields() {
+        let db = open_db();
+        save(
+            &db,
+            &Settings {
+                theme: Theme::Light,
+                ui_language: UiLanguage::Ja,
+                onboarding_completed: true,
+                consent_accepted_version: 1,
+                consent_declined: true,
+            },
+        )
+        .unwrap();
+        db.with_connection(|conn| {
+            conn.execute(
+                "UPDATE settings SET value = 'not-json' WHERE key = 'consentAcceptedVersion'",
+                [],
+            )?;
+            conn.execute(
+                "UPDATE settings SET value = 'not-json' WHERE key = 'consentDeclined'",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(
+            load(&db),
+            Settings {
+                theme: Theme::Light,
+                ui_language: UiLanguage::Ja,
+                onboarding_completed: true,
+                consent_accepted_version: 0,
+                consent_declined: false,
+            }
+        );
+    }
+
+    #[test]
+    fn legacy_rows_default_missing_consent_without_changing_completion() {
+        let db = open_db();
+        db.with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO settings (key, value) VALUES ('onboardingCompleted', 'true')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(
+            load(&db),
+            Settings {
+                onboarding_completed: true,
+                ..Default::default()
             }
         );
     }

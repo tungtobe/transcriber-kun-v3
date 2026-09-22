@@ -32,23 +32,48 @@ export function redirectUnknownRoute(): void {
   void replace('/home');
 }
 
-/**
- * Startup access owned by Story 1.4. Story 1.5 inserts versioned Consent
- * precedence before this completion decision; no Consent state is invented here.
- */
+export type StartupRouteState = {
+  onboardingCompleted: boolean;
+  consentAcceptedVersion: number;
+  consentDeclined: boolean;
+  currentConsentVersion: number;
+};
+
+function normalizeStartupState(
+  state: StartupRouteState | boolean,
+): StartupRouteState {
+  if (typeof state === 'boolean') {
+    return {
+      onboardingCompleted: state,
+      consentAcceptedVersion: state ? 1 : 0,
+      consentDeclined: false,
+      currentConsentVersion: 1,
+    };
+  }
+  return state;
+}
+
 export function startupRedirectPath(
-  onboardingCompleted: boolean,
+  state: StartupRouteState | boolean,
   currentPath = typeof window === 'undefined' ? '/home' : window.location.pathname,
-): '/onboarding' | '/home' | null {
-  if (!onboardingCompleted && currentPath !== '/onboarding') return '/onboarding';
-  if (onboardingCompleted && currentPath === '/onboarding') return '/home';
+): '/onboarding' | '/home' | '/settings/about' | null {
+  const { onboardingCompleted, consentAcceptedVersion, consentDeclined, currentConsentVersion } = normalizeStartupState(state);
+  const consentCurrent = !consentDeclined
+    && currentConsentVersion > 0
+    && consentAcceptedVersion === currentConsentVersion;
+  if (consentDeclined) {
+    if (currentPath !== '/onboarding' && currentPath !== '/settings/about') return '/settings/about';
+    return null;
+  }
+  if (!consentCurrent && currentPath !== '/onboarding') return '/onboarding';
+  if (consentCurrent && onboardingCompleted && currentPath === '/onboarding') return '/home';
   return null;
 }
 
 export async function enforceStartupRoute(
-  onboardingCompleted: boolean,
-  replaceRoute: (path: '/onboarding' | '/home') => Promise<unknown> = replace,
+  state: StartupRouteState | boolean,
+  replaceRoute: (path: '/onboarding' | '/home' | '/settings/about') => Promise<unknown> = replace,
 ): Promise<void> {
-  const target = startupRedirectPath(onboardingCompleted);
+  const target = startupRedirectPath(state);
   if (target) await replaceRoute(target);
 }

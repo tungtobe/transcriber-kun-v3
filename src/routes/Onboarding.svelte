@@ -1,6 +1,18 @@
 <script lang="ts">
   import { i18n, type Locale, type TranslationKey } from '../i18n/index.svelte';
   import { settingsStore } from '../lib/stores/settings.svelte';
+  import { openUrl } from '@tauri-apps/plugin-opener';
+
+  type Stage = 'language' | 'consent' | 'apiKey';
+  let stage = $state<Stage>('language');
+  let consentError = $state(false);
+  let saving = $state(false);
+
+  $effect(() => {
+    const status = settingsStore.consentStatus;
+    if (status === 'declined' || status === 'stale') stage = 'consent';
+    if (status === 'current') stage = 'apiKey';
+  });
 
   const languages: Array<{
     value: Locale;
@@ -20,6 +32,47 @@
     const value = (event.currentTarget as HTMLInputElement).value as Locale;
     void settingsStore.setUiLanguage(value);
   }
+
+  async function continueFromLanguage(): Promise<void> {
+    stage = 'consent';
+  }
+
+  async function acceptConsent(): Promise<void> {
+    if (saving) return;
+    saving = true;
+    consentError = false;
+    try {
+      await settingsStore.acceptConsent();
+      if (settingsStore.error) throw new Error('consent save failed');
+      stage = 'apiKey';
+    } catch {
+      consentError = true;
+    } finally {
+      saving = false;
+    }
+  }
+
+  async function declineConsent(): Promise<void> {
+    if (saving) return;
+    saving = true;
+    consentError = false;
+    try {
+      await settingsStore.declineConsent();
+      if (settingsStore.error) throw new Error('consent save failed');
+      window.history.replaceState({}, '', '/settings/about');
+      window.dispatchEvent(new PopStateEvent('popstate'));
+    } catch {
+      consentError = true;
+    } finally {
+      saving = false;
+    }
+  }
+
+  async function openPrivacyPolicy(): Promise<void> {
+    const url = settingsStore.consentPolicy?.privacyUrl;
+    if (!url) return;
+    try { await openUrl(url); } catch { consentError = true; }
+  }
 </script>
 
 <svelte:head>
@@ -28,16 +81,19 @@
 
 <section class="route-screen onboarding-screen" aria-labelledby="onboarding-title">
   <div class="onboarding-card">
-    <p class="route-kicker">{i18n.t('onboarding.header.kicker')}</p>
-    <h1 id="onboarding-title">{i18n.t('onboarding.header.title')}</h1>
-    <p class="route-lede">{i18n.t('onboarding.header.description')}</p>
+    <p class="route-kicker">{stage === 'language' ? i18n.t('onboarding.header.kicker') : stage === 'consent' ? i18n.t('onboarding.consent.kicker') : i18n.t('onboarding.apiKey.kicker')}</p>
+    <h1 id="onboarding-title">{stage === 'language' ? i18n.t('onboarding.header.title') : stage === 'consent' ? i18n.t('onboarding.consent.title') : i18n.t('onboarding.apiKey.title')}</h1>
+    <p class="route-lede">
+      {stage === 'language' ? i18n.t('onboarding.header.description') : stage === 'consent' ? i18n.t('onboarding.consent.description') : i18n.t('onboarding.apiKey.description')}
+    </p>
 
     <ol class="stepper" aria-label={i18n.t('onboarding.stepper.label')}>
-      <li class="step step-current" aria-current="step"><span>1</span> {i18n.t('onboarding.stepper.language')}</li>
-      <li class="step"><span>2</span> {i18n.t('onboarding.stepper.data')}</li>
-      <li class="step"><span>3</span> {i18n.t('onboarding.stepper.apiKey')}</li>
+      <li class:step-current={stage === 'language'} class="step" aria-current={stage === 'language' ? 'step' : undefined}><span>1</span> {i18n.t('onboarding.stepper.language')}</li>
+      <li class:step-current={stage === 'consent'} class="step" aria-current={stage === 'consent' ? 'step' : undefined}><span>2</span> {i18n.t('onboarding.stepper.data')}</li>
+      <li class:step-current={stage === 'apiKey'} class="step" aria-current={stage === 'apiKey' ? 'step' : undefined}><span>3</span> {i18n.t('onboarding.stepper.apiKey')}</li>
     </ol>
 
+    {#if stage === 'language'}
     <fieldset class="language-picker">
       <legend>{i18n.t('onboarding.language.legend')}</legend>
       {#each languages as language}
@@ -63,12 +119,34 @@
     <div class="actions">
       <button
         type="button"
-        aria-disabled="true"
-        title={i18n.t('onboarding.action.unavailable')}
+        onclick={() => void continueFromLanguage()}
       >
         {i18n.t('onboarding.action.continue')}
       </button>
     </div>
+    {:else if stage === 'consent'}
+      <div class="flow" aria-label={i18n.t('onboarding.consent.title')}>
+        <div class="flow-node">{i18n.t('onboarding.consent.flowLocal')}</div>
+        <div class="flow-arrow" aria-hidden="true">→</div>
+        <div class="flow-node">{i18n.t('onboarding.consent.flowKey')}</div>
+        <div class="flow-arrow" aria-hidden="true">→</div>
+        <div class="flow-node">{i18n.t('onboarding.consent.flowGoogle')}</div>
+      </div>
+      <ul class="consent-points">
+        <li>{i18n.t('onboarding.consent.bulletLocal')}</li>
+        <li>{i18n.t('onboarding.consent.bulletKey')}</li>
+        <li>{i18n.t('onboarding.consent.bulletGoogle')}</li>
+      </ul>
+      <button class="privacy-link" type="button" onclick={() => void openPrivacyPolicy()}>{i18n.t('onboarding.consent.privacy')}</button>
+      <p class="consent-version">{i18n.t('onboarding.consent.version', { version: settingsStore.consentPolicy?.currentVersion ?? 1 })}</p>
+      {#if consentError}<p class="consent-error" role="alert">{i18n.t('onboarding.consent.error')}</p>{/if}
+      <div class="actions consent-actions">
+        <button class="ghost" type="button" disabled={saving} onclick={() => void declineConsent()}>{i18n.t('onboarding.consent.decline')}</button>
+        <button type="button" disabled={saving} onclick={() => void acceptConsent()}>{i18n.t('onboarding.consent.accept')}</button>
+      </div>
+    {:else}
+      <div class="api-placeholder"><strong>{i18n.t('onboarding.apiKey.placeholder')}</strong></div>
+    {/if}
   </div>
 </section>
 
@@ -237,8 +315,14 @@
     font-weight: 500;
   }
 
-  .actions button[aria-disabled='true'] {
-    cursor: not-allowed;
-    opacity: 0.45;
-  }
+  .flow { display: grid; grid-template-columns: 1fr auto 1fr auto 1fr; gap: var(--space-2); align-items: center; margin: var(--space-6) 0; }
+  .flow-node { min-height: 56px; display: grid; place-items: center; padding: var(--space-3); border: 1px solid var(--color-accent-border); border-radius: var(--radius-lg); background: var(--color-accent-soft); text-align: center; font-size: var(--text-help-size); }
+  .flow-arrow { color: var(--color-text-muted); font-size: 20px; }
+  .consent-points { display: grid; gap: var(--space-3); padding-left: var(--space-5); color: var(--color-text-secondary); }
+  .privacy-link { padding: 0; border: 0; background: transparent; color: var(--color-accent); text-decoration: underline; cursor: pointer; }
+  .consent-version { margin: var(--space-4) 0 0; color: var(--color-text-muted); font-size: var(--text-help-size); }
+  .consent-error { color: var(--color-danger, #b42318); font-size: var(--text-help-size); }
+  .consent-actions { justify-content: space-between; }
+  .consent-actions .ghost { border: 1px solid var(--color-border-strong); background: transparent; color: var(--color-text); }
+  .api-placeholder { margin-top: var(--space-8); padding: var(--space-6); border: 1px dashed var(--color-border-strong); border-radius: var(--radius-lg); color: var(--color-text-secondary); }
 </style>

@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { Snippet } from 'svelte';
-  import { location, link } from '@keenmate/svelte-spa-router';
+  import { location, link, replace } from '@keenmate/svelte-spa-router';
   import {
     AlertTriangleIcon,
     HomeIcon,
@@ -18,6 +18,7 @@
   let { children }: { children?: Snippet } = $props();
 
   const currentPath = $derived(location());
+  const consentRestricted = $derived(settingsStore.consentStatus === 'declined');
   const pageTitle = $derived(
     currentPath.startsWith('/settings')
       ? i18n.t('app.shell.settings')
@@ -25,6 +26,12 @@
         ? i18n.t('app.shell.onboarding')
         : i18n.t('app.shell.home'),
   );
+
+  $effect(() => {
+    if (consentRestricted && currentPath !== '/onboarding' && currentPath !== '/settings/about') {
+      void replace('/settings/about');
+    }
+  });
 
   function changeTheme(event: Event): void {
     const value = (event.currentTarget as HTMLSelectElement).value as Theme;
@@ -43,6 +50,7 @@
     </div>
 
     <nav class="primary-nav" aria-label={i18n.t('app.shell.navigationLabel')}>
+      {#if !consentRestricted}
       <a
         href="/home"
         use:link
@@ -52,6 +60,7 @@
         <HomeIcon size={18} strokeWidth={1.75} aria-hidden="true" />
         <span>{i18n.t('app.shell.home')}</span>
       </a>
+      {/if}
 
       <button
         class="nav-disabled"
@@ -138,6 +147,13 @@
           <p>{i18n.t('app.error.syncBody')}</p>
         </div>
         <button type="button" onclick={() => void settingsStore.load()}>{i18n.t('app.error.reload')}</button>
+      </div>
+    {/if}
+
+    {#if consentRestricted && currentPath !== '/onboarding'}
+      <div class="consent-banner" role="status">
+        <span>{i18n.t('onboarding.consent.returnBanner')}</span>
+        <a href="/onboarding" use:link>{i18n.t('onboarding.consent.accept')}</a>
       </div>
     {/if}
 
@@ -388,6 +404,22 @@
     font-size: var(--text-label-size);
     font-weight: 600;
   }
+
+  .consent-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-3);
+    margin: var(--space-3) var(--space-6) 0;
+    padding: var(--space-3) var(--space-4);
+    border: 1px solid var(--color-accent-border);
+    border-radius: var(--radius-lg);
+    background: var(--color-accent-soft);
+    color: var(--color-text-secondary);
+    font-size: var(--text-help-size);
+  }
+
+  .consent-banner a { color: var(--color-accent); font-weight: 600; }
 
   .main-content {
     min-width: 0;
