@@ -275,6 +275,7 @@ impl fmt::Debug for ReqwestTransport {
 impl ReqwestTransport {
     pub fn new() -> Result<Self, AppError> {
         let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|_| AppError::new(Code::Tls, "Gemini TLS client could not be initialized"))?;
         let base_url = reqwest::Url::parse(GEMINI_BASE_URL)
@@ -439,7 +440,17 @@ impl GeminiGateway {
                 if let Some((outcome, error)) = classify_http_status(response.status) {
                     match outcome {
                         RequestOutcome::Quota | RequestOutcome::Auth => {
-                            match self.key_pool.report(lease, outcome).await {
+                            let request_id = lease.request_id.clone();
+                            let report = self.key_pool.report(lease, outcome);
+                            tokio::pin!(report);
+                            let reported = tokio::select! {
+                                result = &mut report => result,
+                                _ = cancellation.cancelled() => {
+                                    let _ = self.key_pool.cancel(request_id).await;
+                                    return Err(cancelled_error());
+                                }
+                            };
+                            match reported {
                                 Ok(ReportAction::Retry(next)) => {
                                     lease = next;
                                     continue;

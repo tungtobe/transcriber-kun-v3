@@ -15,7 +15,9 @@
   // conservatively as missing (spec I/O Matrix: no banner only once a usable
   // key is confirmed present).
   const showKeyBanner = $derived(
-    keysStore.status !== 'idle' && keysStore.status !== 'loading' && !keysStore.hasUsableKey,
+    keysStore.status !== 'idle'
+      && keysStore.status !== 'loading'
+      && (keysStore.status === 'error' || !keysStore.hasUsableKey),
   );
 
   const banners = $derived.by((): BannerItem[] =>

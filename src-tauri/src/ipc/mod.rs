@@ -291,7 +291,11 @@ async fn models_list(
         .and_then(|inner| inner);
     let result = match consent_result {
         Ok(consent) => match state.gateway.clone() {
-            Ok(gateway) => gateway.models_list(kind, consent, CancellationToken::new()).await,
+            Ok(gateway) => {
+                gateway
+                    .models_list(kind, consent, CancellationToken::new())
+                    .await
+            }
             Err(err) => Err(err),
         },
         Err(err) => Err(err),
@@ -314,7 +318,11 @@ async fn keys_test(
         .and_then(|inner| inner);
     let result = match consent_result {
         Ok(consent) => match state.gateway.clone() {
-            Ok(gateway) => gateway.keys_test(id, consent, CancellationToken::new()).await,
+            Ok(gateway) => {
+                gateway
+                    .keys_test(id, consent, CancellationToken::new())
+                    .await
+            }
             Err(err) => Err(err),
         },
         Err(err) => Err(err),
@@ -607,5 +615,26 @@ mod tests {
 
         let summary = crate::diagnostics::summary(&db).unwrap();
         assert!(summary.errors_by_category.iter().all(|row| row.count == 0));
+    }
+
+    #[tokio::test]
+    async fn track_ipc_error_records_the_category_and_preserves_the_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Db::open(dir.path()).unwrap());
+        let original: Result<u8, AppError> = Err(AppError::new(Code::Auth, "key rejected"));
+
+        let returned = track_ipc_error(&Ok(db.clone()), original).await;
+
+        assert_eq!(returned.unwrap_err().category, Category::Auth);
+        let summary = crate::diagnostics::summary(&db).unwrap();
+        assert_eq!(
+            summary
+                .errors_by_category
+                .iter()
+                .find(|row| row.category == Category::Auth)
+                .unwrap()
+                .count,
+            1
+        );
     }
 }

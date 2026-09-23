@@ -149,6 +149,10 @@ pub fn masked_label(secret: &str) -> String {
     } else {
         "AIza"
     };
+    // Keep at least four characters hidden even for format-valid short keys.
+    if secret.chars().count() < prefix.chars().count() + 8 {
+        return format!("{prefix}••••");
+    }
     let suffix: String = secret
         .chars()
         .rev()
@@ -537,6 +541,12 @@ mod tests {
         assert_eq!(values.len(), 2);
         assert_eq!(masked_label(values[0].expose()), "AIza••••1234");
         assert!(!format!("{:?}", values[0]).contains("TESTKEY"));
+    }
+
+    #[test]
+    fn masked_label_never_reveals_all_of_a_short_accepted_key() {
+        assert_eq!(masked_label("AIzaX"), "AIza••••");
+        assert_eq!(masked_label("AQ.X"), "AQ.••••");
     }
 
     #[test]

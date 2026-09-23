@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use specta::Type;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tokio::time::Instant;
 use uuid::Uuid;
 
@@ -76,12 +76,13 @@ pub enum RequestOutcome {
     Timeout,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub struct KeyLease {
     pub request_id: String,
     pub key_id: KeyId,
     pub secret: Sensitive<String>,
     generation: u64,
+    attempt: u8,
     priority: Priority,
 }
 
@@ -93,12 +94,13 @@ impl std::fmt::Debug for KeyLease {
             .field("key_id", &self.key_id)
             .field("secret", &self.secret)
             .field("generation", &self.generation)
+            .field("attempt", &self.attempt)
             .field("priority", &self.priority)
             .finish()
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum ReportAction {
     Complete,
     Retry(KeyLease),
@@ -108,31 +110,57 @@ pub enum ReportAction {
 pub struct KeyPoolHandle {
     commands: mpsc::Sender<Command>,
     provider: Arc<dyn KeyProvider>,
+    refresh_lock: Arc<Mutex<()>>,
+    initialized: watch::Sender<bool>,
 }
 
 impl KeyPoolHandle {
     pub fn channel(provider: Arc<dyn KeyProvider>, clock: Arc<dyn Clock>) -> (Self, KeyPoolActor) {
         let (commands, receiver) = mpsc::channel(64);
+        let (initialized, _) = watch::channel(false);
         (
-            Self { commands, provider },
+            Self {
+                commands,
+                provider,
+                refresh_lock: Arc::new(Mutex::new(())),
+                initialized,
+            },
             KeyPoolActor::new(receiver, clock),
         )
     }
 
     pub async fn refresh(&self) -> Result<(), AppError> {
-        let provider = self.provider.clone();
-        let loaded = tokio::task::spawn_blocking(move || provider.load_keys())
-            .await
-            .map_err(|_| actor_error())?;
-        match loaded {
-            Ok(keys) => self.replace(keys).await,
-            Err(error) => {
-                // Fail closed: a store failure must never leave a deleted or
-                // stale secret allocatable from the in-memory pool.
-                self.replace(Vec::new()).await?;
-                Err(error)
+        // Keep each provider snapshot paired with its actor replacement. A
+        // slower earlier load must never replace a newer credential snapshot.
+        let _refresh_guard = self.refresh_lock.lock().await;
+        let result = async {
+            let provider = self.provider.clone();
+            let loaded = tokio::task::spawn_blocking(move || provider.load_keys())
+                .await
+                .map_err(|_| actor_error())?;
+            match loaded {
+                Ok(keys) => self.replace(keys).await,
+                Err(error) => {
+                    // Fail closed: a store failure must never leave a deleted or
+                    // stale secret allocatable from the in-memory pool.
+                    self.replace(Vec::new()).await?;
+                    Err(error)
+                }
             }
         }
+        .await;
+        // A failed initial read is still a completed initialization: callers
+        // must see the fail-closed pool instead of waiting indefinitely.
+        self.initialized.send_replace(true);
+        result
+    }
+
+    async fn wait_initialized(&self) -> Result<(), AppError> {
+        let mut ready = self.initialized.subscribe();
+        while !*ready.borrow() {
+            ready.changed().await.map_err(|_| actor_error())?;
+        }
+        Ok(())
     }
 
     async fn replace(&self, keys: Vec<KeyMaterial>) -> Result<(), AppError> {
@@ -154,6 +182,7 @@ impl KeyPoolHandle {
         priority: Priority,
         budget: Duration,
     ) -> Result<KeyLease, AppError> {
+        self.wait_initialized().await?;
         let (reply, response) = oneshot::channel();
         self.commands
             .send(Command::Acquire {
@@ -175,6 +204,7 @@ impl KeyPoolHandle {
         priority: Priority,
         budget: Duration,
     ) -> Result<KeyLease, AppError> {
+        self.wait_initialized().await?;
         let (reply, response) = oneshot::channel();
         self.commands
             .send(Command::AcquireForKey {
@@ -458,13 +488,12 @@ impl KeyPoolActor {
         reply: oneshot::Sender<Result<(), AppError>>,
     ) {
         let current = lease.generation == self.generation
-            && self
-                .requests
-                .get(&lease.request_id)
-                .is_some_and(|request| request.target_key.as_ref() == Some(&lease.key_id))
+            && self.requests.get(&lease.request_id).is_some_and(|request| {
+                request.target_key.as_ref() == Some(&lease.key_id)
+                    && request.attempts == lease.attempt
+            })
             && self.keys.iter().any(|key| key.material.id == lease.key_id);
         if !current {
-            self.requests.remove(&lease.request_id);
             let _ = reply.send(Err(AppError::new(
                 Code::Auth,
                 "key validation lease is no longer current",
@@ -514,10 +543,12 @@ impl KeyPoolActor {
         reply: oneshot::Sender<Result<ReportAction, AppError>>,
     ) {
         let current = lease.generation == self.generation
-            && self.requests.contains_key(&lease.request_id)
+            && self
+                .requests
+                .get(&lease.request_id)
+                .is_some_and(|request| request.attempts == lease.attempt)
             && self.keys.iter().any(|key| key.material.id == lease.key_id);
         if !current {
-            self.requests.remove(&lease.request_id);
             let _ = reply.send(Err(AppError::new(
                 Code::Auth,
                 "key lease is no longer current",
@@ -611,6 +642,7 @@ impl KeyPoolActor {
     }
 
     fn process_pending(&mut self) {
+        let mut deferred = Vec::new();
         loop {
             let now = self.clock.now();
             let Some(pending) = self.pop_pending(now) else {
@@ -665,6 +697,7 @@ impl KeyPoolActor {
                         key_id: material.id,
                         secret: material.secret,
                         generation: self.generation,
+                        attempt: request.attempts,
                         priority,
                     };
                     pending.reply.send(Ok(lease));
@@ -690,10 +723,12 @@ impl KeyPoolActor {
                     )));
                 }
                 None => {
-                    self.requeue_front(pending);
-                    break;
+                    deferred.push(pending);
                 }
             }
+        }
+        for pending in deferred {
+            self.enqueue(pending);
         }
     }
 
@@ -734,17 +769,6 @@ impl KeyPoolActor {
                     .or_else(|| self.pending_memo.pop_front())
             }
         })
-    }
-
-    fn requeue_front(&mut self, pending: Pending) {
-        let Some(request) = self.requests.get(&pending.request_id) else {
-            return;
-        };
-        match request.priority {
-            Priority::Live => self.pending_live.push_front(pending),
-            Priority::Job => self.pending_job.push_front(pending),
-            Priority::Memo => self.pending_memo.push_front(pending),
-        }
     }
 
     fn cancel_pending(&mut self, request_id: &str) {
@@ -793,6 +817,7 @@ impl KeyPoolActor {
 mod tests {
     use super::*;
     use crate::secrets::FakeCredentialStore;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
     use tokio::sync::Notify;
 
@@ -925,6 +950,92 @@ mod tests {
         );
         let next = pool.acquire(Priority::Live).await.unwrap();
         assert_eq!(next.key_id, KeyId::from_opaque("b"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_refreshes_cannot_restore_an_older_snapshot() {
+        struct BlockingProvider {
+            keys: Mutex<Vec<KeyMaterial>>,
+            block_first: AtomicBool,
+            started: std::sync::mpsc::Sender<()>,
+            release: Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+
+        impl KeyProvider for BlockingProvider {
+            fn load_keys(&self) -> Result<Vec<KeyMaterial>, AppError> {
+                let snapshot = self.keys.lock().unwrap().clone();
+                if self.block_first.swap(false, Ordering::SeqCst) {
+                    self.started.send(()).unwrap();
+                    self.release.lock().unwrap().recv().unwrap();
+                }
+                Ok(snapshot)
+            }
+        }
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let provider = Arc::new(BlockingProvider {
+            keys: Mutex::new(vec![material("old", "OLD")]),
+            block_first: AtomicBool::new(true),
+            started: started_tx,
+            release: Mutex::new(release_rx),
+        });
+        let (pool, actor) = KeyPoolHandle::channel(provider.clone(), Arc::new(SystemClock));
+        tokio::spawn(actor.run());
+
+        let first_pool = pool.clone();
+        let first = tokio::spawn(async move { first_pool.refresh().await });
+        tokio::task::spawn_blocking(move || started_rx.recv().unwrap())
+            .await
+            .unwrap();
+        *provider.keys.lock().unwrap() = vec![material("new", "NEW")];
+        let second_pool = pool.clone();
+        let mut second = tokio::spawn(async move { second_pool.refresh().await });
+        assert!(tokio::time::timeout(Duration::from_millis(20), &mut second)
+            .await
+            .is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), pool.acquire(Priority::Job))
+                .await
+                .is_err()
+        );
+        release_tx.send(()).unwrap();
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+        let lease = pool.acquire(Priority::Live).await.unwrap();
+        assert_eq!(lease.key_id, KeyId::from_opaque("new"));
+    }
+
+    #[tokio::test]
+    async fn cooling_target_does_not_block_another_available_target() {
+        let (pool, _provider, _clock) = pool(vec![material("a", "A"), material("b", "B")]).await;
+        let a = KeyId::from_opaque("a");
+        let b = KeyId::from_opaque("b");
+        let first = pool
+            .acquire_for_key(&a, Priority::Job, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(pool
+            .report_for_key(first, RequestOutcome::Quota)
+            .await
+            .is_err());
+
+        let waiting_pool = pool.clone();
+        let waiting = tokio::spawn(async move {
+            waiting_pool
+                .acquire_for_key(&a, Priority::Job, Duration::from_secs(5))
+                .await
+        });
+        tokio::task::yield_now().await;
+        let available = tokio::time::timeout(
+            Duration::from_millis(100),
+            pool.acquire_for_key(&b, Priority::Job, Duration::from_secs(5)),
+        )
+        .await
+        .expect("available key must not wait behind cooling key")
+        .unwrap();
+        assert_eq!(available.key_id, b);
+        waiting.abort();
     }
 
     #[tokio::test]
@@ -1067,6 +1178,35 @@ mod tests {
             }
         }
         assert_eq!(attempts, MAX_ATTEMPTS);
+    }
+
+    #[tokio::test]
+    async fn stale_attempt_report_cannot_cancel_or_advance_a_retry() {
+        let (pool, _provider, _clock) = pool(vec![material("a", "A"), material("b", "B")]).await;
+        let first = pool.acquire(Priority::Job).await.unwrap();
+        let stale = KeyLease {
+            request_id: first.request_id.clone(),
+            key_id: first.key_id.clone(),
+            secret: first.secret.clone(),
+            generation: first.generation,
+            attempt: first.attempt,
+            priority: first.priority,
+        };
+        let retry = match pool.report(first, RequestOutcome::Quota).await.unwrap() {
+            ReportAction::Retry(lease) => lease,
+            ReportAction::Complete => panic!("quota should retry"),
+        };
+        assert_eq!(
+            pool.report(stale, RequestOutcome::Quota)
+                .await
+                .unwrap_err()
+                .code,
+            Code::Auth
+        );
+        assert_eq!(
+            pool.report(retry, RequestOutcome::Success).await.unwrap(),
+            ReportAction::Complete
+        );
     }
 
     #[tokio::test]

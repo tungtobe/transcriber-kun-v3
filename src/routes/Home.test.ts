@@ -66,6 +66,14 @@ describe('Home missing-key banner', () => {
     expect(screen.queryByRole('status', { name: /key/i })).toBeNull();
   });
 
+  it('shows the banner after a list error even if an old key is cached', () => {
+    mocks.keysStore.hasUsableKey = true;
+    mocks.keysStore.status = 'error';
+    render(Home);
+
+    expect(screen.getByText('Chưa có key Gemini hợp lệ')).toBeTruthy();
+  });
+
   it('does not flash the banner while the key list is still loading', () => {
     mocks.keysStore.hasUsableKey = false;
     mocks.keysStore.status = 'loading';

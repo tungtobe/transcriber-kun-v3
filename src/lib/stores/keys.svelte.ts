@@ -31,6 +31,16 @@ const EMPTY_INPUT_ERROR: AppError = {
   code: 'format',
   detailRedacted: 'empty key input',
 };
+const KEY_CHECK_UNAVAILABLE_ERROR: AppError = {
+  category: 'network',
+  code: 'network',
+  detailRedacted: 'key check unavailable',
+};
+const KEY_DELETE_UNAVAILABLE_ERROR: AppError = {
+  category: 'storage',
+  code: 'storage',
+  detailRedacted: 'key delete unavailable',
+};
 
 function hasNonEmptySegment(raw: string): boolean {
   return raw.split(',').some((item) => item.trim().length > 0);
@@ -50,6 +60,7 @@ export function createKeysStore() {
   // (spec I/O Matrix: "Key hợp lệ, N model khả dụng · HH:MM").
   let lastCheckedAt = $state<Date | null>(null);
   let activeLoad: Promise<void> | undefined;
+  let mutationGeneration = 0;
   // Session-only, per model kind (spec Design Notes: "Danh sách đã tải chỉ
   // giữ trong phiên chạy") — never persisted, cleared by `reset()`.
   let modelLists = $state<Record<ModelKind, ModelInfo[]>>({ transcribe: [], live: [], memo: [] });
@@ -74,10 +85,12 @@ export function createKeysStore() {
   /** Home calls this to render (or skip) the missing-key banner. */
   function load(): Promise<void> {
     if (activeLoad) return activeLoad;
+    const generation = mutationGeneration;
     status = 'loading';
     const request = (async () => {
       try {
         const result = await commands.keysList();
+        if (generation !== mutationGeneration) return;
         if (result.status === 'ok') {
           keys = result.data;
           error = null;
@@ -87,6 +100,7 @@ export function createKeysStore() {
           status = 'error';
         }
       } catch {
+        if (generation !== mutationGeneration) return;
         error = null;
         status = 'error';
       }
@@ -121,44 +135,49 @@ export function createKeysStore() {
     checkStatus = 'checking';
     checkResult = null;
 
-    const setResult = await commands.keysSet(rawInput);
-    if (setResult.status === 'error') {
-      return finishCheck({ kind: 'error', error: setResult.error });
-    }
-
-    keys = setResult.data;
-    status = 'ready';
-    error = null;
-    // `keysSet` is replace-all: a fresh list starts a fresh test round
-    // (Design Notes — re-checking after an edit replaces prior results).
-    testedResults = new Map();
-
-    const outcomes = await Promise.all(
-      keys.map(async (key) => ({ id: key.id, result: await commands.keysTest(key.id) })),
-    );
-
-    const nextTested = new Map<KeyId, boolean>();
-    let lastError: AppError | null = null;
-    for (const { id, result } of outcomes) {
-      if (result.status === 'ok') {
-        nextTested.set(id, true);
-      } else {
-        nextTested.set(id, false);
-        lastError = result.error;
+    try {
+      const setResult = await commands.keysSet(rawInput);
+      if (setResult.status === 'error') {
+        return finishCheck({ kind: 'error', error: setResult.error });
       }
+
+      keys = setResult.data;
+      mutationGeneration += 1;
+      status = 'ready';
+      error = null;
+      // `keysSet` is replace-all: a fresh list starts a fresh test round
+      // (Design Notes — re-checking after an edit replaces prior results).
+      testedResults = new Map();
+
+      const outcomes = await Promise.all(
+        keys.map(async (key) => ({ id: key.id, result: await commands.keysTest(key.id) })),
+      );
+
+      const nextTested = new Map<KeyId, boolean>();
+      let lastError: AppError | null = null;
+      for (const { id, result } of outcomes) {
+        if (result.status === 'ok') {
+          nextTested.set(id, true);
+        } else {
+          nextTested.set(id, false);
+          lastError = result.error;
+        }
+      }
+      testedResults = nextTested;
+
+      const validCount = keys.filter((key) => nextTested.get(key.id) === true).length;
+      const rejectedCount = keys.length - validCount;
+
+      if (validCount === 0) {
+        return finishCheck({ kind: 'error', error: lastError ?? EMPTY_INPUT_ERROR });
+      }
+
+      const modelsResult = await commands.modelsList('transcribe');
+      const modelCount = modelsResult.status === 'ok' ? modelsResult.data.length : null;
+      return finishCheck({ kind: 'success', validCount, rejectedCount, modelCount });
+    } catch {
+      return finishCheck({ kind: 'error', error: KEY_CHECK_UNAVAILABLE_ERROR });
     }
-    testedResults = nextTested;
-
-    const validCount = keys.filter((key) => nextTested.get(key.id) === true).length;
-    const rejectedCount = keys.length - validCount;
-
-    if (validCount === 0) {
-      return finishCheck({ kind: 'error', error: lastError ?? EMPTY_INPUT_ERROR });
-    }
-
-    const modelsResult = await commands.modelsList('transcribe');
-    const modelCount = modelsResult.status === 'ok' ? modelsResult.data.length : null;
-    return finishCheck({ kind: 'success', validCount, rejectedCount, modelCount });
   }
 
   /**
@@ -169,12 +188,19 @@ export function createKeysStore() {
    * (spec I/O Matrix "Xoá key").
    */
   async function deleteKey(id: KeyId): Promise<AppError | null> {
-    const result = await commands.keysDelete(id);
+    let result: Awaited<ReturnType<typeof commands.keysDelete>>;
+    try {
+      result = await commands.keysDelete(id);
+    } catch {
+      error = KEY_DELETE_UNAVAILABLE_ERROR;
+      return error;
+    }
     if (result.status === 'error') {
       error = result.error;
       return result.error;
     }
     keys = result.data;
+    mutationGeneration += 1;
     const nextTested = new Map(testedResults);
     nextTested.delete(id);
     testedResults = nextTested;
@@ -212,6 +238,7 @@ export function createKeysStore() {
 
   /** Test-only seam: clears all session state between isolated test cases. */
   function reset(): void {
+    mutationGeneration += 1;
     keys = [];
     status = 'idle';
     error = null;

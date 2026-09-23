@@ -5,6 +5,7 @@
 //! là việc của `ipc::` (Code Map) — module này không phụ thuộc Tauri, nên
 //! phần allow-list/gói/xoá test được bằng `tempfile` thuần.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -142,12 +143,22 @@ pub fn mark_clean_shutdown(db: &Db) -> Result<(), AppError> {
 
 /// `true` nếu `file_name` khớp allow-list: đúng prefix `core::log` dùng để
 /// ghi log, theo sau bởi hậu tố rotation (spec Boundaries: "tên khớp
-/// `trans-kun` + hậu tố rotation của `core::log`"). Không kiểm gì khác — việc
+/// `trans-kun` + hậu tố rotation của `core::log`"). Việc
 /// loại symlink/thư mục con là trách nhiệm của [`allow_listed_log_files`]
 /// (dựa vào `file_type()`, không dựa vào tên).
 fn is_allow_listed_name(file_name: &str) -> bool {
     let prefix = format!("{LOG_FILE_PREFIX}.");
-    file_name.starts_with(&prefix) && file_name.len() > prefix.len()
+    let Some(date) = file_name.strip_prefix(&prefix) else {
+        return false;
+    };
+    let bytes = date.as_bytes();
+    bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| index == 4 || index == 7 || byte.is_ascii_digit())
 }
 
 /// Liệt kê các file log hợp lệ nằm trực tiếp trong `log_dir` — không đệ quy
@@ -222,7 +233,7 @@ pub fn default_export_file_name(now: SystemTime) -> String {
     format!("trans-kun-diagnostics-{y:04}{m:02}{d:02}.txt")
 }
 
-/// Thay mọi đường dẫn tuyệt đối (POSIX `/Users/...`, `/home/...`, hay
+/// Thay mọi đường dẫn tuyệt đối (POSIX như `/Users/...`, `/tmp/...`, hay
 /// Windows `C:\Users\...`) và tên người dùng hệ điều hành hiện tại bằng
 /// marker trung tính — áp dụng riêng cho nội dung đi vào gói xuất (spec
 /// Never: "Không đưa đường dẫn tuyệt đối hay tên người dùng của máy vào
@@ -231,7 +242,7 @@ pub fn default_export_file_name(now: SystemTime) -> String {
 /// runtime không cần biết tới nó.
 fn scrub_paths_and_username(input: &str) -> String {
     static PATH_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?:[A-Za-z]:\\(?:[^\\\r\n]+\\)*[^\\\r\n]+|/(?:Users|home)/[^/\s]+(?:/[^\s]*)?)")
+        Regex::new(r"(?:[A-Za-z]:[\\/][^\r\n]+|\\\\[^\\\s]+\\[^\r\n]+|/[^/\s]+(?:/[^\s]*)?)")
             .unwrap()
     });
 
@@ -258,7 +269,10 @@ fn scrub_paths_and_username(input: &str) -> String {
 /// dòng đó chỉ ghi lại rằng không đọc được, chi tiết lỗi cũng đi qua cùng hai
 /// lớp lọc.
 pub fn build_bundle(log_dir: &Path, summary: &DiagnosticsSummary) -> String {
+    const MAX_LOG_BYTES_PER_FILE: usize = 1_048_576;
+    const MAX_TOTAL_LOG_BYTES: usize = 8_388_608;
     let mut out = String::new();
+    let mut included_log_bytes = 0usize;
 
     out.push_str("trans-kun diagnostics\n");
     out.push_str(&format!("version: {}\n", env!("CARGO_PKG_VERSION")));
@@ -273,18 +287,35 @@ pub fn build_bundle(log_dir: &Path, summary: &DiagnosticsSummary) -> String {
     out.push('\n');
 
     for path in allow_listed_log_files(log_dir) {
+        if included_log_bytes >= MAX_TOTAL_LOG_BYTES {
+            out.push_str("[additional logs omitted: export size limit]\n");
+            break;
+        }
         let name = path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("log")
             .to_string();
         out.push_str(&format!("== {name} ==\n"));
-        match std::fs::read_to_string(&path) {
-            Ok(content) => {
+        let limit = MAX_LOG_BYTES_PER_FILE.min(MAX_TOTAL_LOG_BYTES - included_log_bytes);
+        let content = std::fs::File::open(&path).and_then(|file| {
+            let mut bytes = Vec::new();
+            file.take((limit + 1) as u64).read_to_end(&mut bytes)?;
+            Ok(bytes)
+        });
+        match content {
+            Ok(mut bytes) => {
+                let truncated = bytes.len() > limit;
+                bytes.truncate(limit);
+                included_log_bytes += bytes.len();
+                let content = String::from_utf8_lossy(&bytes);
                 let redacted = crate::core::log::redact(&content);
                 out.push_str(&scrub_paths_and_username(&redacted));
                 if !content.ends_with('\n') {
                     out.push('\n');
+                }
+                if truncated {
+                    out.push_str("[log truncated: export size limit]\n");
                 }
             }
             Err(err) => {
@@ -307,12 +338,30 @@ pub fn build_bundle(log_dir: &Path, summary: &DiagnosticsSummary) -> String {
 /// allow-list (tên không khớp, thư mục con, symlink) không bị đụng tới vì
 /// không nằm trong danh sách duyệt.
 pub fn clear_logs(log_dir: &Path) -> std::io::Result<()> {
-    let today = current_log_file_name(SystemTime::now());
-    for path in allow_listed_log_files(log_dir) {
+    clear_logs_at(log_dir, SystemTime::now())
+}
+
+fn clear_logs_at(log_dir: &Path, now: SystemTime) -> std::io::Result<()> {
+    let today = current_log_file_name(now);
+    let files = allow_listed_log_files(log_dir);
+    // Daily rotation opens the next file on the first write. Just after UTC
+    // midnight the writer may still hold yesterday's last file.
+    let active_name = if files
+        .iter()
+        .any(|path| path.file_name().and_then(|name| name.to_str()) == Some(today.as_str()))
+    {
+        Some(today)
+    } else {
+        files
+            .last()
+            .and_then(|path| path.file_name()?.to_str())
+            .map(str::to_string)
+    };
+    for path in files {
         let is_today = path
             .file_name()
             .and_then(|n| n.to_str())
-            .map(|name| name == today)
+            .map(|name| active_name.as_deref() == Some(name))
             .unwrap_or(false);
         if is_today {
             let file = std::fs::OpenOptions::new().write(true).open(&path)?;
@@ -387,7 +436,7 @@ mod tests {
     fn boot_after_unclean_shutdown_increments_crash_once() {
         let db = open_db();
         note_boot(&db).unwrap(); // lần chạy đầu tiên (không phải crash)
-        // Không gọi `mark_clean_shutdown` -- mô phỏng thoát không sạch.
+                                 // Không gọi `mark_clean_shutdown` -- mô phỏng thoát không sạch.
         note_boot(&db).unwrap();
         assert_eq!(summary(&db).unwrap().crashes, 1);
     }
@@ -414,8 +463,8 @@ mod tests {
         })
         .unwrap();
 
-        let err = record_error(&db, Category::Model)
-            .expect_err("bảng đã bị xoá nên ghi đếm phải lỗi");
+        let err =
+            record_error(&db, Category::Model).expect_err("bảng đã bị xoá nên ghi đếm phải lỗi");
         assert_eq!(err.category, Category::Storage);
     }
 
@@ -436,6 +485,8 @@ mod tests {
         std::fs::write(dir.path().join("trans-kun.2026-09-21"), "b").unwrap();
         std::fs::write(dir.path().join("secret.txt"), "c").unwrap();
         std::fs::write(dir.path().join("trans-kun"), "d").unwrap(); // không có hậu tố
+        std::fs::write(dir.path().join("trans-kun.secret"), "private").unwrap();
+        std::fs::write(dir.path().join("trans-kun.2026-09-22.backup"), "private").unwrap();
         std::fs::create_dir(dir.path().join("trans-kun.subdir")).unwrap();
 
         let files = allow_listed_log_files(dir.path());
@@ -506,14 +557,31 @@ mod tests {
         assert!(!bundle.contains("không được xuất hiện"));
     }
 
+    #[test]
+    fn build_bundle_limits_a_large_log_file() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("trans-kun.2026-09-22"),
+            vec![b'x'; 1_048_577],
+        )
+        .unwrap();
+
+        let bundle = build_bundle(dir.path(), &zero_summary());
+
+        assert!(bundle.contains("[log truncated: export size limit]"));
+        assert!(bundle.len() < 1_050_000);
+    }
+
     // spec Never: "Không đưa đường dẫn tuyệt đối hay tên người dùng của máy
     // vào gói."
 
     #[test]
     fn scrub_paths_and_username_masks_posix_absolute_paths() {
-        let input = "panic tại /Users/nguyenthanhtung/code/trans-kun/src-tauri/target/debug/build";
+        let input = "panic tại /Users/nguyenthanhtung/code/trans-kun/src-tauri/target/debug/build và /tmp/trans-kun/log và /opt/app/config";
         let out = scrub_paths_and_username(input);
         assert!(!out.contains("/Users/nguyenthanhtung"));
+        assert!(!out.contains("/tmp/trans-kun"));
+        assert!(!out.contains("/opt/app"));
         assert!(out.contains("[path]"));
     }
 
@@ -523,6 +591,14 @@ mod tests {
         let out = scrub_paths_and_username(input);
         assert!(!out.contains(r"C:\Users\nguyen.tung"));
         assert!(out.contains("[path]"));
+    }
+
+    #[test]
+    fn scrub_paths_and_username_masks_unc_and_forward_slash_windows_paths() {
+        let input = "file C:/Users/name/AppData and \\\\server\\share\\private.txt";
+        let out = scrub_paths_and_username(input);
+        assert!(!out.contains("C:/Users"));
+        assert!(!out.contains("\\\\server"));
     }
 
     #[test]
@@ -622,12 +698,30 @@ mod tests {
     }
 
     #[test]
+    fn clear_logs_truncates_the_latest_file_before_the_first_write_after_midnight() {
+        let dir = tempdir().unwrap();
+        let prior = dir.path().join("trans-kun.2026-09-22");
+        std::fs::write(&prior, "writer still open").unwrap();
+        std::fs::write(dir.path().join("trans-kun.2026-09-21"), "older").unwrap();
+        let now = UNIX_EPOCH + std::time::Duration::from_secs(20_719 * 86_400);
+
+        clear_logs_at(dir.path(), now).unwrap();
+
+        assert!(prior.exists());
+        assert_eq!(std::fs::read_to_string(prior).unwrap(), "");
+        assert!(!dir.path().join("trans-kun.2026-09-21").exists());
+    }
+
+    #[test]
     fn default_export_file_name_formats_a_fixed_instant_as_utc_yyyymmdd() {
         // 100 ngày sau epoch = 1970-04-11 (UTC) — mốc cố định, tính tay bằng
         // thuật toán `civil_from_unix_days` để test tất định, không phụ
         // thuộc đồng hồ hệ thống lúc chạy test.
         let instant = UNIX_EPOCH + std::time::Duration::from_secs(100 * 86_400);
-        assert_eq!(default_export_file_name(instant), "trans-kun-diagnostics-19700411.txt");
+        assert_eq!(
+            default_export_file_name(instant),
+            "trans-kun-diagnostics-19700411.txt"
+        );
     }
 
     #[test]

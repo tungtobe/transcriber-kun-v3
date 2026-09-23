@@ -63,6 +63,22 @@ describe('keysStore', () => {
     expect(mocks.modelsList).not.toHaveBeenCalled();
   });
 
+  it('finishes with a safe error when the IPC bridge rejects a key check', async () => {
+    mocks.keysSet.mockResolvedValue({ status: 'ok', data: [key('k1')] });
+    mocks.keysTest.mockRejectedValue(new Error('raw bridge failure with secret'));
+    const { createKeysStore } = await import('./keys.svelte');
+    const store = createKeysStore();
+
+    const outcome = await store.checkKeys('AIzaSomeKey');
+
+    expect(outcome).toEqual({
+      kind: 'error',
+      error: { category: 'network', code: 'network', detailRedacted: 'key check unavailable' },
+    });
+    expect(store.checkStatus).toBe('done');
+    expect(store.lastCheckedAt).toBeInstanceOf(Date);
+  });
+
   it('reports a valid key and the transcribe model count', async () => {
     mocks.keysSet.mockResolvedValue({ status: 'ok', data: [key('k1')] });
     mocks.keysTest.mockResolvedValue({ status: 'ok', data: { keyId: 'k1', valid: true } });
@@ -134,6 +150,25 @@ describe('keysStore', () => {
 
     expect(store.hasUsableKey).toBe(false);
     expect(store.status).toBe('ready');
+  });
+
+  it('does not restore an old list when a pending load finishes after keysSet', async () => {
+    let resolveList!: (value: unknown) => void;
+    mocks.keysList.mockReturnValue(new Promise((resolve) => { resolveList = resolve; }));
+    mocks.keysSet.mockResolvedValue({ status: 'ok', data: [key('new')] });
+    mocks.keysTest.mockResolvedValue({ status: 'ok', data: { keyId: 'new', valid: true } });
+    mocks.modelsList.mockResolvedValue({ status: 'ok', data: [] });
+    const { createKeysStore } = await import('./keys.svelte');
+    const store = createKeysStore();
+
+    const loading = store.load();
+    await store.checkKeys('AIzaNew');
+    resolveList({ status: 'ok', data: [key('old')] });
+    await loading;
+
+    expect(store.keys).toEqual([key('new')]);
+    expect(store.status).toBe('ready');
+    expect(store.hasUsableKey).toBe(true);
   });
 
   it('resets tested results after a replace-all keysSet so a fresh list needs a fresh check', async () => {
@@ -258,6 +293,19 @@ describe('keysStore.deleteKey', () => {
     expect(err).toEqual({ category: 'storage', code: 'storage', detailRedacted: 'keychain unavailable' });
     expect(store.error?.category).toBe('storage');
     // I/O Matrix "Xoá key": lỗi storage -> danh sách giữ nguyên.
+    expect(store.keys).toEqual([key('k1')]);
+  });
+
+  it('keeps the list and reports a safe error when delete invoke rejects', async () => {
+    mocks.keysList.mockResolvedValue({ status: 'ok', data: [key('k1')] });
+    mocks.keysDelete.mockRejectedValue(new Error('raw bridge failure with secret'));
+    const { createKeysStore } = await import('./keys.svelte');
+    const store = createKeysStore();
+    await store.load();
+
+    expect(await store.deleteKey('k1')).toEqual({
+      category: 'storage', code: 'storage', detailRedacted: 'key delete unavailable',
+    });
     expect(store.keys).toEqual([key('k1')]);
   });
 });
