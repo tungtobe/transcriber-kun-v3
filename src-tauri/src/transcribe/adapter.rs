@@ -1,6 +1,5 @@
-//! Family-specific request construction behind the single Gemini gateway.
-//! Only exact, documented model IDs get a profile. Alias and free-text model
-//! names never inherit a thinking configuration guessed from their spelling.
+//! File transcription through ordinary Gemini generateContent models.
+//! Live Translate has its own WebSocket pipeline in the Live epic.
 
 use serde_json::{json, Value};
 
@@ -8,60 +7,53 @@ use crate::core::error::{AppError, Code};
 use crate::gemini::{CancellationToken, ConsentSnapshot, GeminiGateway};
 use crate::media::{serialize_transcribe_request, Chunk};
 
-use super::parser::{parse_general_response, parse_interaction_response, ChunkTranscript};
+use super::parser::{parse_general_response, ChunkTranscript};
 
-const PROMPT: &str = "Transcribe the spoken audio into a JSON array of segments. Each segment must have start and end as MM:SS relative to this audio chunk and text. Target segments of 5 to 15 seconds. Return [] only when the audio contains no speech.";
+const PROMPT: &str = "Transcribe this audio accurately, including code-switching between Vietnamese and Japanese. Detect each spoken language automatically; do not translate. Return ONLY a JSON array, no markdown or prose. Each segment has start and end in MM:SS relative to THIS audio chunk and text. Target segments of 5 to 15 seconds. Timestamps must match the audio. Return [] only if there is no speech.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ModelProfile {
-    General25Flash,
-    General25FlashLite,
-    General25Pro,
-    General35FlashLite,
-    General35Flash,
-    General38Flash,
-    /// Not returned by `verified_profile` until S2 proves inline support.
-    SpecializedInline,
+enum ThinkingProfile {
+    BudgetZero,
+    BudgetDynamic,
+    LevelMinimal,
+    LevelLow,
+    ModelDefault,
 }
 
-pub fn verified_profile(model: &str) -> Result<ModelProfile, AppError> {
-    match canonical_model_id(model) {
-        "gemini-2.5-flash" => Ok(ModelProfile::General25Flash),
-        "gemini-2.5-flash-lite" => Ok(ModelProfile::General25FlashLite),
-        "gemini-2.5-pro" => Ok(ModelProfile::General25Pro),
-        "gemini-3.5-flash-lite" => Ok(ModelProfile::General35FlashLite),
-        "gemini-3.5-flash" => Ok(ModelProfile::General35Flash),
-        "gemini-3.8-flash" => Ok(ModelProfile::General38Flash),
-        "gemini-3.5-transcribe" => Err(AppError::new(
-            Code::Blocked,
-            "S2 inline audio is not verified for this transcribe model",
-        )),
-        _ => Err(AppError::new(
-            Code::Model,
-            "This Gemini model has no verified transcribe adapter profile",
-        )),
+/// Only exact model IDs receive model-specific thinking controls. Versionless
+/// aliases and user-entered names use the model's own default configuration;
+/// their name is never parsed to guess a major version.
+fn thinking_profile(model: &str) -> ThinkingProfile {
+    match model {
+        "gemini-2.5-flash" | "gemini-2.5-flash-lite" => ThinkingProfile::BudgetZero,
+        "gemini-2.5-pro" => ThinkingProfile::BudgetDynamic,
+        "gemini-3.5-flash" | "gemini-3.5-flash-lite" => ThinkingProfile::LevelMinimal,
+        "gemini-3.8-flash" => ThinkingProfile::LevelLow,
+        _ => ThinkingProfile::ModelDefault,
     }
 }
 
 /// Model listing returns `models/<id>` while Settings may hold a bare ID.
-/// Both forms identify the same model and keep the user's selection intact.
-fn canonical_model_id(model: &str) -> &str {
-    model.strip_prefix("models/").unwrap_or(model)
+fn model_id(model: &str) -> Result<&str, AppError> {
+    let id = model.strip_prefix("models/").unwrap_or(model);
+    if id.is_empty()
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(AppError::new(Code::Model, "Gemini model ID is invalid"));
+    }
+    if id.contains("transcribe") || id.contains("live-translate") {
+        return Err(AppError::new(
+            Code::Model,
+            "Select a general Gemini model for file transcription",
+        ));
+    }
+    Ok(id)
 }
 
-fn generation_config(profile: ModelProfile) -> Value {
-    let thinking = match profile {
-        ModelProfile::General25Flash | ModelProfile::General25FlashLite => {
-            json!({"thinkingBudget": 0})
-        }
-        ModelProfile::General25Pro => json!({"thinkingBudget": -1}),
-        ModelProfile::General35FlashLite | ModelProfile::General35Flash => {
-            json!({"thinkingLevel": "minimal"})
-        }
-        ModelProfile::General38Flash => json!({"thinkingLevel": "low"}),
-        ModelProfile::SpecializedInline => unreachable!(),
-    };
-    json!({
+fn generation_config(model: &str) -> Value {
+    let mut config = json!({
         "responseMimeType": "application/json",
         "responseSchema": {
             "type": "ARRAY",
@@ -70,61 +62,35 @@ fn generation_config(profile: ModelProfile) -> Value {
                 "properties": {"start": {"type": "STRING"}, "end": {"type": "STRING"}, "text": {"type": "STRING"}},
                 "required": ["start", "end", "text"]
             }
-        },
-        "thinkingConfig": thinking
-    })
+        }
+    });
+    let thinking = match thinking_profile(model) {
+        ThinkingProfile::BudgetZero => Some(json!({"thinkingBudget": 0})),
+        ThinkingProfile::BudgetDynamic => Some(json!({"thinkingBudget": -1})),
+        ThinkingProfile::LevelMinimal => Some(json!({"thinkingLevel": "minimal"})),
+        ThinkingProfile::LevelLow => Some(json!({"thinkingLevel": "low"})),
+        ThinkingProfile::ModelDefault => None,
+    };
+    if let Some(thinking) = thinking {
+        config["thinkingConfig"] = thinking;
+    }
+    config
 }
 
-pub fn build_general_request(
-    model: &str,
-    profile: ModelProfile,
-    chunk: &Chunk,
-) -> Result<(String, String), AppError> {
-    if profile == ModelProfile::SpecializedInline {
-        return Err(AppError::new(Code::Model, "Wrong Gemini adapter family"));
-    }
-    // A profile is bound to its exact verified model; callers cannot select
-    // one model's thinking settings for a different or user-entered name.
-    if verified_profile(model)? != profile {
-        return Err(AppError::new(Code::Model, "Gemini model profile mismatch"));
-    }
-    let model = canonical_model_id(model);
+pub fn build_general_request(model: &str, chunk: &Chunk) -> Result<(String, String), AppError> {
+    let model = model_id(model)?;
     let body = json!({
-        "contents": [{"role":"user", "parts": [
+        "contents": [{"role": "user", "parts": [
             {"text": PROMPT},
             {"inline_data": {"mime_type": "audio/flac", "data": chunk.flac_base64}}
         ]}],
-        "generationConfig": generation_config(profile)
+        "generationConfig": generation_config(model)
     });
     let serialized = serialize_transcribe_request(&body)?;
     Ok((
         format!("/v1beta/models/{model}:generateContent"),
         serialized,
     ))
-}
-
-pub fn build_specialized_request(
-    model: &str,
-    chunk: &Chunk,
-    language_codes: &[String],
-) -> Result<(String, String), AppError> {
-    let model = canonical_model_id(model);
-    if model != "gemini-3.5-transcribe" {
-        return Err(AppError::new(
-            Code::Model,
-            "Unknown specialized transcribe model",
-        ));
-    }
-    let body = json!({
-        "model": model,
-        "input": [{"type": "audio", "data": chunk.flac_base64, "mime_type": "audio/flac"}],
-        "generation_config": {"transcription_config": {
-            "mode": {"type": "verbatim", "timestamp_granularities": ["word"], "diarization_mode": "speaker"},
-            "language_codes": language_codes
-        }}
-    });
-    let serialized = serialize_transcribe_request(&body)?;
-    Ok(("/v1beta/interactions".to_string(), serialized))
 }
 
 #[derive(Debug)]
@@ -147,31 +113,9 @@ pub async fn transcribe_chunk(
     consent: ConsentSnapshot,
     cancellation: CancellationToken,
 ) -> Result<ChunkTranscript, TranscribeFailure> {
-    let profile = verified_profile(model)?;
-    // The specialized branch is dormant until an exact-model S2 probe makes
-    // `verified_profile` return SpecializedInline. It is already wired to the
-    // Interactions transport and parser, so enabling it cannot silently fall
-    // through to generateContent.
-    let (path, body) = match profile {
-        ModelProfile::SpecializedInline => build_specialized_request(model, chunk, &[])?,
-        _ => build_general_request(model, profile, chunk)?,
-    };
+    let (path, body) = build_general_request(model, chunk)?;
     let response = gateway.post_job(&path, body, consent, cancellation).await?;
-    match profile {
-        ModelProfile::SpecializedInline => parse_interaction_response(&response.body, chunk),
-        _ => parse_general_response(&response.body, chunk),
-    }
-    .map_err(Into::into)
-}
-
-/// The specialized builder is deliberately available for exact-shape tests,
-/// while the public execution path remains blocked at S2 until inline audio
-/// is proven for this exact model. No Files API fallback is permitted.
-pub fn specialized_inline_gate() -> Result<(), AppError> {
-    Err(AppError::new(
-        Code::Blocked,
-        "S2 inline audio is not verified for this transcribe model",
-    ))
+    parse_general_response(&response.body, chunk).map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -190,23 +134,18 @@ mod tests {
     }
 
     #[test]
-    fn general_request_has_exact_inline_schema_and_thinking_profiles() {
-        let (path, body) = build_general_request(
-            "gemini-2.5-flash-lite",
-            ModelProfile::General25FlashLite,
-            &chunk(),
-        )
-        .unwrap();
-        assert_eq!(path, "/v1beta/models/gemini-2.5-flash-lite:generateContent");
+    fn ordinary_model_request_has_inline_flac_json_schema_and_mixed_language_prompt() {
+        let (path, body) = build_general_request("models/gemini-3.8-flash", &chunk()).unwrap();
+        assert_eq!(path, "/v1beta/models/gemini-3.8-flash:generateContent");
         let value: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(
             value["contents"][0]["parts"][1],
             json!({"inline_data":{"mime_type":"audio/flac","data":"AAAA"}})
         );
-        assert_eq!(
-            value["generationConfig"]["thinkingConfig"],
-            json!({"thinkingBudget":0})
-        );
+        assert!(value["contents"][0]["parts"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Vietnamese and Japanese"));
         assert_eq!(
             value["generationConfig"]["responseMimeType"],
             "application/json"
@@ -215,51 +154,26 @@ mod tests {
             value["generationConfig"]["responseSchema"]["items"]["required"],
             json!(["start", "end", "text"])
         );
-        let (_, body3) =
-            build_general_request("gemini-3.8-flash", ModelProfile::General38Flash, &chunk())
-                .unwrap();
-        let value3: Value = serde_json::from_str(&body3).unwrap();
         assert_eq!(
-            value3["generationConfig"]["thinkingConfig"],
+            value["generationConfig"]["thinkingConfig"],
             json!({"thinkingLevel":"low"})
         );
     }
 
     #[test]
-    fn specialized_shape_is_exact_but_execution_is_gated() {
-        let (path, body) =
-            build_specialized_request("gemini-3.5-transcribe", &chunk(), &["ja-JP".into()])
-                .unwrap();
-        assert_eq!(path, "/v1beta/interactions");
-        let value: Value = serde_json::from_str(&body).unwrap();
+    fn default_alias_and_custom_name_use_generate_content_without_version_guessing() {
+        for model in ["gemini-flash-lite-latest", "my-custom-model"] {
+            let (path, body) = build_general_request(model, &chunk()).unwrap();
+            assert_eq!(path, format!("/v1beta/models/{model}:generateContent"));
+            let value: Value = serde_json::from_str(&body).unwrap();
+            assert!(value["generationConfig"].get("thinkingConfig").is_none());
+        }
         assert_eq!(
-            value["input"][0],
-            json!({"type":"audio","data":"AAAA","mime_type":"audio/flac"})
+            thinking_profile("gemini-2.5-flash-lite"),
+            ThinkingProfile::BudgetZero
         );
-        assert_eq!(
-            value["generation_config"]["transcription_config"]["mode"],
-            json!({"type":"verbatim","timestamp_granularities":["word"],"diarization_mode":"speaker"})
-        );
-        assert_eq!(
-            value["generation_config"]["transcription_config"]["language_codes"],
-            json!(["ja-JP"])
-        );
-        assert!(verified_profile("gemini-3.5-transcribe").is_err());
-        assert!(specialized_inline_gate().is_err());
-        assert!(verified_profile("gemini-flash-lite-latest").is_err());
-        assert_eq!(
-            verified_profile("models/gemini-2.5-flash-lite").unwrap(),
-            ModelProfile::General25FlashLite
-        );
-        let (listed_path, _) = build_general_request(
-            "models/gemini-2.5-flash-lite",
-            ModelProfile::General25FlashLite,
-            &chunk(),
-        )
-        .unwrap();
-        assert_eq!(
-            listed_path,
-            "/v1beta/models/gemini-2.5-flash-lite:generateContent"
-        );
+        assert!(build_general_request("gemini-3.5-transcribe", &chunk()).is_err());
+        assert!(build_general_request("gemini-3.5-live-translate-preview", &chunk()).is_err());
+        assert!(build_general_request("models/../oops", &chunk()).is_err());
     }
 }

@@ -1,43 +1,20 @@
-# ADR 2.2: Gemini inline transcribe capability gate
+# ADR 2.2: Transcribe file bằng Gemini generateContent
 
-**Status:** Open — S2/OQ2 is not verified.
+**Status:** Direction accepted; live S2 request pending.
 **Date:** 2026-09-23
-
-## Context
-
-Story 2.2 sends chunk audio inline and must not add a Files API upload, change
-the selected model, or silently fall back to a different protocol. The
-specialized `*-transcribe` Interactions path requires direct evidence that the
-selected model accepts inline audio. Generic Interactions documentation shows
-an inline `input.audio.data` shape, while the Transcribe examples use a Files
-API URI. Those examples do not establish inline support for the specialized
-model.
-
-No Gemini API key was available in the implementation environment for a direct
-request against the target model. Unit tests of the request shape are not
-evidence that the service accepts that shape.
 
 ## Decision
 
-Keep specialized inline Interactions capability disabled unless the model has
-an explicit, verified inline profile. Do not infer that profile from an alias
-or model name. When no verified profile exists, return the S2/OQ2 gate error
-before sending a request. If a direct request later confirms that the API only
-accepts Files API references, stop and obtain the product and architecture
-decision required by OQ2; do not upload audio or switch models in this story.
+Theo điều chỉnh của chủ sản phẩm, transcribe file dùng model Gemini thông thường qua `POST /v1beta/models/{model}:generateContent` với FLAC inline và JSON Segment. Prompt yêu cầu tự nhận diện tiếng Việt/tiếng Nhật xen kẽ, giữ nguyên lời nói và không dịch. Model `*-transcribe`/Interactions và Files API không thuộc đường transcribe file v3. Chế độ Live dùng Live Translate qua WebSocket để nhận transcript đầu vào, transcript bản dịch và audio bản dịch; luồng đó thuộc Epic 4–5.
 
-The general `generateContent` path remains available only for models with a
-verified general profile. Both paths serialize and size-check the complete
-inline JSON request before it reaches the gateway.
+Tên model version đã biết có thinking config tương ứng. Alias mặc định `gemini-flash-lite-latest` và tên người dùng nhập được gửi nguyên tên với thinking mặc định của model, không suy ra major version hay tự đổi model. Google sẽ trả lỗi nếu model không hỗ trợ JSON schema hoặc audio inline.
 
-## Evidence and follow-up
+## Evidence
 
-- The [Gemini Transcription guide](https://ai.google.dev/gemini-api/docs/transcribe)
-  describes word annotations and the specialized model flow using Files API
-  references; it does not show direct inline audio for that model.
-- The [Interactions API guide](https://ai.google.dev/gemini-api/docs/generate-content/transcribe)
-  documents the general inline audio data shape, which is insufficient to
-  validate the specialized model capability.
-- Revisit this gate when a direct, successful inline request can be made with
-  the target specialized model. Record the model ID, request form, response
-  status, and date without saving a key, audio, transcript, or response body.
+- Code v2 ở `../transcriber-kun/app/python/transcriber.py` gọi `client.models.generate_content` với prompt và JSON schema cho model thông thường; `../transcriber-kun/app/python/realtime_gemini.py` dùng WebSocket BidiGenerateContent cho Live.
+- [Gemini audio guide](https://ai.google.dev/gemini-api/docs/generate-content/audio) mô tả audio inline cho generateContent dưới giới hạn request 20 MB.
+- [Live Translate guide](https://ai.google.dev/gemini-api/docs/live-api/live-translate) mô tả `inputAudioTranscription`, `outputAudioTranscription` và audio output trong Live session.
+
+## S2 verification remaining
+
+Môi trường triển khai không có Gemini API key, nên chưa có request thật với model được chọn và fixture Việt–Nhật. Trước khi chốt S2, chạy FLAC inline 5 phút qua `generateContent`, xác nhận JSON schema, kích thước payload và so timestamp với v2; ghi model ID, ngày, trạng thái và số đo mà không lưu key/audio/transcript trong ADR.

@@ -1,4 +1,4 @@
-//! Pure response parser shared by both Gemini transcription families.
+//! Response parser for ordinary Gemini generateContent file transcription.
 use std::collections::HashSet;
 
 use serde_json::Value;
@@ -161,98 +161,6 @@ fn parse_clock(value: &str) -> Option<f64> {
     Some(minutes as f64 * 60.0 + seconds)
 }
 
-fn parse_offset(value: &str) -> Option<f64> {
-    let seconds = value.strip_suffix('s')?.parse::<f64>().ok()?;
-    (seconds.is_finite() && seconds >= 0.0).then_some(seconds)
-}
-
-pub fn parse_interaction_response(body: &str, chunk: &Chunk) -> Result<ChunkTranscript, AppError> {
-    let response: Value = serde_json::from_str(body).map_err(|_| shape())?;
-    let completed = response.get("status").and_then(Value::as_str) == Some("completed");
-    let steps = response
-        .get("steps")
-        .and_then(Value::as_array)
-        .ok_or_else(shape)?;
-    let mut words = Vec::new();
-    let mut invalid = false;
-    for step in steps {
-        if step.get("type").and_then(Value::as_str) != Some("model_output") {
-            continue;
-        }
-        for content in step
-            .get("content")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            for annotation in content
-                .get("annotations")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-            {
-                if annotation.get("type").and_then(Value::as_str) != Some("word_info") {
-                    continue;
-                }
-                let word = (|| {
-                    let start = parse_offset(annotation.get("start_offset")?.as_str()?)?;
-                    let end = parse_offset(annotation.get("end_offset")?.as_str()?)?;
-                    let text = annotation.get("text")?.as_str()?.trim();
-                    if text.is_empty() {
-                        return None;
-                    }
-                    Some(Segment {
-                        start,
-                        end,
-                        text: text.to_owned(),
-                        speaker: annotation
-                            .get("speaker")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned),
-                    })
-                })();
-                if let Some(word) = word {
-                    if word.end > word.start && word.end <= chunk.duration_ms as f64 / 1000.0 {
-                        words.push(word);
-                    } else {
-                        invalid = true;
-                    }
-                } else {
-                    invalid = true;
-                }
-            }
-        }
-    }
-    if words.is_empty() {
-        let output = response.get("output_text").and_then(Value::as_str);
-        if completed && output.is_some_and(|text| text.trim().is_empty()) && !invalid {
-            return Ok(ChunkTranscript {
-                segments: vec![],
-                unresolved: vec![],
-                confirmed_silence: true,
-            });
-        }
-        return Err(shape());
-    }
-    words.sort_by(|a, b| a.start.total_cmp(&b.start));
-    let mut groups: Vec<Segment> = Vec::new();
-    for word in words {
-        if let Some(last) = groups.last_mut() {
-            if last.speaker == word.speaker
-                && word.end - last.start <= 15.0
-                && word.start - last.start < 8.0
-            {
-                last.end = last.end.max(word.end);
-                last.text.push(' ');
-                last.text.push_str(&word.text);
-                continue;
-            }
-        }
-        groups.push(word);
-    }
-    normalize(groups, chunk, invalid || !completed)
-}
-
 fn normalize(
     raw: Vec<Segment>,
     chunk: &Chunk,
@@ -380,26 +288,6 @@ mod tests {
             &chunk()
         )
         .is_err());
-    }
-
-    #[test]
-    fn interaction_groups_words_and_splits_speakers() {
-        let body = r#"{"status":"completed","steps":[{"type":"model_output","content":[{"type":"text","annotations":[{"type":"word_info","text":"Hello","speaker":"spk_1","start_offset":"0.100s","end_offset":"0.400s"},{"type":"word_info","text":"world","speaker":"spk_1","start_offset":"0.500s","end_offset":"0.900s"},{"type":"word_info","text":"Yes","speaker":"spk_2","start_offset":"1.000s","end_offset":"1.500s"}]}]}]}"#;
-        let result = parse_interaction_response(body, &chunk()).unwrap();
-        assert_eq!(result.segments.len(), 2);
-        assert_eq!(result.segments[0].text, "Hello world");
-        assert_eq!(result.segments[0].speaker.as_deref(), Some("spk_1"));
-        assert_eq!(result.segments[0].start, 10.1);
-        assert!(result.unresolved.is_empty());
-    }
-
-    #[test]
-    fn interaction_drops_invalid_word_before_grouping_and_marks_missing() {
-        let body = r#"{"status":"completed","steps":[{"type":"model_output","content":[{"type":"text","annotations":[{"type":"word_info","text":"Valid","speaker":"spk_1","start_offset":"0.100s","end_offset":"0.400s"},{"type":"word_info","text":"Invalid","speaker":"spk_1","start_offset":"0.500s","end_offset":"30.000s"}]}]}]}"#;
-        let result = parse_interaction_response(body, &chunk()).unwrap();
-        assert_eq!(result.segments.len(), 1);
-        assert_eq!(result.segments[0].text, "Valid");
-        assert!(!result.unresolved.is_empty());
     }
 
     #[test]
