@@ -34,6 +34,14 @@ impl Db {
 
         let mut conn = Connection::open(dir.join(DB_FILE_NAME))?;
 
+        // Bật ràng buộc khoá ngoại cho connection này (story 2.3 Tasks: "bật
+        // foreign keys"). SQLite tắt mặc định và đây là pragma theo-connection
+        // (không lưu trong file DB), nên phải đặt lại mỗi lần mở — có đúng một
+        // connection sống suốt vòng đời app ở đây nên đặt một lần là đủ. Cần
+        // bật trước khi insert dữ liệu tham chiếu (`transcripts.session_id`,
+        // `segments.transcript_id`) để `ON DELETE CASCADE` thực sự chạy.
+        conn.pragma_update(None, "foreign_keys", true)?;
+
         // `PRAGMA journal_mode = WAL` luôn trả một hàng kết quả (chế độ áp
         // dụng được) kể cả khi dùng để "set" — phải `query_row`, không
         // `pragma_update`, nếu không rusqlite sẽ coi là lỗi "unexpected row".
@@ -91,7 +99,105 @@ mod tests {
             let version: i64 = conn
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 2);
+            assert_eq!(version, 3);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn foreign_keys_pragma_is_on() {
+        let dir = tempdir().unwrap();
+        let db = Db::open(dir.path()).unwrap();
+        db.with_connection(|conn| {
+            let on: i64 = conn
+                .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(on, 1);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn deleting_a_transcript_cascades_to_its_segments() {
+        let dir = tempdir().unwrap();
+        let db = Db::open(dir.path()).unwrap();
+        db.with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO sessions (id, kind, title, status, duration_sec, created_at, updated_at) \
+                 VALUES ('s1', 'file', 't', 'complete', 1.0, 0, 0)",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO transcripts (id, session_id, variant, status, model, created_at) \
+                 VALUES ('t1', 's1', 'primary', 'complete', 'm', 0)",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO segments (transcript_id, idx, start_sec, end_sec, kind, text) \
+                 VALUES ('t1', 0, 0.0, 1.0, 'text', 'hello')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        db.with_connection(|conn| {
+            conn.execute("DELETE FROM transcripts WHERE id = 't1'", [])?;
+            Ok(())
+        })
+        .unwrap();
+
+        db.with_connection(|conn| {
+            let count: i64 = conn
+                .query_row("SELECT count(*) FROM segments", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(count, 0, "xoá transcript phải kéo theo xoá segments của nó");
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn deleting_a_session_cascades_through_transcripts_to_segments() {
+        let dir = tempdir().unwrap();
+        let db = Db::open(dir.path()).unwrap();
+        db.with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO sessions (id, kind, title, status, duration_sec, created_at, updated_at) \
+                 VALUES ('s1', 'file', 't', 'complete', 1.0, 0, 0)",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO transcripts (id, session_id, variant, status, model, created_at) \
+                 VALUES ('t1', 's1', 'primary', 'complete', 'm', 0)",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO segments (transcript_id, idx, start_sec, end_sec, kind, text) \
+                 VALUES ('t1', 0, 0.0, 1.0, 'text', 'hello')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        db.with_connection(|conn| {
+            conn.execute("DELETE FROM sessions WHERE id = 's1'", [])?;
+            Ok(())
+        })
+        .unwrap();
+
+        db.with_connection(|conn| {
+            let transcripts: i64 = conn
+                .query_row("SELECT count(*) FROM transcripts", [], |row| row.get(0))
+                .unwrap();
+            let segments: i64 = conn
+                .query_row("SELECT count(*) FROM segments", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(transcripts, 0);
+            assert_eq!(segments, 0);
             Ok(())
         })
         .unwrap();
