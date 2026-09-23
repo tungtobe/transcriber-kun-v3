@@ -16,7 +16,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "=2.6.3", features = [] }
 
 [dependencies]
-tauri = { version = "=2.11.5", features = ["specta"] }
+tauri = { version = "=2.11.5", features = ["specta", "protocol-asset"] }
 tauri-specta = { version = "=2.0.0-rc.25", features = ["derive", "typescript"] }
 tauri-plugin-opener = "=2.5.5"
 # Story 1.10: dialog lưu file hệ thống cho "Xuất gói nhật ký" — mở chỉ từ
@@ -46,6 +46,12 @@ regex = "=1.13.1"
 serde_json = { version = "=1.0.151" }
 tokio = { version = "=1.53.1", default-features = false, features = ["macros", "rt", "sync", "time"] }
 reqwest = { version = "=0.13.5", default-features = false, features = ["json", "rustls"] }
+symphonia = { version = "=0.6.1", default-features = false, features = ["aac", "adpcm", "aiff", "alac", "caf", "flac", "isomp4", "mkv", "mp3", "ogg", "pcm", "vorbis", "wav"] }
+rubato = "=5.0.0"
+flacenc = "=0.5.1"
+hound = "=3.5.1"
+sha2 = "=0.10.9"
+base64 = "=0.22.1"
 
 # Keyring is intentionally restricted to the two supported desktop stores.
 # Linux is not a supported product target; keeping this dependency target

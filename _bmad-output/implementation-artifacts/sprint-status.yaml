@@ -50,8 +50,8 @@ development_status:
   1-12-bản-beta-windows-msix-qua-store-package-flight-spike-s6: backlog
   epic-1-retrospective: optional
 
-  epic-2: backlog
-  2-1-media-pipeline-thuần-rust-và-kiểm-chứng-phát-flac-spike-s1-s: backlog
+  epic-2: in-progress
+  2-1-media-pipeline-thuần-rust-và-kiểm-chứng-phát-flac-spike-s1-s: review
   2-2-gemini-transcribe-adapter-theo-họ-model-và-parser-chịu-lỗi-s: backlog
   2-3-lưu-phiên-và-transcript-bền-vững: backlog
   2-4-job-transcribe-file-hàng-đợi-tiến-độ-và-huỷ: backlog
