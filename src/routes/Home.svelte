@@ -1,15 +1,45 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  // Home (story 2.9): trạng thái trống (2.8's two-card UI, giữ nguyên) khi
+  // không có Phiên và không có Job; ngược lại drop-zone mỏng + card job (nếu
+  // có) + danh sách Phiên virtualized (spec Boundaries/Intent). `jobsStore`
+  // được subscribe suốt vòng đời màn này (đếm tham chiếu — sidebar giữ
+  // subscribe riêng của nó, không đụng nhau) và `libraryStore` tự tải lại
+  // khi một Job commit (`jobsStore.resultSeq` đổi) — không cần thao tác gì ở
+  // đây ngoài `load()` lúc mount.
+  import { onDestroy, onMount } from 'svelte';
   import { InfoIcon, RadioIcon, UploadIcon } from '../components/icons';
   import DisabledHint from '../components/DisabledHint.svelte';
   import BannerStack, { type BannerItem } from '../components/BannerStack.svelte';
   import IntakeNotices from '../components/IntakeNotices.svelte';
+  import JobCard from '../components/JobCard.svelte';
+  import SessionList from './home/SessionList.svelte';
+  import SessionListSkeleton from './home/SessionListSkeleton.svelte';
   import { i18n } from '../i18n/index.svelte';
   import { keysStore } from '../lib/stores/keys.svelte';
   import { intakeStore } from '../lib/stores/intake.svelte';
+  import { jobsStore } from '../lib/stores/jobs.svelte';
+  import { libraryStore } from '../lib/stores/library.svelte';
+
+  // Test-only seam (spec Design Notes: "jsdom không có layout nên test cần
+  // cấp chiều cao khung nhìn qua prop/biến có thể ghi đè"): jsdom's
+  // `clientHeight` is always 0, so a real viewport can never be measured
+  // there — a test renders `Home` with this prop to pin the list's viewport
+  // height instead. Production never passes it (`SessionList` auto-measures
+  // `.session-list-wrap`'s real `clientHeight`).
+  let { sessionListViewportHeight }: { sessionListViewportHeight?: number } = $props();
+
+  let subscribedJobs = false;
+  let cancellingJobId = $state<string | null>(null);
 
   onMount(() => {
     void keysStore.load();
+    subscribedJobs = true;
+    void jobsStore.subscribe();
+    void libraryStore.load();
+  });
+
+  onDestroy(() => {
+    if (subscribedJobs) jobsStore.unsubscribe();
   });
 
   // Loading is treated conservatively (button stays disabled) the same way
@@ -22,6 +52,36 @@
     if (!canChooseFile) return;
     void intakeStore.pick();
   }
+
+  async function handleCancelJob(jobId: string): Promise<void> {
+    cancellingJobId = jobId;
+    try {
+      await jobsStore.cancel(jobId);
+    } finally {
+      cancellingJobId = null;
+    }
+  }
+
+  // Job đang chạy, hoặc Job đầu hàng nếu chưa có Job chạy (spec Always: "Card
+  // job ... cho Job đang chạy (hoặc Job đầu hàng nếu chưa có Job chạy)") —
+  // `jobsStore.jobs` là một `Map` được dựng/cập nhật theo đúng thứ tự
+  // snapshot/registry nên phần tử đầu tiên còn `queued` là job đầu hàng.
+  const activeJob = $derived.by(() => {
+    const jobs = Array.from(jobsStore.jobs.values());
+    return jobs.find((job) => job.state === 'running') ?? jobs.find((job) => job.state === 'queued') ?? null;
+  });
+
+  // Trạng thái trống thật sự (spec Boundaries: "không có Phiên và không có
+  // Job") chỉ được khẳng định sau khi cả `libraryStore` tải xong — trong lúc
+  // tải (hay lỗi tải) luôn hiện bố cục "có phiên" (drop-zone mỏng + skeleton/
+  // lỗi), không phải hai card lớn (spec I/O Matrix "Đang tải").
+  // `jobsStore.synced` (hoặc lỗi subscribe) cũng phải chắc trước khi khẳng
+  // định "không có Job" — tránh chớp hai card lớn khi danh sách đã tải xong
+  // mà snapshot Job đầu tiên chưa tới.
+  const jobsKnown = $derived(jobsStore.synced || jobsStore.status === 'error');
+  const isEmpty = $derived(
+    libraryStore.status === 'ready' && libraryStore.sessions.length === 0 && jobsKnown && !activeJob,
+  );
 
   // Loading is treated as "not yet confirmed missing" to avoid a flash of
   // the banner while `keysList` is still in flight; a load error is treated
@@ -72,7 +132,9 @@
           <span class="button button-secondary">{i18n.t('home.file.action')}</span>
         </DisabledHint>
       {/if}
-      <span class="status-pill status-off"><span class="status-dot" aria-hidden="true"></span> {i18n.t('home.header.emptyStatus')}</span>
+      {#if isEmpty}
+        <span class="status-pill status-off"><span class="status-dot" aria-hidden="true"></span> {i18n.t('home.header.emptyStatus')}</span>
+      {/if}
     </div>
   </div>
 
@@ -84,11 +146,43 @@
     <IntakeNotices />
   </div>
 
-  <div class="empty-grid">
-    <article class="empty-card">
-      <div class="empty-icon" aria-hidden="true"><UploadIcon size={18} strokeWidth={1.75} /></div>
-      <h2>{i18n.t('home.file.title')}</h2>
-      <p>{i18n.t('home.file.description')}</p>
+  {#if isEmpty}
+    <div class="empty-grid">
+      <article class="empty-card">
+        <div class="empty-icon" aria-hidden="true"><UploadIcon size={18} strokeWidth={1.75} /></div>
+        <h2>{i18n.t('home.file.title')}</h2>
+        <p>{i18n.t('home.file.description')}</p>
+        {#if canChooseFile}
+          <button type="button" class="button button-secondary" onclick={chooseFile}>
+            {i18n.t('home.file.action')}
+          </button>
+        {:else}
+          <DisabledHint
+            reason={i18n.t('home.file.unavailable')}
+            shortcut={i18n.t('home.banner.keyMissingAction')}
+          >
+            <span class="button button-secondary">{i18n.t('home.file.action')}</span>
+          </DisabledHint>
+        {/if}
+      </article>
+
+      <article class="empty-card">
+        <div class="empty-icon" aria-hidden="true"><RadioIcon size={18} strokeWidth={1.75} /></div>
+        <h2>{i18n.t('home.live.title')}</h2>
+        <p>{i18n.t('home.live.description')}</p>
+        <DisabledHint reason={i18n.t('home.live.unavailable')}>
+          <span class="button button-primary">{i18n.t('home.live.action')}</span>
+        </DisabledHint>
+      </article>
+    </div>
+
+    <div class="empty-note" role="status">
+      <InfoIcon size={18} strokeWidth={1.75} aria-hidden="true" />
+      <p>{i18n.t('home.note.ready')}</p>
+    </div>
+  {:else}
+    <div class="drop-zone-thin">
+      <span class="drop-zone-hint">{i18n.t('home.dropZone.hint')}</span>
       {#if canChooseFile}
         <button type="button" class="button button-secondary" onclick={chooseFile}>
           {i18n.t('home.file.action')}
@@ -101,22 +195,35 @@
           <span class="button button-secondary">{i18n.t('home.file.action')}</span>
         </DisabledHint>
       {/if}
-    </article>
+    </div>
 
-    <article class="empty-card">
-      <div class="empty-icon" aria-hidden="true"><RadioIcon size={18} strokeWidth={1.75} /></div>
-      <h2>{i18n.t('home.live.title')}</h2>
-      <p>{i18n.t('home.live.description')}</p>
-      <DisabledHint reason={i18n.t('home.live.unavailable')}>
-        <span class="button button-primary">{i18n.t('home.live.action')}</span>
-      </DisabledHint>
-    </article>
-  </div>
+    {#if activeJob}
+      <JobCard
+        variant="full"
+        job={activeJob}
+        cancelling={cancellingJobId === activeJob.jobId}
+        onCancel={handleCancelJob}
+      />
+    {/if}
 
-  <div class="empty-note" role="status">
-    <InfoIcon size={18} strokeWidth={1.75} aria-hidden="true" />
-    <p>{i18n.t('home.note.ready')}</p>
-  </div>
+    {#if libraryStore.status === 'loading'}
+      <SessionListSkeleton />
+    {:else if libraryStore.status === 'error'}
+      <div class="list-error" role="status">
+        <p>{i18n.t('home.list.loadError')}</p>
+        <button type="button" class="button button-secondary" onclick={() => void libraryStore.load()}>
+          {i18n.t('home.list.retryAction')}
+        </button>
+      </div>
+    {:else}
+      {#if libraryStore.reloadError}
+        <p class="reload-error" role="status">{i18n.t('home.list.reloadError')}</p>
+      {/if}
+      <div class="session-list-wrap">
+        <SessionList sessions={libraryStore.sessions} viewportHeight={sessionListViewportHeight} />
+      </div>
+    {/if}
+  {/if}
 </section>
 
 <style>
@@ -268,5 +375,49 @@
 
   .empty-note p {
     margin: 0;
+  }
+
+  .drop-zone-thin {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--space-3);
+    margin-bottom: var(--space-4);
+    padding: var(--space-4);
+    border: 1px dashed var(--color-border-strong);
+    border-radius: var(--radius-2xl);
+  }
+
+  .drop-zone-hint {
+    color: var(--color-text-secondary);
+    font-size: var(--text-body-size);
+  }
+
+  .list-error {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: var(--space-3);
+    padding: var(--space-6);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-xl);
+    color: var(--color-text-secondary);
+  }
+
+  .list-error p {
+    margin: 0;
+  }
+
+  .reload-error {
+    margin: 0 0 var(--space-3);
+    color: var(--color-warning);
+    font-size: var(--text-help-size);
+  }
+
+  .session-list-wrap {
+    height: 480px;
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-xl);
+    overflow: hidden;
   }
 </style>

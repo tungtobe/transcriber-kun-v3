@@ -28,6 +28,31 @@ vi.mock('./lib/keymap', () => ({
 }));
 vi.mock('./lib/stores/settings.svelte', () => ({ settingsStore: mocks.settingsStore }));
 vi.mock('./lib/stores/app.svelte', () => ({ appStore: mocks.appStore }));
+// story 2.9: `AppShell`/`Home` now subscribe `jobsStore` (a real
+// `@tauri-apps/api` Channel, which has no window to bind to outside a real
+// Tauri runtime) and `libraryStore` (a real IPC call) on mount — this suite
+// composes the real shell/router so it stubs both domain stores wholesale,
+// the same way it already stubs `settingsStore`/`appStore`.
+vi.mock('./lib/stores/jobs.svelte', () => ({
+  jobsStore: {
+    jobs: new Map(),
+    resultSeq: 0,
+    synced: true,
+    status: 'subscribed',
+    subscribe: vi.fn(() => Promise.resolve()),
+    unsubscribe: vi.fn(),
+    cancel: vi.fn(),
+  },
+}));
+vi.mock('./lib/stores/library.svelte', () => ({
+  libraryStore: {
+    sessions: [],
+    status: 'ready',
+    error: null,
+    reloadError: false,
+    load: vi.fn(() => Promise.resolve()),
+  },
+}));
 // AppShell registers a webview-wide drag-drop listener (story 2.8) — the
 // real `@tauri-apps/api/webview` has no window to bind to outside a real
 // Tauri runtime, so this suite (composing the real App shell) mocks the

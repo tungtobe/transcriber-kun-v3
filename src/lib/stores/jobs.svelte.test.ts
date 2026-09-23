@@ -214,6 +214,74 @@ describe('jobsStore', () => {
     expect('error' in failed).toBe(true);
   });
 
+  it('reference-counts subscribe/unsubscribe: a second subscriber reuses the Channel and does not wipe state for the first', async () => {
+    const { createJobsStore } = await import('./jobs.svelte');
+    const store = createJobsStore();
+
+    await store.subscribe();
+    capturedChannel!.onmessage({ kind: 'snapshot', seq: 1, jobs: [job('a')] });
+    expect(mocks.jobsSubscribe).toHaveBeenCalledTimes(1);
+
+    // Second subscriber (e.g. the sidebar) joins the same subscription.
+    await store.subscribe();
+    expect(mocks.jobsSubscribe).toHaveBeenCalledTimes(1);
+    expect(store.jobs.get('a')?.processedMs).toBe(0);
+
+    // The first subscriber leaves (count 2 -> 1) — state must survive for
+    // the still-mounted second subscriber.
+    store.unsubscribe();
+    expect(store.jobs.get('a')?.processedMs).toBe(0);
+    expect(store.status).toBe('subscribed');
+
+    // The last subscriber leaves (count 1 -> 0) — now state clears.
+    store.unsubscribe();
+    expect(store.jobs.size).toBe(0);
+    expect(store.status).toBe('idle');
+  });
+
+  it('resubscribes (does not just increment the count) when a later subscribe() call happens while status is error', async () => {
+    mocks.jobsSubscribe.mockResolvedValueOnce({
+      status: 'error',
+      error: { category: 'storage', code: 'storage', detailRedacted: 'registry unavailable' },
+    });
+    const { createJobsStore } = await import('./jobs.svelte');
+    const store = createJobsStore();
+
+    await store.subscribe();
+    expect(store.status).toBe('error');
+    expect(mocks.jobsSubscribe).toHaveBeenCalledTimes(1);
+
+    mocks.jobsSubscribe.mockImplementation((channel: FakeChannel<unknown>) => {
+      capturedChannel = channel;
+      return Promise.resolve({ status: 'ok', data: null });
+    });
+    await store.subscribe();
+    expect(mocks.jobsSubscribe).toHaveBeenCalledTimes(2);
+    capturedChannel!.onmessage({ kind: 'snapshot', seq: 1, jobs: [] });
+    expect(store.status).toBe('subscribed');
+  });
+
+  it('increments resultSeq once per result event and never on other events', async () => {
+    const { createJobsStore } = await import('./jobs.svelte');
+    const store = createJobsStore();
+
+    await store.subscribe();
+    capturedChannel!.onmessage({ kind: 'snapshot', seq: 1, jobs: [job('a'), job('b')] });
+    expect(store.resultSeq).toBe(0);
+
+    capturedChannel!.onmessage({ kind: 'updated', seq: 2, job: job('a', { processedMs: 1 }) });
+    expect(store.resultSeq).toBe(0);
+
+    capturedChannel!.onmessage({ kind: 'result', seq: 3, jobId: 'a', sessionId: 'session-a' });
+    expect(store.resultSeq).toBe(1);
+
+    capturedChannel!.onmessage({ kind: 'cancelled', seq: 4, jobId: 'b' });
+    expect(store.resultSeq).toBe(1);
+
+    capturedChannel!.onmessage({ kind: 'result', seq: 5, jobId: 'b', sessionId: 'session-b' });
+    expect(store.resultSeq).toBe(2);
+  });
+
   it('cancel returns the outcome on success and null on failure', async () => {
     mocks.jobsCancel.mockResolvedValueOnce({ status: 'ok', data: 'cancelling' });
     const { createJobsStore } = await import('./jobs.svelte');

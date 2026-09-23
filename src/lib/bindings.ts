@@ -121,6 +121,12 @@ export const commands = {
 	transcript: TranscriptDetail | null,
 } | null, AppError>(__TAURI_INVOKE("library_session_detail", { sessionId })),
 	/**
+	 *  Liệt kê mọi Phiên cho Home (story 2.9): một truy vấn, mới nhất trước, kèm
+	 *  `missing_gap_count` (gap `chunk_failed` của transcript `primary`) — xem
+	 *  [`repo::sessions::list_for_home`] cho logic đọc thật.
+	 */
+	librarySessionsList: () => typedError<SessionListItem[], AppError>(__TAURI_INVOKE("library_sessions_list")),
+	/**
 	 *  Chọn lại file nguồn cho một Phiên `file` đã lưu (spec Approach, FR-15):
 	 *  hash file được chọn phải khớp đúng `source_hash` của Phiên trước khi
 	 *  publish Proxy mới — xem [`decide_proxy_relink`] cho thứ tự gate thật và
@@ -391,6 +397,24 @@ export type SessionDetail = {
 	sourceName: string | null,
 	proxyPath: string | null,
 	transcript: TranscriptDetail | null,
+};
+
+/**
+ *  Một dòng phiên cho danh sách Home (story 2.9) — xem
+ *  [`repo::sessions::SessionListRow`] cho logic đọc thật. `created_at` giữ
+ *  dạng `f64` (mili-giây epoch, UTC) chứ không phải `i64`, cùng lý do
+ *  `SessionDetail::created_at`: specta-typescript cấm xuất kiểu BigInt.
+ *  `missing_gap_count` là `i32` (không phải `i64`), cùng lý do
+ *  `SegmentDetail::idx` — không Phiên nào tới gần `i32::MAX` gap.
+ */
+export type SessionListItem = {
+	sessionId: string,
+	kind: string,
+	title: string,
+	createdAt: number | null,
+	durationSec: number | null,
+	recovered: boolean,
+	missingGapCount: number,
 };
 
 /**

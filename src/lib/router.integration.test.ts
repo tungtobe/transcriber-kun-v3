@@ -5,6 +5,30 @@ import { Router, push } from '@keenmate/svelte-spa-router';
 import { configureRouter, redirectUnknownRoute, routes } from './router';
 import { i18n } from '../i18n/index.svelte';
 
+// story 2.9: `Home`/settings routes mount through the real shell tree here —
+// stub the domain stores that would otherwise open a real Tauri Channel /
+// IPC call outside a Tauri runtime (same seam `App.test.ts` stubs).
+vi.mock('./stores/jobs.svelte', () => ({
+  jobsStore: {
+    jobs: new Map(),
+    resultSeq: 0,
+    synced: true,
+    status: 'subscribed',
+    subscribe: vi.fn(() => Promise.resolve()),
+    unsubscribe: vi.fn(),
+    cancel: vi.fn(),
+  },
+}));
+vi.mock('./stores/library.svelte', () => ({
+  libraryStore: {
+    sessions: [],
+    status: 'ready',
+    error: null,
+    reloadError: false,
+    load: vi.fn(() => Promise.resolve()),
+  },
+}));
+
 afterEach(() => cleanup());
 
 describe('history router runtime', () => {

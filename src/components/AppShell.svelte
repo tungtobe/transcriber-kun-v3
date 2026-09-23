@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { Snippet } from 'svelte';
+  import { onDestroy, onMount } from 'svelte';
   import { location, link, replace } from '@keenmate/svelte-spa-router';
   import {
     AlertTriangleIcon,
@@ -13,11 +14,13 @@
   import { appStore } from '../lib/stores/app.svelte';
   import { settingsStore } from '../lib/stores/settings.svelte';
   import { intakeStore } from '../lib/stores/intake.svelte';
+  import { jobsStore } from '../lib/stores/jobs.svelte';
   import { onDragDropEvent, type DragDropEvent } from '../lib/dragdrop';
   import { i18n } from '../i18n/index.svelte';
   import type { Theme } from '../lib/bindings';
   import CloseConfirm from './CloseConfirm.svelte';
   import DropOverlay from './DropOverlay.svelte';
+  import JobCard from './JobCard.svelte';
 
   let { children }: { children?: Snippet } = $props();
 
@@ -37,6 +40,16 @@
   );
 
   let dragging = $state(false);
+
+  // Card job thu gọn ở sidebar nhìn thấy từ mọi màn (spec Always) —
+  // `jobsStore` là đếm tham chiếu nên subscribe suốt vòng đời shell không
+  // xoá state của bất kỳ subscriber nào khác (Home, `/session/:id`).
+  onMount(() => {
+    void jobsStore.subscribe();
+  });
+  onDestroy(() => {
+    jobsStore.unsubscribe();
+  });
 
   $effect(() => {
     if (consentRestricted && currentPath !== '/onboarding' && currentPath !== '/settings/about') {
@@ -130,13 +143,9 @@
       </a>
     </nav>
 
-    <section class="job-placeholder" aria-label={i18n.t('app.shell.runningJobs')}>
-      <div class="job-heading">
-        <span>{i18n.t('app.shell.runningJobs')}</span>
-        <span class="job-count">0</span>
-      </div>
-      <p>{i18n.t('app.shell.noRunningJobs')}</p>
-    </section>
+    <div class="job-card-slot">
+      <JobCard variant="compact" />
+    </div>
 
     <div class="sidebar-spacer"></div>
 
@@ -261,8 +270,7 @@
   .brand-caption,
   .header-kicker,
   .version-label,
-  .version-value,
-  .job-placeholder p {
+  .version-value {
     margin: 0;
   }
 
@@ -314,40 +322,8 @@
     opacity: 0.45;
   }
 
-  .job-placeholder {
+  .job-card-slot {
     margin-top: var(--space-6);
-    padding: var(--space-3);
-    border: 1px solid var(--color-border);
-    border-radius: var(--radius-lg);
-    background: var(--color-surface);
-  }
-
-  .job-heading {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    margin-bottom: var(--space-2);
-    color: var(--color-text-secondary);
-    font-size: var(--text-label-size);
-    font-weight: 600;
-  }
-
-  .job-count {
-    display: grid;
-    min-width: 20px;
-    min-height: 20px;
-    padding: 0 6px;
-    place-items: center;
-    border-radius: var(--radius-sm);
-    background: var(--color-surface-sunken);
-    font-family: var(--font-mono);
-    font-size: var(--text-help-size);
-    font-variant-numeric: tabular-nums;
-  }
-
-  .job-placeholder p {
-    color: var(--color-text-muted);
-    font-size: var(--text-help-size);
   }
 
   .sidebar-spacer {
