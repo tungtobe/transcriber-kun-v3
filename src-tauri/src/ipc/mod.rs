@@ -10,17 +10,42 @@ mod spike_channel;
 
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+use specta::Type;
 use tauri::Manager;
 use tauri_specta::{collect_commands, collect_events, Builder, Event};
 
 use crate::consent::{self, ConsentPolicy};
 use crate::core::error::{AppError, Code};
-use crate::db::Db;
+use crate::core::id::{JobId, SessionId};
+use crate::db::{repo, Db};
 use crate::diagnostics::{self, DiagnosticsSummary};
 use crate::gemini::{CancellationToken, ConsentSnapshot, KeyTestResult, ModelInfo, ModelKind};
+use crate::library;
 use crate::secrets::{KeyId, KeyMetadata};
 use crate::settings::{self, Settings, SettingsChanged};
+use crate::transcribe::job::{CancelOutcome, JobEvent};
+use crate::transcribe::registry;
 use boot::AppState;
+
+/// Phát khi cửa sổ chính bị yêu cầu đóng trong lúc registry bận (spec Design
+/// Notes: "bận → emit `CloseRequested`") — UI hỏi xác nhận, gọi
+/// `app_close_confirm` nếu người dùng đồng ý huỷ sạch rồi thoát.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, tauri_specta::Event)]
+pub struct CloseRequested;
+
+/// Chạy một closure blocking trên `spawn_blocking`, gộp lỗi join thành
+/// `AppError` category `storage` — dùng cho những command story 2.4 có
+/// nhiều bước chạm DB/OS tuần tự (Code Map: mọi I/O chặn chỉ qua
+/// `spawn_blocking`, không có `rt-multi-thread`/`fs`).
+async fn blocking<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T, AppError> + Send + 'static,
+) -> Result<T, AppError> {
+    tauri::async_runtime::spawn_blocking(f)
+        .await
+        .map_err(|err| AppError::new(Code::Storage, err.to_string()))
+        .and_then(|inner| inner)
+}
 
 /// Trả về version của app. Nguồn duy nhất là `Cargo.toml`
 /// (`CARGO_PKG_VERSION`, đọc lúc biên dịch) — không có nơi thứ hai giữ version.
@@ -448,6 +473,266 @@ async fn diagnostics_export(
     track_ipc_error(&state.db, result).await
 }
 
+/// Kết quả `transcribe_start` (spec Always: thứ tự gate "Consent → hash + tra
+/// `source_hash` → có key dùng được → tạo Job").
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum TranscribeStartOutcome {
+    Job {
+        job_id: JobId,
+        session_id: SessionId,
+    },
+    Existing {
+        session_id: SessionId,
+    },
+}
+
+/// Pure gate-order decision for `transcribe_start` (spec Always: "Consent →
+/// hash + tra `source_hash` → có key dùng được → tạo Job"), factored out so
+/// it can be tested without a real `AppState`/DB/gateway: every I/O step is
+/// injected as a closure, so a test can assert both the *outcome* and that a
+/// later step's closure was never invoked once an earlier gate rejects (spec
+/// I/O Matrix "Trùng": "không Job, không Gemini"; "Chưa Consent / thiếu
+/// key": "Không tạo Job").
+///
+/// `compute_hash`/`lookup_existing_session`/`has_usable_key`/`start_job` are
+/// each called at most once, strictly in gate order, and only when every
+/// prior gate passed.
+async fn decide_transcribe_start<HashFut, LookupFut, KeyFut, StartFut>(
+    consent_current: bool,
+    compute_hash: impl FnOnce() -> HashFut,
+    lookup_existing_session: impl FnOnce(String) -> LookupFut,
+    has_usable_key: impl FnOnce() -> KeyFut,
+    start_job: impl FnOnce(String) -> StartFut,
+) -> Result<TranscribeStartOutcome, AppError>
+where
+    HashFut: std::future::Future<Output = Result<String, AppError>>,
+    LookupFut: std::future::Future<Output = Result<Option<SessionId>, AppError>>,
+    KeyFut: std::future::Future<Output = Result<bool, AppError>>,
+    StartFut: std::future::Future<Output = Result<(JobId, SessionId), AppError>>,
+{
+    if !consent_current {
+        return Err(AppError::new(
+            Code::Auth,
+            "Current consent is required before transcription can start",
+        ));
+    }
+
+    let hash = compute_hash().await?;
+
+    if let Some(session_id) = lookup_existing_session(hash.clone()).await? {
+        return Ok(TranscribeStartOutcome::Existing { session_id });
+    }
+
+    if !has_usable_key().await? {
+        return Err(AppError::new(
+            Code::Auth,
+            "No usable Gemini API key is configured",
+        ));
+    }
+
+    let (job_id, session_id) = start_job(hash).await?;
+    Ok(TranscribeStartOutcome::Job { job_id, session_id })
+}
+
+async fn transcribe_start_inner(
+    state: &AppState,
+    path: String,
+) -> Result<TranscribeStartOutcome, AppError> {
+    let db = state.db.clone()?;
+    let settings = blocking({
+        let db = db.clone();
+        move || Ok(settings::load(&db))
+    })
+    .await?;
+
+    let consent =
+        ConsentSnapshot::new(settings.consent_accepted_version, settings.consent_declined);
+    let source_path = std::path::PathBuf::from(&path);
+    let source_name = source_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned());
+    let hash_path = source_path.clone();
+    let lookup_db = db.clone();
+    let secrets = state.secrets.clone();
+    let jobs = state.jobs.clone();
+    let model = settings.transcribe_model.clone();
+
+    decide_transcribe_start(
+        consent.is_current(),
+        move || blocking(move || crate::media::sha256_file(&hash_path)),
+        move |hash: String| {
+            blocking(move || {
+                lookup_db
+                    .with_connection(|conn| Ok(repo::sessions::find_by_source_hash(conn, &hash)?))
+            })
+        },
+        move || async move {
+            let keys = blocking(move || secrets.list()).await?;
+            Ok(!keys.is_empty())
+        },
+        move |hash: String| async move {
+            let jobs = jobs?;
+            jobs.start(registry::StartParams {
+                source_path,
+                source_hash: hash,
+                source_name,
+                model,
+                consent,
+            })
+            .await
+        },
+    )
+    .await
+}
+
+/// Bắt đầu transcribe một file (spec Always: thứ tự gate đầy đủ nằm ở
+/// [`transcribe_start_inner`]). `path` là đường dẫn tuyệt đối do caller cung
+/// cấp — story này không mở dialog/nhận kéo thả (2.8/2.9 sẽ gọi lệnh này với
+/// đường dẫn đã chọn).
+#[tauri::command]
+#[specta::specta]
+async fn transcribe_start(
+    state: tauri::State<'_, AppState>,
+    path: String,
+) -> Result<TranscribeStartOutcome, AppError> {
+    let result = transcribe_start_inner(&state, path).await;
+    track_ipc_error(&state.db, result).await
+}
+
+/// Đăng ký một Channel nhận snapshot rồi các `JobEvent` tiếp theo (spec
+/// Always: "snapshot và đăng ký Channel trong cùng một lệnh actor").
+#[tauri::command]
+#[specta::specta]
+async fn jobs_subscribe(
+    state: tauri::State<'_, AppState>,
+    on_event: tauri::ipc::Channel<JobEvent>,
+) -> Result<(), AppError> {
+    let result = async {
+        let jobs = state.jobs.clone()?;
+        jobs.subscribe(on_event).await
+    }
+    .await;
+    track_ipc_error(&state.db, result).await
+}
+
+/// Huỷ một Job — xem [`crate::transcribe::job::CancelOutcome`] cho ý nghĩa
+/// kết quả (spec I/O Matrix "Huỷ": "Cancel đến sau commit -> trả kết quả
+/// hoàn tất").
+#[tauri::command]
+#[specta::specta]
+async fn jobs_cancel(
+    state: tauri::State<'_, AppState>,
+    job_id: JobId,
+) -> Result<CancelOutcome, AppError> {
+    let result = async {
+        let jobs = state.jobs.clone()?;
+        jobs.cancel(job_id).await
+    }
+    .await;
+    track_ipc_error(&state.db, result).await
+}
+
+/// Kết quả tra `id` của route `/session/:id` — có thể là Job đang chạy/chờ
+/// (registry cấp `session_id` trước khi commit), một Phiên đã lưu, hay không
+/// còn gì (spec I/O Matrix "`/session/:id`").
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum SessionLookup {
+    Job {
+        job_id: JobId,
+        session_id: SessionId,
+    },
+    Session {
+        session_id: SessionId,
+        title: String,
+        duration_sec: f64,
+        status: String,
+    },
+    NotFound,
+}
+
+async fn library_session_get_inner(
+    state: &AppState,
+    id: String,
+) -> Result<SessionLookup, AppError> {
+    let Ok(session_id) = SessionId::try_from(id.as_str()) else {
+        return Ok(SessionLookup::NotFound);
+    };
+
+    if let Ok(jobs) = state.jobs.clone() {
+        let snapshot = jobs.snapshot().await?;
+        if let Some(job) = snapshot
+            .into_iter()
+            .find(|job| job.session_id == session_id)
+        {
+            return Ok(SessionLookup::Job {
+                job_id: job.job_id,
+                session_id,
+            });
+        }
+    }
+
+    let db = state.db.clone()?;
+    let summary = blocking(move || library::store::get(&db, session_id)).await?;
+    Ok(match summary {
+        Some(summary) => SessionLookup::Session {
+            session_id: summary.session_id,
+            title: summary.title,
+            duration_sec: summary.duration_sec,
+            status: summary.status,
+        },
+        None => SessionLookup::NotFound,
+    })
+}
+
+/// Tra `id` (Job hoặc Phiên) cho route `/session/:id`.
+#[tauri::command]
+#[specta::specta]
+async fn library_session_get(
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<SessionLookup, AppError> {
+    let result = library_session_get_inner(&state, id).await;
+    track_ipc_error(&state.db, result).await
+}
+
+/// Người dùng xác nhận đóng app khi registry đang bận (spec Design Notes:
+/// "đồng ý → huỷ sạch rồi thoát"): huỷ mọi Job hiện có, chờ tối đa ~4 s để
+/// mỗi Job dọn xong (huỷ có hiệu lực ≤ 2 s — spec Always), rồi thoát tiến
+/// trình thật sự bất kể kết quả chờ, vì người dùng đã đồng ý đóng.
+#[tauri::command]
+#[specta::specta]
+async fn app_close_confirm(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), AppError> {
+    if let Ok(jobs) = state.jobs.clone() {
+        if let Ok(pending) = jobs.snapshot().await {
+            for job in &pending {
+                let _ = jobs.cancel(job.job_id).await;
+            }
+        }
+        for _ in 0..40 {
+            match jobs.snapshot().await {
+                Ok(remaining) if remaining.is_empty() => break,
+                _ => {}
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+    app.exit(0);
+    Ok(())
+}
+
 /// Danh sách command/event production — nguồn duy nhất, dùng chung cho
 /// `lib.rs` (đăng ký `invoke_handler`/`mount_events` thật) và test
 /// `export_bindings` (sinh `src/lib/bindings.ts`). Không đăng ký gì từ
@@ -468,9 +753,14 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             keys_test,
             diagnostics_summary,
             diagnostics_clear_logs,
-            diagnostics_export
+            diagnostics_export,
+            transcribe_start,
+            jobs_subscribe,
+            jobs_cancel,
+            library_session_get,
+            app_close_confirm
         ])
-        .events(collect_events![SettingsChanged])
+        .events(collect_events![SettingsChanged, CloseRequested])
 }
 
 #[cfg(test)]
@@ -636,5 +926,165 @@ mod tests {
                 .count,
             1
         );
+    }
+
+    // `decide_transcribe_start` — spec Always gate order "Consent → hash +
+    // tra `source_hash` → có key dùng được → tạo Job" (I/O Matrix "Trùng",
+    // "Chưa Consent / thiếu key"). Each closure below increments a counter
+    // so a test can assert a later gate's step was never reached once an
+    // earlier gate decided the outcome — no `AppState`/DB/gateway needed.
+
+    fn counting_hash(
+        count: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    ) -> impl FnOnce() -> std::future::Ready<Result<String, AppError>> {
+        move || {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(Ok("hash-123".to_string()))
+        }
+    }
+
+    fn counting_lookup(
+        count: std::sync::Arc<std::sync::atomic::AtomicU32>,
+        existing: Option<SessionId>,
+    ) -> impl FnOnce(String) -> std::future::Ready<Result<Option<SessionId>, AppError>> {
+        move |_hash: String| {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(Ok(existing))
+        }
+    }
+
+    fn counting_key_check(
+        count: std::sync::Arc<std::sync::atomic::AtomicU32>,
+        has_key: bool,
+    ) -> impl FnOnce() -> std::future::Ready<Result<bool, AppError>> {
+        move || {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(Ok(has_key))
+        }
+    }
+
+    fn counting_start(
+        count: std::sync::Arc<std::sync::atomic::AtomicU32>,
+        job_id: JobId,
+        session_id: SessionId,
+    ) -> impl FnOnce(String) -> std::future::Ready<Result<(JobId, SessionId), AppError>> {
+        move |_hash: String| {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(Ok((job_id, session_id)))
+        }
+    }
+
+    #[tokio::test]
+    async fn decide_transcribe_start_missing_consent_never_computes_hash_or_starts_a_job() {
+        let hash_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let lookup_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let key_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let start_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+        let result = decide_transcribe_start(
+            false,
+            counting_hash(hash_calls.clone()),
+            counting_lookup(lookup_calls.clone(), None),
+            counting_key_check(key_calls.clone(), true),
+            counting_start(start_calls.clone(), JobId::new(), SessionId::new()),
+        )
+        .await;
+
+        let err = result.expect_err("thiếu consent phải trả lỗi");
+        assert_eq!(err.category, Category::Auth);
+        assert_eq!(hash_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(lookup_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(key_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(start_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn decide_transcribe_start_duplicate_hash_returns_existing_without_key_check_or_job() {
+        let hash_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let lookup_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let key_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let start_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let existing_session = SessionId::new();
+
+        let result = decide_transcribe_start(
+            true,
+            counting_hash(hash_calls.clone()),
+            counting_lookup(lookup_calls.clone(), Some(existing_session)),
+            counting_key_check(key_calls.clone(), true),
+            counting_start(start_calls.clone(), JobId::new(), SessionId::new()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result,
+            TranscribeStartOutcome::Existing {
+                session_id: existing_session
+            }
+        );
+        assert_eq!(hash_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(lookup_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            key_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "trùng hash không được kiểm key"
+        );
+        assert_eq!(
+            start_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "trùng hash không được tạo Job"
+        );
+    }
+
+    #[tokio::test]
+    async fn decide_transcribe_start_no_usable_key_never_starts_a_job() {
+        let hash_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let lookup_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let key_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let start_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+        let result = decide_transcribe_start(
+            true,
+            counting_hash(hash_calls.clone()),
+            counting_lookup(lookup_calls.clone(), None),
+            counting_key_check(key_calls.clone(), false),
+            counting_start(start_calls.clone(), JobId::new(), SessionId::new()),
+        )
+        .await;
+
+        let err = result.expect_err("thiếu key phải trả lỗi");
+        assert_eq!(err.category, Category::Auth);
+        assert_eq!(key_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            start_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "thiếu key không được tạo Job"
+        );
+    }
+
+    #[tokio::test]
+    async fn decide_transcribe_start_every_gate_passing_creates_the_job() {
+        let hash_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let lookup_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let key_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let start_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let job_id = JobId::new();
+        let session_id = SessionId::new();
+
+        let result = decide_transcribe_start(
+            true,
+            counting_hash(hash_calls.clone()),
+            counting_lookup(lookup_calls.clone(), None),
+            counting_key_check(key_calls.clone(), true),
+            counting_start(start_calls.clone(), job_id, session_id),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, TranscribeStartOutcome::Job { job_id, session_id });
+        assert_eq!(hash_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(lookup_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(key_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(start_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

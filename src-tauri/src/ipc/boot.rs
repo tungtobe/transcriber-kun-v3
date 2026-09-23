@@ -11,6 +11,7 @@ use crate::db::Db;
 use crate::gemini::keys::{KeyPoolHandle, KeyProvider, SystemClock};
 use crate::gemini::GeminiGateway;
 use crate::secrets::{NativeCredentialStore, SecretService};
+use crate::transcribe::registry::{self, GatewayTranscriber, JobRegistryHandle};
 
 /// State managed toàn app. `db` là `Err` khi thư mục dữ liệu không mở được —
 /// app vẫn khởi động bình thường, mọi command chạm DB trả lại đúng lỗi này
@@ -22,6 +23,11 @@ pub struct AppState {
     /// One process-wide HTTP client/gateway. A client-construction failure is
     /// retained as a typed error so boot still reaches the UI.
     pub gateway: Result<Arc<GeminiGateway>, AppError>,
+    /// Story 2.4: the one in-memory sequential Job queue for file
+    /// transcription. `Err` only when `db`/`gateway` themselves failed to
+    /// initialize — `transcribe_start` surfaces that same storage error
+    /// instead of ever touching a registry built on a broken foundation.
+    pub jobs: Result<JobRegistryHandle, AppError>,
     // Giữ sống suốt vòng đời app — drop sớm sẽ ngắt worker ghi log không
     // đồng bộ của `tracing-appender`. Không đọc trực tiếp ở đâu khác nên
     // đặt `_` để không bị cảnh báo "chưa dùng", nhưng vẫn public để test có
@@ -96,11 +102,28 @@ pub fn boot<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
         tracing::error!(error = %err, "không khởi tạo được Gemini gateway");
     }
 
+    // Story 2.4: one `JobRegistry` actor for the process, rooted at the same
+    // `app_data_dir` as `db`/`library::store::reconcile` above (so staging
+    // lives under `media/.staging` next to published Proxy media). Both `db`
+    // and `gateway` must already be usable — a registry built on a broken DB
+    // or gateway could never commit or transcribe anything anyway.
+    let jobs = match (&db, &gateway, app.path().app_data_dir()) {
+        (Ok(db), Ok(gateway), Ok(data_dir)) => {
+            let transcriber = Arc::new(GatewayTranscriber::new(gateway.clone()));
+            let (handle, actor) = registry::channel(db.clone(), data_dir, transcriber);
+            tauri::async_runtime::spawn(actor.run());
+            Ok(handle)
+        }
+        (Err(err), _, _) | (_, Err(err), _) => Err(err.clone()),
+        (_, _, Err(err)) => Err(AppError::new(Code::Storage, err.to_string())),
+    };
+
     AppState {
         db,
         secrets,
         key_pool,
         gateway,
+        jobs,
         _log_guard: log_guard,
     }
 }

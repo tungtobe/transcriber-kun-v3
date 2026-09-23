@@ -52,6 +52,31 @@ macro_rules! uuid_v7_id {
                 Ok(Self(parsed))
             }
         }
+
+        // `uuid` không bật feature `serde` (Cargo.toml chỉ bật `v7`), nên
+        // (de)serialize thủ công qua chuỗi — cùng con đường với `Display`/
+        // `TryFrom<&str>` ở trên, để một giá trị lỗi (không phải UUIDv7) bị
+        // từ chối giống hệt lúc parse trực tiếp.
+        impl serde::Serialize for $name {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.serialize_str(&self.0.to_string())
+            }
+        }
+
+        impl<'de> serde::Deserialize<'de> for $name {
+            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                let raw = String::deserialize(deserializer)?;
+                Self::try_from(raw.as_str()).map_err(serde::de::Error::custom)
+            }
+        }
+
+        // Xuất sang TypeScript như một chuỗi opaque — khớp đúng hình dạng
+        // JSON thật ở trên (spec: id qua IPC là chuỗi UUIDv7).
+        impl specta::Type for $name {
+            fn definition(types: &mut specta::Types) -> specta::datatype::DataType {
+                <String as specta::Type>::definition(types)
+            }
+        }
     };
 }
 

@@ -20,6 +20,7 @@ pub mod settings;
 pub mod transcribe;
 
 use tauri::Manager;
+use tauri_specta::Event;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -33,6 +34,35 @@ pub fn run() {
             let state = ipc::boot::boot(app.handle());
             app.manage(state);
             Ok(())
+        })
+        // Story 2.4 Design Notes: "Đóng app: luôn `prevent_close`, hỏi
+        // registry async; rảnh → thoát, bận → emit `CloseRequested`" — the OS
+        // close request always arrives synchronously, but whether a Job is
+        // running is only knowable by asking the registry actor, which is
+        // async; `prevent_close` buys the time for that async check.
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let window = window.clone();
+                tauri::async_runtime::spawn(async move {
+                    let state = window.state::<ipc::boot::AppState>();
+                    let busy = match &state.jobs {
+                        Ok(jobs) => jobs
+                            .snapshot()
+                            .await
+                            .map(|jobs| !jobs.is_empty())
+                            .unwrap_or(false),
+                        Err(_) => false,
+                    };
+                    if busy {
+                        if let Err(err) = ipc::CloseRequested.emit(&window) {
+                            tracing::warn!(error = %err, "phát event CloseRequested thất bại");
+                        }
+                    } else {
+                        window.app_handle().exit(0);
+                    }
+                });
+            }
         })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

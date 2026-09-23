@@ -1,10 +1,18 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 
 const appVersion = vi.fn();
+const appCloseConfirm = vi.fn();
+const closeRequestedListen = vi.fn();
 
 vi.mock('../bindings', () => ({
   commands: {
     appVersion: (...args: unknown[]) => appVersion(...args),
+    appCloseConfirm: (...args: unknown[]) => appCloseConfirm(...args),
+  },
+  events: {
+    closeRequested: {
+      listen: (...args: unknown[]) => closeRequestedListen(...args),
+    },
   },
 }));
 
@@ -12,6 +20,8 @@ describe('store app', () => {
   beforeEach(() => {
     vi.resetModules();
     appVersion.mockReset();
+    appCloseConfirm.mockReset();
+    closeRequestedListen.mockReset();
   });
 
   it('chuyển sang trạng thái ok khi binding trả version', async () => {
@@ -40,5 +50,29 @@ describe('store app', () => {
     await appStore.loadVersion();
 
     expect(appStore.version).toEqual({ status: 'error', error: null });
+  });
+
+  it('listenForCloseRequested wires the raw event to a plain callback', async () => {
+    const unlisten = vi.fn();
+    closeRequestedListen.mockImplementation((cb: (event: unknown) => void) => {
+      cb({ event: 'close-requested', payload: null } as never);
+      return Promise.resolve(unlisten);
+    });
+    const { appStore } = await import('./app.svelte');
+    const callback = vi.fn();
+
+    const returned = await appStore.listenForCloseRequested(callback);
+
+    expect(callback).toHaveBeenCalledTimes(1);
+    expect(returned).toBe(unlisten);
+  });
+
+  it('confirmClose calls appCloseConfirm', async () => {
+    appCloseConfirm.mockResolvedValue({ status: 'ok', data: null });
+    const { appStore } = await import('./app.svelte');
+
+    await appStore.confirmClose();
+
+    expect(appCloseConfirm).toHaveBeenCalledTimes(1);
   });
 });

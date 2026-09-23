@@ -163,6 +163,12 @@ fn publish_proxy(
 /// `Err` (staging không tạo được Proxy) được xử lý giống một lỗi publish:
 /// commit vẫn tiếp tục với `proxy_ext = NULL`.
 ///
+/// `session_id` do caller cấp (story 2.4: `JobRegistry` cấp trước
+/// `session_id` dự kiến ngay lúc nhận Job, dùng cho tiến độ/route
+/// `/session/:id` trước khi commit thật sự xảy ra) — hàm này không tự sinh
+/// id nữa, chỉ dùng đúng id được truyền vào (spec Tasks: "`commit_file_session`
+/// nhận `session_id` từ caller").
+///
 /// DB lỗi (kể cả `source_hash` trùng — spec I/O Matrix "Trùng hash") gỡ luôn
 /// Proxy vừa publish và trả `Err`, không còn dòng DB nửa vời nào (transaction
 /// tự rollback qua `Drop` khi closure trả `Err` trước `commit()`). Thành công
@@ -172,10 +178,10 @@ pub fn commit_file_session(
     db: &Db,
     root: &Path,
     job_id: JobId,
+    session_id: SessionId,
     draft: FileSessionDraft,
     staged_proxy: Result<std::path::PathBuf, AppError>,
 ) -> Result<CommitOutcome, AppError> {
-    let session_id = SessionId::new();
     let transcript_id = TranscriptId::new();
     let now = now_ms();
 
@@ -243,6 +249,32 @@ pub fn commit_file_session(
     Ok(CommitOutcome {
         session_id,
         proxy_error,
+    })
+}
+
+/// Tóm tắt một Phiên đã lưu — dùng bởi route `/session/:id` (story 2.4) khi
+/// `id` không khớp Job nào đang chạy trong `JobRegistry`: đủ để hiển thị tên
+/// Phiên, không phải toàn bộ `SessionRow`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionSummary {
+    pub session_id: SessionId,
+    pub title: String,
+    pub duration_sec: f64,
+    pub status: String,
+}
+
+/// Đọc tóm tắt một Phiên theo id, `None` nếu không còn tồn tại (spec I/O
+/// Matrix "`/session/:id`": "Phiên đã lưu / không còn").
+pub fn get(db: &Db, session_id: SessionId) -> Result<Option<SessionSummary>, AppError> {
+    db.with_connection(|conn| {
+        Ok(
+            repo::sessions::get(conn, session_id)?.map(|row| SessionSummary {
+                session_id: row.id,
+                title: row.title,
+                duration_sec: row.duration_sec,
+                status: row.status,
+            }),
+        )
     })
 }
 
@@ -489,6 +521,7 @@ mod tests {
             &db,
             root.path(),
             job_id,
+            SessionId::new(),
             sample_draft(Some("hash-a")),
             Ok(staged),
         )
@@ -528,6 +561,7 @@ mod tests {
             &db,
             root.path(),
             job_id,
+            SessionId::new(),
             draft,
             Err(storage_error("no proxy")),
         )
@@ -562,6 +596,7 @@ mod tests {
             &db,
             root.path(),
             job_id,
+            SessionId::new(),
             draft,
             Err(storage_error("no proxy")),
         )
@@ -584,6 +619,7 @@ mod tests {
             &db,
             root.path(),
             job_id,
+            SessionId::new(),
             sample_draft(None),
             Err(storage_error("staging không tạo được proxy")),
         )
@@ -606,7 +642,14 @@ mod tests {
         let staged = stage_fake_proxy(root.path(), job_id);
 
         fault::set(Some(fault::Point::PublishWrite));
-        let result = commit_file_session(&db, root.path(), job_id, sample_draft(None), Ok(staged));
+        let result = commit_file_session(
+            &db,
+            root.path(),
+            job_id,
+            SessionId::new(),
+            sample_draft(None),
+            Ok(staged),
+        );
         fault::set(None);
 
         let outcome = result.unwrap();
@@ -626,7 +669,14 @@ mod tests {
         let staged = stage_fake_proxy(root.path(), job_id);
 
         fault::set(Some(fault::Point::PublishRename));
-        let result = commit_file_session(&db, root.path(), job_id, sample_draft(None), Ok(staged));
+        let result = commit_file_session(
+            &db,
+            root.path(),
+            job_id,
+            SessionId::new(),
+            sample_draft(None),
+            Ok(staged),
+        );
         fault::set(None);
 
         let outcome = result.unwrap();
@@ -644,6 +694,7 @@ mod tests {
             &db,
             root.path(),
             job_a,
+            SessionId::new(),
             sample_draft(Some("dup")),
             Ok(staged_a),
         )
@@ -655,6 +706,7 @@ mod tests {
             &db,
             root.path(),
             job_b,
+            SessionId::new(),
             sample_draft(Some("dup")),
             Ok(staged_b),
         )
@@ -686,6 +738,7 @@ mod tests {
             &db,
             root.path(),
             job_id,
+            SessionId::new(),
             sample_draft(Some("x")),
             Ok(staged),
         );
@@ -721,6 +774,31 @@ mod tests {
     }
 
     #[test]
+    fn get_returns_summary_for_a_committed_session_and_none_when_missing() {
+        let root = tempdir().unwrap();
+        let db = open_db(root.path());
+        let job_id = JobId::new();
+        let session_id = SessionId::new();
+        let outcome = commit_file_session(
+            &db,
+            root.path(),
+            job_id,
+            session_id,
+            sample_draft(Some("summary-hash")),
+            Err(storage_error("no proxy")),
+        )
+        .unwrap();
+        assert_eq!(outcome.session_id, session_id);
+
+        let summary = get(&db, session_id).unwrap().unwrap();
+        assert_eq!(summary.session_id, session_id);
+        assert_eq!(summary.title, "cuộc họp");
+        assert_eq!(summary.status, "complete");
+
+        assert!(get(&db, SessionId::new()).unwrap().is_none());
+    }
+
+    #[test]
     fn discard_staging_failure_after_successful_commit_is_only_logged_not_propagated() {
         let root = tempdir().unwrap();
         let db = open_db(root.path());
@@ -732,6 +810,7 @@ mod tests {
             &db,
             root.path(),
             job_id,
+            SessionId::new(),
             sample_draft(Some("y")),
             Ok(staged),
         );
@@ -756,6 +835,7 @@ mod tests {
             &db,
             root.path(),
             job_id,
+            SessionId::new(),
             sample_draft(Some("z")),
             Ok(staged),
         )
@@ -800,6 +880,7 @@ mod tests {
             &db,
             root.path(),
             job_id,
+            SessionId::new(),
             sample_draft(Some("w")),
             Ok(staged),
         )
@@ -890,6 +971,7 @@ mod tests {
             &db,
             root.path(),
             job_id,
+            SessionId::new(),
             sample_draft(Some("v")),
             Ok(staged),
         )
@@ -917,6 +999,7 @@ mod tests {
             &db,
             root.path(),
             job_id,
+            SessionId::new(),
             sample_draft(Some("u")),
             Ok(staged),
         )
@@ -941,6 +1024,7 @@ mod tests {
             &db,
             root.path(),
             job_id,
+            SessionId::new(),
             sample_draft(Some("t")),
             Ok(staged),
         )

@@ -13,6 +13,8 @@ const mocks = vi.hoisted(() => ({
   },
   appStore: {
     version: { status: 'ok' as const, version: '0.1.0' },
+    listenForCloseRequested: vi.fn(() => Promise.resolve(() => {})),
+    confirmClose: vi.fn(() => Promise.resolve()),
   },
 }));
 

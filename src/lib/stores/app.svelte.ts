@@ -3,7 +3,7 @@
 // `error` mang đúng kiểu `AppError` (category/code/detailRedacted) sinh từ
 // story 1.2 khi có; `null` khi lỗi không phải một `AppError` có cấu trúc
 // (invoke ném exception thẳng, ví dụ IPC chưa sẵn sàng).
-import { commands, type AppError } from '../bindings';
+import { commands, events, type AppError } from '../bindings';
 
 export type AppVersionState =
   | { status: 'loading' }
@@ -27,11 +27,29 @@ function createAppStore() {
     }
   }
 
+  /**
+   * Story 2.4: `CloseRequested` fires when the OS close was intercepted
+   * because the Job registry is busy (spec Design Notes). `CloseConfirm`
+   * calls this once on mount; the returned unlisten function must be called
+   * on unmount.
+   */
+  function listenForCloseRequested(callback: () => void): Promise<() => void> {
+    return events.closeRequested.listen(() => callback());
+  }
+
+  /** The user confirmed closing while Jobs were running — cancel everything
+   * and exit (spec Design Notes: "đồng ý → huỷ sạch rồi thoát"). */
+  async function confirmClose(): Promise<void> {
+    await commands.appCloseConfirm();
+  }
+
   return {
     get version() {
       return version;
     },
     loadVersion,
+    listenForCloseRequested,
+    confirmClose,
   };
 }
 

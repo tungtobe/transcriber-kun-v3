@@ -1,10 +1,12 @@
 //! File transcription through ordinary Gemini generateContent models.
 //! Live Translate has its own WebSocket pipeline in the Live epic.
 
+use std::sync::Arc;
+
 use serde_json::{json, Value};
 
 use crate::core::error::{AppError, Code};
-use crate::gemini::{CancellationToken, ConsentSnapshot, GeminiGateway};
+use crate::gemini::{CancellationToken, ConsentSnapshot, GeminiGateway, JobObserver};
 use crate::media::{serialize_transcribe_request, Chunk};
 
 use super::parser::{parse_general_response, ChunkTranscript};
@@ -113,8 +115,25 @@ pub async fn transcribe_chunk(
     consent: ConsentSnapshot,
     cancellation: CancellationToken,
 ) -> Result<ChunkTranscript, TranscribeFailure> {
+    transcribe_chunk_observed(gateway, model, chunk, consent, cancellation, None).await
+}
+
+/// Same contract as [`transcribe_chunk`], plus an optional progress observer
+/// threaded through to [`GeminiGateway::post_job_observed`] (story 2.4
+/// Tasks: "chuyển observer xuyên qua `transcribe_chunk`"). `observer: None`
+/// behaves exactly like [`transcribe_chunk`].
+pub async fn transcribe_chunk_observed(
+    gateway: &GeminiGateway,
+    model: &str,
+    chunk: &Chunk,
+    consent: ConsentSnapshot,
+    cancellation: CancellationToken,
+    observer: Option<Arc<dyn JobObserver>>,
+) -> Result<ChunkTranscript, TranscribeFailure> {
     let (path, body) = build_general_request(model, chunk)?;
-    let response = gateway.post_job(&path, body, consent, cancellation).await?;
+    let response = gateway
+        .post_job_observed(&path, body, consent, cancellation, observer)
+        .await?;
     parse_general_response(&response.body, chunk).map_err(Into::into)
 }
 
