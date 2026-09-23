@@ -34,6 +34,38 @@ pub enum UiLanguage {
     Ja,
 }
 
+/// Ngôn ngữ transcribe (story 2.6, không phải ngôn ngữ UI): `Auto` giữ
+/// nguyên hành vi tự phát hiện hiện có (prompt/request JSON byte-for-byte
+/// không đổi — spec Always); `Ja|Vi|En` thêm một câu chỉ định ngôn ngữ chính
+/// vào prompt (spec `transcribe::adapter::build_general_request`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, Type)]
+#[serde(rename_all = "lowercase")]
+pub enum TranscribeLanguage {
+    #[default]
+    Auto,
+    Ja,
+    Vi,
+    En,
+}
+
+impl TranscribeLanguage {
+    /// Mã lưu vào `transcripts.language` -- `None` (NULL) cho `auto` (spec
+    /// Always: "`transcripts.language` lưu mã ngôn ngữ đã chụp (`NULL` khi
+    /// `auto`)").
+    pub fn as_code(self) -> Option<&'static str> {
+        match self {
+            TranscribeLanguage::Auto => None,
+            TranscribeLanguage::Ja => Some("ja"),
+            TranscribeLanguage::Vi => Some("vi"),
+            TranscribeLanguage::En => Some("en"),
+        }
+    }
+}
+
+/// `chunkMinutes` mặc định (spec Approach: "mặc định 5") -- cũng là giá trị
+/// `load` fallback về khi khoá thiếu hoặc hỏng.
+const DEFAULT_CHUNK_MINUTES: u32 = 5;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
@@ -54,6 +86,19 @@ pub struct Settings {
     pub live_model: String,
     /// Free-text model name used by Memo.
     pub memo_model: String,
+    /// Độ dài Chunk khi transcribe file (phút), số nguyên >= 1 (spec
+    /// Boundaries Always). Job chụp giá trị này lúc nhận Job
+    /// (`transcribe_start`/`transcribe_rerun`) -- đổi Settings giữa chừng
+    /// không ảnh hưởng Job đang chạy/chờ.
+    pub chunk_minutes: u32,
+    /// Offset cộng vào timestamp hiển thị/export (giây), số nguyên >= 0 --
+    /// không có offset âm (spec quyết định). Thuần hiển thị: không bao giờ
+    /// ghi vào Segment/DB (spec Always) -- chỉ đọc qua `src/lib/time.ts` ở
+    /// frontend.
+    pub timestamp_offset_sec: u32,
+    /// Ngôn ngữ transcribe file/Live (không phải ngôn ngữ UI). Job chụp cùng
+    /// lúc với `chunk_minutes`/`model`.
+    pub transcribe_language: TranscribeLanguage,
 }
 
 /// Derived manually (not `#[derive(Default)]`) so the three model fields
@@ -73,6 +118,9 @@ impl Default for Settings {
             transcribe_model: DEFAULT_TRANSCRIBE_MODEL.to_string(),
             live_model: DEFAULT_LIVE_MODEL.to_string(),
             memo_model: DEFAULT_MEMO_MODEL.to_string(),
+            chunk_minutes: DEFAULT_CHUNK_MINUTES,
+            timestamp_offset_sec: 0,
+            transcribe_language: TranscribeLanguage::default(),
         }
     }
 }
@@ -90,6 +138,9 @@ const KEY_CONSENT_DECLINED: &str = "consentDeclined";
 const KEY_TRANSCRIBE_MODEL: &str = "transcribeModel";
 const KEY_LIVE_MODEL: &str = "liveModel";
 const KEY_MEMO_MODEL: &str = "memoModel";
+const KEY_CHUNK_MINUTES: &str = "chunkMinutes";
+const KEY_TIMESTAMP_OFFSET_SEC: &str = "timestampOffsetSec";
+const KEY_TRANSCRIBE_LANGUAGE: &str = "transcribeLanguage";
 
 /// Shared by `load`'s three model branches: missing key, corrupt JSON, and a
 /// parsed-but-blank string (e.g. a hand-edited DB row) all fall back to
@@ -188,6 +239,48 @@ pub fn load(db: &Db) -> Settings {
     let live_model = load_model_field(&raw, KEY_LIVE_MODEL, DEFAULT_LIVE_MODEL);
     let memo_model = load_model_field(&raw, KEY_MEMO_MODEL, DEFAULT_MEMO_MODEL);
 
+    // `chunk_minutes` fallback độc lập: một giá trị parse được nhưng < 1
+    // (không thể xảy ra qua `save`, nhưng có thể qua hàng bị sửa tay) fallback
+    // giống hệt JSON hỏng (spec Boundaries Always: "chunk_minutes là số
+    // nguyên >= 1").
+    let chunk_minutes = match raw.get(KEY_CHUNK_MINUTES) {
+        None => DEFAULT_CHUNK_MINUTES,
+        Some(value) => match serde_json::from_str::<u32>(value) {
+            Ok(parsed) if parsed >= 1 => parsed,
+            _ => {
+                tracing::warn!(
+                    key = KEY_CHUNK_MINUTES,
+                    "giá trị settings không parse được, dùng mặc định"
+                );
+                DEFAULT_CHUNK_MINUTES
+            }
+        },
+    };
+
+    // `u32` đã tự loại âm ở kiểu -- không cần kiểm ngưỡng thêm, chỉ fallback
+    // khi JSON hỏng.
+    let timestamp_offset_sec = match raw.get(KEY_TIMESTAMP_OFFSET_SEC) {
+        None => 0,
+        Some(value) => serde_json::from_str::<u32>(value).unwrap_or_else(|_| {
+            tracing::warn!(
+                key = KEY_TIMESTAMP_OFFSET_SEC,
+                "giá trị settings không parse được, dùng mặc định"
+            );
+            0
+        }),
+    };
+
+    let transcribe_language = match raw.get(KEY_TRANSCRIBE_LANGUAGE) {
+        None => TranscribeLanguage::default(),
+        Some(value) => serde_json::from_str::<TranscribeLanguage>(value).unwrap_or_else(|_| {
+            tracing::warn!(
+                key = KEY_TRANSCRIBE_LANGUAGE,
+                "giá trị settings không parse được, dùng mặc định"
+            );
+            TranscribeLanguage::default()
+        }),
+    };
+
     Settings {
         theme,
         ui_language,
@@ -197,6 +290,9 @@ pub fn load(db: &Db) -> Settings {
         transcribe_model,
         live_model,
         memo_model,
+        chunk_minutes,
+        timestamp_offset_sec,
+        transcribe_language,
     }
 }
 
@@ -213,6 +309,19 @@ fn require_non_blank_model(field: &str, value: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+/// Từ chối `chunkMinutes < 1` trước khi ghi (spec Boundaries Always: "Rust
+/// `settings::save` cũng từ chối (`Code::Format`)"). `timestampOffsetSec`
+/// không cần kiểm tương tự -- kiểu `u32` đã loại âm.
+fn require_min_chunk_minutes(value: u32) -> Result<(), AppError> {
+    if value < 1 {
+        return Err(AppError::new(
+            Code::Format,
+            "chunkMinutes phải là số nguyên lớn hơn hoặc bằng 1",
+        ));
+    }
+    Ok(())
+}
+
 /// Ghi toàn bộ settings trong một transaction (spec Boundaries). Lỗi ghi trả
 /// `AppError` category `storage`; người gọi (ipc) chỉ phát `SettingsChanged`
 /// khi hàm này trả `Ok`.
@@ -220,6 +329,7 @@ pub fn save(db: &Db, settings: &Settings) -> Result<(), AppError> {
     require_non_blank_model(KEY_TRANSCRIBE_MODEL, &settings.transcribe_model)?;
     require_non_blank_model(KEY_LIVE_MODEL, &settings.live_model)?;
     require_non_blank_model(KEY_MEMO_MODEL, &settings.memo_model)?;
+    require_min_chunk_minutes(settings.chunk_minutes)?;
 
     let theme_json = serde_json::to_string(&settings.theme)
         .map_err(|err| AppError::new(Code::Format, err.to_string()))?;
@@ -238,6 +348,12 @@ pub fn save(db: &Db, settings: &Settings) -> Result<(), AppError> {
         .map_err(|err| AppError::new(Code::Format, err.to_string()))?;
     let memo_model_json = serde_json::to_string(&settings.memo_model)
         .map_err(|err| AppError::new(Code::Format, err.to_string()))?;
+    let chunk_minutes_json = serde_json::to_string(&settings.chunk_minutes)
+        .map_err(|err| AppError::new(Code::Format, err.to_string()))?;
+    let timestamp_offset_sec_json = serde_json::to_string(&settings.timestamp_offset_sec)
+        .map_err(|err| AppError::new(Code::Format, err.to_string()))?;
+    let transcribe_language_json = serde_json::to_string(&settings.transcribe_language)
+        .map_err(|err| AppError::new(Code::Format, err.to_string()))?;
 
     db.with_connection(|conn| {
         Ok(repo::settings::upsert_many(
@@ -251,6 +367,9 @@ pub fn save(db: &Db, settings: &Settings) -> Result<(), AppError> {
                 (KEY_TRANSCRIBE_MODEL, transcribe_model_json),
                 (KEY_LIVE_MODEL, live_model_json),
                 (KEY_MEMO_MODEL, memo_model_json),
+                (KEY_CHUNK_MINUTES, chunk_minutes_json),
+                (KEY_TIMESTAMP_OFFSET_SEC, timestamp_offset_sec_json),
+                (KEY_TRANSCRIBE_LANGUAGE, transcribe_language_json),
             ],
         )?)
     })
@@ -742,5 +861,248 @@ mod tests {
         assert_eq!(loaded.transcribe_model, DEFAULT_TRANSCRIBE_MODEL);
         assert_eq!(loaded.live_model, DEFAULT_LIVE_MODEL);
         assert_eq!(loaded.memo_model, DEFAULT_MEMO_MODEL);
+    }
+
+    // Story 2.6: `chunkMinutes`/`timestampOffsetSec`/`transcribeLanguage`.
+
+    #[test]
+    fn default_settings_use_five_minute_chunks_zero_offset_and_auto_language() {
+        let defaults = Settings::default();
+        assert_eq!(defaults.chunk_minutes, 5);
+        assert_eq!(defaults.timestamp_offset_sec, 0);
+        assert_eq!(defaults.transcribe_language, TranscribeLanguage::Auto);
+    }
+
+    #[test]
+    fn transcribe_language_serializes_lowercase() {
+        assert_eq!(
+            serde_json::to_string(&TranscribeLanguage::Auto).unwrap(),
+            "\"auto\""
+        );
+        assert_eq!(
+            serde_json::to_string(&TranscribeLanguage::Ja).unwrap(),
+            "\"ja\""
+        );
+        assert_eq!(
+            serde_json::to_string(&TranscribeLanguage::Vi).unwrap(),
+            "\"vi\""
+        );
+        assert_eq!(
+            serde_json::to_string(&TranscribeLanguage::En).unwrap(),
+            "\"en\""
+        );
+    }
+
+    #[test]
+    fn transcribe_language_as_code_is_null_only_for_auto() {
+        assert_eq!(TranscribeLanguage::Auto.as_code(), None);
+        assert_eq!(TranscribeLanguage::Ja.as_code(), Some("ja"));
+        assert_eq!(TranscribeLanguage::Vi.as_code(), Some("vi"));
+        assert_eq!(TranscribeLanguage::En.as_code(), Some("en"));
+    }
+
+    #[test]
+    fn chunking_fields_round_trip() {
+        let db = open_db();
+        let expected = Settings {
+            chunk_minutes: 3,
+            timestamp_offset_sec: 3_600,
+            transcribe_language: TranscribeLanguage::Ja,
+            ..Default::default()
+        };
+
+        save(&db, &expected).unwrap();
+
+        assert_eq!(load(&db), expected);
+    }
+
+    #[test]
+    fn save_rejects_zero_chunk_minutes() {
+        let db = open_db();
+        let err = save(
+            &db,
+            &Settings {
+                chunk_minutes: 0,
+                ..Default::default()
+            },
+        )
+        .expect_err("chunkMinutes = 0 phải bị từ chối");
+
+        assert_eq!(err.category, Category::Format);
+    }
+
+    #[test]
+    fn save_rejecting_zero_chunk_minutes_does_not_write_any_row() {
+        let db = open_db();
+        let previously_saved = Settings {
+            chunk_minutes: 7,
+            ..Default::default()
+        };
+        save(&db, &previously_saved).unwrap();
+
+        let err = save(
+            &db,
+            &Settings {
+                chunk_minutes: 0,
+                ..Default::default()
+            },
+        )
+        .expect_err("phải từ chối trước khi ghi");
+        assert_eq!(err.category, Category::Format);
+
+        assert_eq!(load(&db), previously_saved);
+    }
+
+    #[test]
+    fn corrupt_chunk_minutes_falls_back_without_losing_other_fields() {
+        let db = open_db();
+        save(
+            &db,
+            &Settings {
+                theme: Theme::Dark,
+                chunk_minutes: 12,
+                timestamp_offset_sec: 42,
+                transcribe_language: TranscribeLanguage::Vi,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.with_connection(|conn| {
+            conn.execute(
+                "UPDATE settings SET value = 'not-json' WHERE key = 'chunkMinutes'",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(
+            load(&db),
+            Settings {
+                theme: Theme::Dark,
+                chunk_minutes: 5,
+                timestamp_offset_sec: 42,
+                transcribe_language: TranscribeLanguage::Vi,
+                ..Default::default()
+            }
+        );
+    }
+
+    /// A hand-edited row of `0` parses fine as a `u32` but is below the
+    /// `>= 1` floor -- `load` must fall back exactly like a parse failure
+    /// (spec Boundaries: "`chunkMinutes` là số nguyên >= 1"), since `save`
+    /// can never itself write such a row.
+    #[test]
+    fn zero_chunk_minutes_row_falls_back_to_default_like_corrupt_json() {
+        let db = open_db();
+        db.with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO settings (key, value) VALUES ('chunkMinutes', '0')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(load(&db).chunk_minutes, 5);
+    }
+
+    #[test]
+    fn corrupt_timestamp_offset_sec_falls_back_without_losing_other_fields() {
+        let db = open_db();
+        save(
+            &db,
+            &Settings {
+                timestamp_offset_sec: 120,
+                transcribe_language: TranscribeLanguage::En,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.with_connection(|conn| {
+            conn.execute(
+                "UPDATE settings SET value = 'not-json' WHERE key = 'timestampOffsetSec'",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(
+            load(&db),
+            Settings {
+                timestamp_offset_sec: 0,
+                transcribe_language: TranscribeLanguage::En,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn corrupt_transcribe_language_falls_back_without_losing_other_fields() {
+        let db = open_db();
+        save(
+            &db,
+            &Settings {
+                chunk_minutes: 9,
+                transcribe_language: TranscribeLanguage::Ja,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.with_connection(|conn| {
+            conn.execute(
+                "UPDATE settings SET value = 'not-json' WHERE key = 'transcribeLanguage'",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(
+            load(&db),
+            Settings {
+                chunk_minutes: 9,
+                transcribe_language: TranscribeLanguage::Auto,
+                ..Default::default()
+            }
+        );
+    }
+
+    /// An unknown language string (e.g. a future value from a newer build,
+    /// or a hand-edited row) must fall back like any other corrupt value,
+    /// never panic or propagate an error (spec I/O Matrix "Khoá hỏng").
+    #[test]
+    fn unknown_transcribe_language_string_falls_back_to_auto() {
+        let db = open_db();
+        db.with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO settings (key, value) VALUES ('transcribeLanguage', '\"ko\"')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(load(&db).transcribe_language, TranscribeLanguage::Auto);
+    }
+
+    #[test]
+    fn legacy_rows_default_missing_chunking_fields_without_changing_others() {
+        let db = open_db();
+        db.with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO settings (key, value) VALUES ('theme', '\"dark\"')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let loaded = load(&db);
+        assert_eq!(loaded.theme, Theme::Dark);
+        assert_eq!(loaded.chunk_minutes, 5);
+        assert_eq!(loaded.timestamp_offset_sec, 0);
+        assert_eq!(loaded.transcribe_language, TranscribeLanguage::Auto);
     }
 }
