@@ -6,10 +6,15 @@ describe('frontend router', () => {
     window.history.replaceState({}, '', '/home');
   });
 
-  it('registers only the Epic 1 routes and builds the typed settings path', async () => {
+  it('registers the Epic 1 routes plus story 2.4 /session/:id and builds the typed settings path', async () => {
     const { routes, routePaths } = await import('./router');
 
-    expect(Object.keys(routes)).toEqual(['/onboarding', '/home', '/settings/:group']);
+    expect(Object.keys(routes)).toEqual([
+      '/onboarding',
+      '/home',
+      '/settings/:group',
+      '/session/:id',
+    ]);
     expect(routePaths.settings({ group: 'gemini' })).toBe('/settings/gemini');
   });
 

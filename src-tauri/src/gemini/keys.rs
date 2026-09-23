@@ -87,6 +87,15 @@ pub struct KeyLease {
     priority: Priority,
 }
 
+impl KeyLease {
+    /// Attempt number for this lease, starting at 1. Exposed read-only so
+    /// callers (story 2.4 progress observer) can report it without touching
+    /// the actor's private retry bookkeeping.
+    pub fn attempt(&self) -> u8 {
+        self.attempt
+    }
+}
+
 impl std::fmt::Debug for KeyLease {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -255,6 +264,26 @@ impl KeyPoolHandle {
         response.await.map_err(|_| actor_error())?
     }
 
+    /// 1-based position of `key_id` in the actor's current key list, or
+    /// `None` if that key is no longer present. Used only to report a
+    /// non-identifying "key ordinal" to a [`super::JobObserver`] (story 2.4)
+    /// — never returns the key material or its opaque id.
+    pub async fn ordinal_of(&self, key_id: &KeyId) -> Option<u32> {
+        let (reply, response) = oneshot::channel();
+        if self
+            .commands
+            .send(Command::Ordinal {
+                key_id: key_id.clone(),
+                reply,
+            })
+            .await
+            .is_err()
+        {
+            return None;
+        }
+        response.await.ok().flatten()
+    }
+
     pub async fn cancel(&self, request_id: impl Into<String>) -> Result<(), AppError> {
         let (reply, response) = oneshot::channel();
         self.commands
@@ -301,6 +330,10 @@ enum Command {
     Cancel {
         request_id: String,
         reply: oneshot::Sender<()>,
+    },
+    Ordinal {
+        key_id: KeyId,
+        reply: oneshot::Sender<Option<u32>>,
     },
 }
 
@@ -478,6 +511,14 @@ impl KeyPoolActor {
                 self.requests.remove(&request_id);
                 self.cancel_pending(&request_id);
                 let _ = reply.send(());
+            }
+            Command::Ordinal { key_id, reply } => {
+                let ordinal = self
+                    .keys
+                    .iter()
+                    .position(|key| key.material.id == key_id)
+                    .map(|index| (index + 1) as u32);
+                let _ = reply.send(ordinal);
             }
         }
     }
@@ -1285,6 +1326,14 @@ mod tests {
             pool.acquire(Priority::Job).await.unwrap_err().code,
             Code::Auth
         );
+    }
+
+    #[tokio::test]
+    async fn ordinal_of_is_one_based_and_none_for_an_unknown_key() {
+        let (pool, _provider, _clock) = pool(vec![material("a", "A"), material("b", "B")]).await;
+        assert_eq!(pool.ordinal_of(&KeyId::from_opaque("a")).await, Some(1));
+        assert_eq!(pool.ordinal_of(&KeyId::from_opaque("b")).await, Some(2));
+        assert_eq!(pool.ordinal_of(&KeyId::from_opaque("z")).await, None);
     }
 
     #[test]

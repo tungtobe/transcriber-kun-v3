@@ -132,6 +132,24 @@ pub fn set_proxy_ext(
     Ok(())
 }
 
+/// Tra một Phiên theo `source_hash` chính xác (spec I/O Matrix "Trùng hash":
+/// `transcribe_start` gọi trước khi tạo Job — trùng thì trả `Existing
+/// { session_id }`, không tạo Job, không gọi Gemini). `source_hash` là
+/// `UNIQUE` khi khác `NULL` nên tối đa một dòng khớp.
+pub fn find_by_source_hash(
+    conn: &Connection,
+    source_hash: &str,
+) -> rusqlite::Result<Option<SessionId>> {
+    conn.query_row(
+        "SELECT id FROM sessions WHERE source_hash = ?1",
+        params![source_hash],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()?
+    .map(|id| parse_session_id(&id))
+    .transpose()
+}
+
 /// Đọc `(id, proxy_ext)` của mọi Phiên — dùng bởi `library::store::reconcile`
 /// để biết thư mục `media/<id>` nào có dòng DB tham chiếu và Proxy nào đang
 /// được tham chiếu, không cần toàn bộ cột khác của [`SessionRow`].
@@ -262,6 +280,23 @@ mod tests {
         let row = get(&conn, id).unwrap().unwrap();
         assert_eq!(row.proxy_ext, None);
         assert_eq!(row.updated_at, 2_000);
+    }
+
+    #[test]
+    fn find_by_source_hash_finds_the_exact_match_and_none_when_absent() {
+        let conn = open_migrated();
+        let a = SessionId::new();
+        insert(
+            &conn,
+            NewSession {
+                source_hash: Some("hash-a"),
+                ..sample(a)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(find_by_source_hash(&conn, "hash-a").unwrap(), Some(a));
+        assert_eq!(find_by_source_hash(&conn, "hash-missing").unwrap(), None);
     }
 
     #[test]

@@ -80,6 +80,23 @@ fn require_consent(snapshot: ConsentSnapshot) -> Result<(), AppError> {
     }
 }
 
+/// Progress signals surfaced during a transcribe Job's Gemini calls (story
+/// 2.4). All methods default to no-ops so a caller only implements what it
+/// needs; `post_job`/`transcribe_chunk` keep taking `Option<Arc<dyn
+/// JobObserver>>` and `None` keeps the exact previous behavior (spec Tasks:
+/// "`None` giữ hành vi cũ").
+pub trait JobObserver: Send + Sync {
+    /// `true` right before awaiting a key lease (initial acquire or a
+    /// quota/auth/server retry), `false` once that wait resolves (lease
+    /// obtained or a terminal error).
+    fn waiting_quota(&self, _waiting: bool) {}
+    /// 1-based position of the key currently leased, in listed order. Never
+    /// the key material or its opaque id.
+    fn key_in_use(&self, _ordinal: u32) {}
+    /// Attempt number for the current chunk request, starting at 1.
+    fn attempt(&self, _attempt: u32) {}
+}
+
 /// Model families exposed to the rest of the application. Filtering is
 /// performed from API capability metadata, never from a model alias/name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
@@ -143,7 +160,10 @@ impl CancellationToken {
         self.inner.cancelled.load(Ordering::Acquire)
     }
 
-    async fn cancelled(&self) {
+    /// Resolves once `cancel()` has been called. Public so a
+    /// `transcribe::registry::ChunkTranscriber` fake (story 2.4 tests) can
+    /// await cancellation directly instead of busy-polling `is_cancelled()`.
+    pub async fn cancelled(&self) {
         loop {
             let notified = self.inner.notify.notified();
             tokio::pin!(notified);
@@ -607,6 +627,21 @@ impl GeminiGateway {
         consent: ConsentSnapshot,
         cancellation: CancellationToken,
     ) -> Result<TransportResponse, AppError> {
+        self.post_job_observed(path, body, consent, cancellation, None)
+            .await
+    }
+
+    /// Same contract as [`Self::post_job`], plus optional progress signals
+    /// for a transcribe Job (story 2.4 Tasks). `observer: None` behaves
+    /// exactly like [`Self::post_job`].
+    pub async fn post_job_observed(
+        &self,
+        path: &str,
+        body: String,
+        consent: ConsentSnapshot,
+        cancellation: CancellationToken,
+        observer: Option<Arc<dyn JobObserver>>,
+    ) -> Result<TransportResponse, AppError> {
         require_consent(consent)?;
         validate_job_path(path)?;
         if body.len() >= MAX_TRANSCRIBE_REQUEST_BYTES {
@@ -620,13 +655,21 @@ impl GeminiGateway {
         let deadline = Instant::now() + TRANSCRIBE_CHUNK_TIMEOUT;
         let mut lease = {
             let budget = remaining(deadline)?;
+            if let Some(observer) = &observer {
+                observer.waiting_quota(true);
+            }
             let acquire = self.key_pool.acquire_with_budget(Priority::Job, budget);
             tokio::pin!(acquire);
-            tokio::select! {
-                result = &mut acquire => result?,
+            let result = tokio::select! {
+                result = &mut acquire => result,
                 _ = cancellation.cancelled() => return Err(cancelled_error()),
+            };
+            if let Some(observer) = &observer {
+                observer.waiting_quota(false);
             }
+            result?
         };
+        self.report_lease_acquired(&lease, &observer).await;
 
         loop {
             if cancellation.is_cancelled() {
@@ -650,6 +693,9 @@ impl GeminiGateway {
                 match outcome {
                     RequestOutcome::Quota | RequestOutcome::Auth | RequestOutcome::Server => {
                         let request_id = lease.request_id.clone();
+                        if let Some(observer) = &observer {
+                            observer.waiting_quota(true);
+                        }
                         let report = self.key_pool.report(lease, outcome);
                         tokio::pin!(report);
                         let reported = tokio::select! {
@@ -659,8 +705,14 @@ impl GeminiGateway {
                                 return Err(cancelled_error());
                             }
                         };
+                        if let Some(observer) = &observer {
+                            observer.waiting_quota(false);
+                        }
                         match reported {
-                            Ok(ReportAction::Retry(next)) => lease = next,
+                            Ok(ReportAction::Retry(next)) => {
+                                lease = next;
+                                self.report_lease_acquired(&lease, &observer).await;
+                            }
                             Ok(ReportAction::Complete) => return Err(error),
                             Err(report_error) => return Err(report_error),
                         }
@@ -676,6 +728,18 @@ impl GeminiGateway {
 
             self.key_pool.report(lease, RequestOutcome::Success).await?;
             return Ok(response);
+        }
+    }
+
+    async fn report_lease_acquired(
+        &self,
+        lease: &self::keys::KeyLease,
+        observer: &Option<Arc<dyn JobObserver>>,
+    ) {
+        let Some(observer) = observer else { return };
+        observer.attempt(u32::from(lease.attempt()));
+        if let Some(ordinal) = self.key_pool.ordinal_of(&lease.key_id).await {
+            observer.key_in_use(ordinal);
         }
     }
 
@@ -1353,6 +1417,64 @@ mod tests {
         assert_eq!(requests[0].header("x-goog-api-key"), Some("AQ.B123456789"));
         assert_eq!(requests[1].header("x-goog-api-key"), Some("AIzaA123456789"));
         assert_eq!(requests[2].header("x-goog-api-key"), Some("AQ.B123456789"));
+    }
+
+    #[derive(Default)]
+    struct RecordingObserver {
+        waiting: Mutex<Vec<bool>>,
+        ordinals: Mutex<Vec<u32>>,
+        attempts: Mutex<Vec<u32>>,
+    }
+
+    impl JobObserver for RecordingObserver {
+        fn waiting_quota(&self, waiting: bool) {
+            self.waiting.lock().unwrap().push(waiting);
+        }
+        fn key_in_use(&self, ordinal: u32) {
+            self.ordinals.lock().unwrap().push(ordinal);
+        }
+        fn attempt(&self, attempt: u32) {
+            self.attempts.lock().unwrap().push(attempt);
+        }
+    }
+
+    #[tokio::test]
+    async fn post_job_observed_reports_ordinal_attempt_and_quota_wait_around_a_retry() {
+        let transport = FakeTransport::new(vec![
+            Ok(TransportResponse {
+                status: 429,
+                body: "quota".to_string(),
+            }),
+            Ok(TransportResponse {
+                status: 200,
+                body: "{\"candidates\":[]}".to_string(),
+            }),
+        ]);
+        let gateway = gateway_with(
+            vec![key("a", "AIzaA123456789"), key("b", "AQ.B123456789")],
+            transport.clone(),
+        )
+        .await;
+        let observer = Arc::new(RecordingObserver::default());
+        gateway
+            .post_job_observed(
+                "/v1beta/interactions",
+                "{}".to_string(),
+                ConsentSnapshot::new(1, false),
+                CancellationToken::new(),
+                Some(observer.clone() as Arc<dyn JobObserver>),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(*observer.attempts.lock().unwrap(), vec![1, 2]);
+        assert_eq!(*observer.ordinals.lock().unwrap(), vec![1, 2]);
+        // waiting flips true/false around the initial acquire and again
+        // around the quota-triggered retry.
+        assert_eq!(
+            *observer.waiting.lock().unwrap(),
+            vec![true, false, true, false]
+        );
     }
 
     #[test]

@@ -14,6 +14,7 @@
   import { settingsStore } from '../lib/stores/settings.svelte';
   import { i18n } from '../i18n/index.svelte';
   import type { Theme } from '../lib/bindings';
+  import CloseConfirm from './CloseConfirm.svelte';
 
   let { children }: { children?: Snippet } = $props();
 
@@ -162,6 +163,8 @@
     </main>
   </div>
 </div>
+
+<CloseConfirm />
 
 <style>
   .app-shell {

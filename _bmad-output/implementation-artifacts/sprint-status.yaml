@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 09-22-2026 06:12
-last_updated: 09-23-2026 15:00
+last_updated: 09-23-2026 17:02
 project: transcriber_kun
 project_key: NOKEY
 tracking_system: file-system
@@ -54,7 +54,7 @@ development_status:
   2-1-media-pipeline-thuần-rust-và-kiểm-chứng-phát-flac-spike-s1-s: review
   2-2-gemini-transcribe-adapter-theo-họ-model-và-parser-chịu-lỗi-s: review
   2-3-lưu-phiên-và-transcript-bền-vững: review
-  2-4-job-transcribe-file-hàng-đợi-tiến-độ-và-huỷ: backlog
+  2-4-job-transcribe-file-hàng-đợi-tiến-độ-và-huỷ: review
   2-5-chịu-lỗi-chunk-khoảng-thiếu-và-chạy-lại: backlog
   2-6-settings-chunking-offset-và-ngôn-ngữ-transcribe: backlog
   2-7-transcript-detail-hiển-thị-trình-phát-và-click-to-seek: backlog

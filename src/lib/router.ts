@@ -6,13 +6,17 @@ import {
 } from '@keenmate/svelte-spa-router';
 import Home from '../routes/Home.svelte';
 import Onboarding from '../routes/Onboarding.svelte';
+import Session from '../routes/Session.svelte';
 import Settings from '../routes/Settings.svelte';
 
-/** Route definitions intentionally cover only screens delivered by Epic 1. */
+/** Route definitions cover the screens delivered by Epic 1 plus, as of story
+ * 2.4, `/session/:id` — a Job's live progress or a saved Phiên's summary
+ * (spec I/O Matrix "`/session/:id`"). */
 const routeDefinition = defineRoutes({
   onboarding: { path: '/onboarding', component: Onboarding },
   home: { path: '/home', component: Home },
   settings: { path: '/settings/:group', component: Settings },
+  session: { path: '/session/:id', component: Session },
 });
 
 export const routes = routeDefinition.routes;

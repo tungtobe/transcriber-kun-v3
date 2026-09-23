@@ -90,7 +90,7 @@ impl fmt::Display for Code {
 
 /// Lỗi thống nhất trả qua mọi command IPC. Serialize `{ category, code,
 /// detailRedacted }` — spec Boundaries.
-#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct AppError {
     pub category: Category,
