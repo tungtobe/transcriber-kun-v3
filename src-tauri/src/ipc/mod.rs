@@ -904,6 +904,143 @@ async fn library_session_get(
     track_ipc_error(&state.db, result).await
 }
 
+/// Đọc chi tiết đầy đủ một Phiên cho `/session/:id` (story 2.7) — xem
+/// [`library::store::get_detail`] cho logic thật. Caller (`Session.svelte`)
+/// chỉ gọi lệnh này sau khi `library_session_get` đã xác định `id` là một
+/// Phiên đã lưu, không phải Job đang chạy (spec Design Notes).
+#[tauri::command]
+#[specta::specta]
+async fn library_session_detail(
+    state: tauri::State<'_, AppState>,
+    session_id: SessionId,
+) -> Result<Option<library::store::SessionDetail>, AppError> {
+    let db = state.db.clone();
+    let root = state.data_dir.clone();
+    let result = async {
+        let db = db?;
+        let root = root?;
+        blocking(move || library::store::get_detail(&db, &root, session_id)).await
+    }
+    .await;
+    track_ipc_error(&state.db, result).await
+}
+
+/// Kết quả `library_proxy_relink` (spec I/O Matrix "Chọn lại khớp/sai/huỷ",
+/// "Phiên live thiếu Proxy"). `LiveUnsupported` gộp cả nhánh Phiên `live`
+/// (chặn trước khi mở dialog) lẫn `library::store::RelinkOutcome::
+/// NotFileSession` (một Phiên `file` bất thường không có `source_hash`) —
+/// cả hai đều báo cùng một thông điệp "chưa có Recording để tái tạo" phía
+/// UI (spec I/O Matrix "Phiên live thiếu Proxy").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub enum ProxyRelinkOutcome {
+    Relinked,
+    HashMismatch,
+    Cancelled,
+    LiveUnsupported,
+}
+
+/// Pure gate-order decision for `library_proxy_relink` (spec Tasks: "gate
+/// tách hàm test được"): tra Phiên → chặn Phiên không phải `file` (live —
+/// không mở dialog, spec I/O Matrix "Phiên live thiếu Proxy") → mở dialog
+/// chọn file (huỷ → `Cancelled`, không làm gì thêm) → so hash + publish qua
+/// `library::store::relink_proxy`. Mirrors [`decide_transcribe_start`]/
+/// [`decide_transcribe_rerun`]: mỗi closure gọi tối đa một lần, đúng thứ
+/// tự, chỉ khi gate trước đã qua.
+async fn decide_proxy_relink<LoadFut, PickFut, RelinkFut>(
+    load_session: impl FnOnce() -> LoadFut,
+    pick_file: impl FnOnce() -> PickFut,
+    do_relink: impl FnOnce(std::path::PathBuf) -> RelinkFut,
+) -> Result<ProxyRelinkOutcome, AppError>
+where
+    LoadFut: std::future::Future<Output = Result<repo::sessions::SessionRow, AppError>>,
+    PickFut: std::future::Future<Output = Result<Option<std::path::PathBuf>, AppError>>,
+    RelinkFut: std::future::Future<Output = Result<library::store::RelinkOutcome, AppError>>,
+{
+    let session = load_session().await?;
+    if session.kind != "file" {
+        return Ok(ProxyRelinkOutcome::LiveUnsupported);
+    }
+
+    let Some(picked) = pick_file().await? else {
+        return Ok(ProxyRelinkOutcome::Cancelled);
+    };
+
+    Ok(match do_relink(picked).await? {
+        library::store::RelinkOutcome::Relinked => ProxyRelinkOutcome::Relinked,
+        library::store::RelinkOutcome::HashMismatch => ProxyRelinkOutcome::HashMismatch,
+        library::store::RelinkOutcome::NotFileSession => ProxyRelinkOutcome::LiveUnsupported,
+    })
+}
+
+/// Mở dialog chọn file hệ thống bằng `rfd` (chỉ phía Rust — spec Boundaries:
+/// "không cấp capability dialog/fs cho frontend") cho "Chọn lại file
+/// nguồn". Huỷ dialog trả `Ok(None)`, không phải lỗi (spec I/O Matrix "Chọn
+/// lại sai": "huỷ dialog: im lặng"). Cùng kỹ thuật main-thread + kênh
+/// `std::sync::mpsc` như [`save_diagnostics_bundle`] — xem doc của nó cho lý
+/// do (dialog file gốc hệ điều hành trên macOS bắt buộc chạy trên main
+/// thread).
+fn pick_source_file(app: &tauri::AppHandle) -> Result<Option<std::path::PathBuf>, AppError> {
+    let (tx, rx) = std::sync::mpsc::channel::<Option<std::path::PathBuf>>();
+
+    app.run_on_main_thread(move || {
+        let picked = rfd::FileDialog::new().pick_file();
+        // Giống `save_diagnostics_bundle`: `send` lỗi chỉ nghĩa là không còn
+        // ai chờ (closure panic trước đó), không phải lỗi cần xử lý ở đây.
+        let _ = tx.send(picked);
+    })
+    .map_err(|err| AppError::new(Code::Storage, err.to_string()))?;
+
+    rx.recv()
+        .map_err(|err| AppError::new(Code::Storage, err.to_string()))
+}
+
+async fn library_proxy_relink_inner(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    session_id: SessionId,
+) -> Result<ProxyRelinkOutcome, AppError> {
+    let db = state.db.clone()?;
+    let root = state.data_dir.clone()?;
+    let load_db = db.clone();
+    let relink_db = db.clone();
+    let relink_root = root.clone();
+    let app_for_dialog = app.clone();
+
+    decide_proxy_relink(
+        move || {
+            blocking(move || {
+                load_db.with_connection(|conn| {
+                    repo::sessions::get(conn, session_id)?
+                        .ok_or_else(|| AppError::new(Code::Request, "Phiên không tồn tại"))
+                })
+            })
+        },
+        move || blocking(move || pick_source_file(&app_for_dialog)),
+        move |picked: std::path::PathBuf| {
+            blocking(move || {
+                library::store::relink_proxy(&relink_db, &relink_root, session_id, &picked)
+            })
+        },
+    )
+    .await
+}
+
+/// Chọn lại file nguồn cho một Phiên `file` đã lưu (spec Approach, FR-15):
+/// hash file được chọn phải khớp đúng `source_hash` của Phiên trước khi
+/// publish Proxy mới — xem [`decide_proxy_relink`] cho thứ tự gate thật và
+/// [`library::store::relink_proxy`] cho logic publish/DB.
+#[tauri::command]
+#[specta::specta]
+async fn library_proxy_relink(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    session_id: SessionId,
+) -> Result<ProxyRelinkOutcome, AppError> {
+    let result = library_proxy_relink_inner(&app, &state, session_id).await;
+    track_ipc_error(&state.db, result).await
+}
+
 /// Người dùng xác nhận đóng app khi registry đang bận (spec Design Notes:
 /// "đồng ý → huỷ sạch rồi thoát"): huỷ mọi Job hiện có, chờ tối đa ~4 s để
 /// mỗi Job dọn xong (huỷ có hiệu lực ≤ 2 s — spec Always), rồi thoát tiến
@@ -958,6 +1095,8 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             jobs_subscribe,
             jobs_cancel,
             library_session_get,
+            library_session_detail,
+            library_proxy_relink,
             app_close_confirm
         ])
         .events(collect_events![SettingsChanged, CloseRequested])
@@ -1634,5 +1773,148 @@ mod tests {
 
         assert_eq!(result, TranscribeRerunOutcome::Existing { job_id });
         assert_eq!(start_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    // `decide_proxy_relink` (story 2.7) — spec Tasks gate order "tra Phiên →
+    // chặn Phiên live trước khi mở dialog → huỷ dialog → so hash/publish"
+    // (I/O Matrix "Chọn lại khớp/sai", "Phiên live thiếu Proxy").
+
+    fn relink_session_row(kind: &str) -> repo::sessions::SessionRow {
+        repo::sessions::SessionRow {
+            id: SessionId::new(),
+            kind: kind.to_string(),
+            title: "cuộc họp".to_string(),
+            source_hash: Some("hash".to_string()),
+            source_name: None,
+            status: "complete".to_string(),
+            recovered: false,
+            duration_sec: 90.0,
+            proxy_ext: Some("flac".to_string()),
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    fn counting_load_session(
+        count: std::sync::Arc<std::sync::atomic::AtomicU32>,
+        session: repo::sessions::SessionRow,
+    ) -> impl FnOnce() -> std::future::Ready<Result<repo::sessions::SessionRow, AppError>> {
+        move || {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(Ok(session))
+        }
+    }
+
+    fn counting_pick(
+        count: std::sync::Arc<std::sync::atomic::AtomicU32>,
+        picked: Option<std::path::PathBuf>,
+    ) -> impl FnOnce() -> std::future::Ready<Result<Option<std::path::PathBuf>, AppError>> {
+        move || {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(Ok(picked))
+        }
+    }
+
+    fn counting_relink(
+        count: std::sync::Arc<std::sync::atomic::AtomicU32>,
+        outcome: library::store::RelinkOutcome,
+    ) -> impl FnOnce(
+        std::path::PathBuf,
+    ) -> std::future::Ready<Result<library::store::RelinkOutcome, AppError>> {
+        move |_picked| {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(Ok(outcome))
+        }
+    }
+
+    #[tokio::test]
+    async fn decide_proxy_relink_live_session_never_opens_dialog_or_relinks() {
+        let load_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let pick_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let relink_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+        let result = decide_proxy_relink(
+            counting_load_session(load_calls.clone(), relink_session_row("live")),
+            counting_pick(
+                pick_calls.clone(),
+                Some(std::path::PathBuf::from("/tmp/picked.wav")),
+            ),
+            counting_relink(
+                relink_calls.clone(),
+                library::store::RelinkOutcome::Relinked,
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, ProxyRelinkOutcome::LiveUnsupported);
+        assert_eq!(load_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            pick_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "Phiên live không được mở dialog"
+        );
+        assert_eq!(relink_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn decide_proxy_relink_cancelled_dialog_never_relinks() {
+        let relink_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+        let result = decide_proxy_relink(
+            counting_load_session(
+                std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                relink_session_row("file"),
+            ),
+            counting_pick(
+                std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                None,
+            ),
+            counting_relink(
+                relink_calls.clone(),
+                library::store::RelinkOutcome::Relinked,
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, ProxyRelinkOutcome::Cancelled);
+        assert_eq!(relink_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn decide_proxy_relink_maps_every_store_outcome() {
+        for (store_outcome, expected) in [
+            (
+                library::store::RelinkOutcome::Relinked,
+                ProxyRelinkOutcome::Relinked,
+            ),
+            (
+                library::store::RelinkOutcome::HashMismatch,
+                ProxyRelinkOutcome::HashMismatch,
+            ),
+            (
+                library::store::RelinkOutcome::NotFileSession,
+                ProxyRelinkOutcome::LiveUnsupported,
+            ),
+        ] {
+            let result = decide_proxy_relink(
+                counting_load_session(
+                    std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                    relink_session_row("file"),
+                ),
+                counting_pick(
+                    std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                    Some(std::path::PathBuf::from("/tmp/picked.wav")),
+                ),
+                counting_relink(
+                    std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                    store_outcome,
+                ),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result, expected);
+        }
     }
 }

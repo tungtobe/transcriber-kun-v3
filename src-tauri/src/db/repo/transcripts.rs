@@ -17,7 +17,7 @@ pub enum Variant {
 }
 
 impl Variant {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Variant::Primary => "primary",
             Variant::Retranscribe => "retranscribe",

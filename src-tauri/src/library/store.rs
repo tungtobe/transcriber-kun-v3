@@ -16,11 +16,15 @@ use std::fs::{self, File};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
+use specta::Type;
+
 use crate::core::error::{AppError, Code};
 use crate::core::id::{JobId, SessionId, TranscriptId};
 use crate::core::paths;
 use crate::db::repo::{self, segments::SegmentDraft, transcripts::Variant};
 use crate::db::Db;
+use crate::media;
 
 fn storage_error(detail: &str) -> AppError {
     AppError::new(Code::Storage, detail)
@@ -293,6 +297,223 @@ pub fn get(db: &Db, session_id: SessionId) -> Result<Option<SessionSummary>, App
     })
 }
 
+/// Một đoạn (Segment) đã chuẩn hoá cho `/session/:id` (story 2.7) — không có
+/// `speaker` (spec Boundaries: "Speaker không hiển thị"). `kind`/`gap_reason`
+/// giữ nguyên chuỗi thô khớp `segments::SegmentKind`/`GapReason` (cùng quy
+/// ước với `SessionLookup::Session.status` — chuỗi thô thay vì một enum
+/// specta riêng cho giá trị chỉ dùng để hiển thị).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct SegmentDetail {
+    /// `i32` không phải `i64` — specta-typescript cấm xuất kiểu BigInt (xem
+    /// `transcribe::rerun::RerunScope::Gap::gap_id`, cùng lý do: không
+    /// transcript nào tới gần `i32::MAX` segment). Đây cũng chính là
+    /// `gap_id` mà `transcribe_rerun` mong đợi cho dòng gap này.
+    pub idx: i32,
+    pub start_sec: f64,
+    pub end_sec: f64,
+    pub kind: String,
+    pub gap_reason: Option<String>,
+    pub text: String,
+}
+
+/// Transcript `primary` (hoặc `retranscribe`, giữ tổng quát) của một Phiên
+/// cho `/session/:id` (story 2.7).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscriptDetail {
+    pub id: TranscriptId,
+    pub variant: String,
+    pub status: String,
+    pub model: String,
+    pub language: Option<String>,
+    pub segments: Vec<SegmentDetail>,
+}
+
+/// Chi tiết đầy đủ một Phiên cho `/session/:id` (story 2.7, Task:
+/// "`SessionDetail { session_id, kind, title, created_at, duration_sec,
+/// recovered, source_name, proxy_path, transcript }`"). `proxy_path` là
+/// `Some` chỉ khi `proxy_ext` có giá trị **và** file thật còn tồn tại trên
+/// đĩa — Proxy lỗi hoặc thiếu (spec I/O Matrix "Proxy thiếu") luôn là `None`,
+/// không bao giờ một đường dẫn trỏ tới file không tồn tại. Giữ dạng `String`
+/// (đường dẫn tuyệt đối) thay vì `PathBuf` để khớp quy ước sẵn có của mọi
+/// đường dẫn khác qua IPC trong codebase này (`transcribe_start(path:
+/// String)`). `source_hash` cố ý không nằm trong struct này — so khớp hash
+/// chỉ diễn ra phía Rust ở [`relink_proxy`], frontend không bao giờ thấy
+/// hash. `created_at` là mili-giây kể từ Unix epoch (UTC), giữ dạng `f64`
+/// (không phải `i64`) vì specta-typescript cấm xuất kiểu BigInt (cùng lý do
+/// `SegmentDetail::idx` dùng `i32`) — số nguyên tới 2^53 vẫn chính xác tuyệt
+/// đối trong `f64`, xa hơn nhiều so với bất kỳ mốc thời gian thật nào.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionDetail {
+    pub session_id: SessionId,
+    pub kind: String,
+    pub title: String,
+    pub created_at: f64,
+    pub duration_sec: f64,
+    pub recovered: bool,
+    pub source_name: Option<String>,
+    pub proxy_path: Option<String>,
+    pub transcript: Option<TranscriptDetail>,
+}
+
+fn segment_row_to_detail(row: repo::segments::SegmentRow) -> SegmentDetail {
+    SegmentDetail {
+        idx: row.idx as i32,
+        start_sec: row.start_sec,
+        end_sec: row.end_sec,
+        kind: row.kind.as_str().to_string(),
+        gap_reason: row.gap_reason.map(|reason| reason.as_str().to_string()),
+        text: row.text,
+    }
+}
+
+/// Đọc chi tiết đầy đủ một Phiên cho `/session/:id` (story 2.7): meta +
+/// transcript `primary` hiện tại (nếu có) + đường dẫn Proxy đã kiểm tồn tại
+/// trên đĩa. `None` khi Phiên không còn tồn tại (giữ đúng quy ước của
+/// [`get`] ở trên). Không chạm registry Job — caller (`ipc::`) chỉ gọi hàm
+/// này sau khi `library_session_get`/`SessionLookup` đã xác định `id` là một
+/// Phiên đã lưu, không phải Job đang chạy (spec Design Notes: "detail tải
+/// sau khi biết là Phiên").
+pub fn get_detail(
+    db: &Db,
+    root: &Path,
+    session_id: SessionId,
+) -> Result<Option<SessionDetail>, AppError> {
+    let Some(session) = db.with_connection(|conn| Ok(repo::sessions::get(conn, session_id)?))?
+    else {
+        return Ok(None);
+    };
+
+    let proxy_path = match session.proxy_ext.as_deref() {
+        Some(ext) => {
+            let path = paths::proxy_path(root, session_id, ext);
+            if path.is_file() {
+                Some(path.to_string_lossy().into_owned())
+            } else {
+                None
+            }
+        }
+        None => None,
+    };
+
+    let transcript = db.with_connection(|conn| {
+        let Some(transcript_id) = repo::transcripts::primary_for_session(conn, session_id)? else {
+            return Ok(None);
+        };
+        let Some(transcript_row) = repo::transcripts::get(conn, transcript_id)? else {
+            return Ok(None);
+        };
+        let segments = repo::segments::list_for_transcript(conn, transcript_id)?
+            .into_iter()
+            .map(segment_row_to_detail)
+            .collect();
+        Ok(Some(TranscriptDetail {
+            id: transcript_row.id,
+            variant: transcript_row.variant.as_str().to_string(),
+            status: transcript_row.status.as_str().to_string(),
+            model: transcript_row.model,
+            language: transcript_row.language,
+            segments,
+        }))
+    })?;
+
+    Ok(Some(SessionDetail {
+        session_id: session.id,
+        kind: session.kind,
+        title: session.title,
+        created_at: session.created_at as f64,
+        duration_sec: session.duration_sec,
+        recovered: session.recovered,
+        source_name: session.source_name,
+        proxy_path,
+        transcript,
+    }))
+}
+
+/// Kết quả [`relink_proxy`] (spec I/O Matrix "Chọn lại khớp/sai/Phiên live").
+/// `NotFileSession` gộp cả "Phiên live" lẫn "Phiên file không có `source_hash`
+/// để so khớp" — cả hai đều không có gì hợp lệ để khớp hash, caller
+/// (`ipc::`) ánh xạ biến thể này sang `ProxyRelinkOutcome::LiveUnsupported`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelinkOutcome {
+    Relinked,
+    HashMismatch,
+    NotFileSession,
+}
+
+/// Chọn lại file nguồn (story 2.7, FR-15): hash `picked_path`, chỉ chấp nhận
+/// khi khớp đúng `source_hash` của Phiên, dựng Proxy mới trong staging (một
+/// `JobId` dùng-một-lần, dọn ngay sau khi xong — không phải staging của một
+/// Job thật trong `JobRegistry`) rồi publish thay Proxy cũ và cập nhật
+/// `proxy_ext`. Lỗi ở bất kỳ bước nào trước khi `publish_proxy` đổi tên file
+/// tại chỗ (staging tạo Proxy lỗi, hay chính `publish_proxy` lỗi ở bước ghi/
+/// fsync/rename) đều giữ nguyên Proxy cũ tại `media/<sid>/proxy.<ext>` —
+/// `publish_proxy` chỉ đổi tên vào đúng chỗ đó ở bước cuối cùng (xem doc của
+/// nó). Staging luôn được dọn ở mọi nhánh thoát, kể cả lỗi (spec Tasks: "lỗi
+/// giữa chừng không để lại staging và giữ Proxy cũ").
+pub fn relink_proxy(
+    db: &Db,
+    root: &Path,
+    session_id: SessionId,
+    picked_path: &Path,
+) -> Result<RelinkOutcome, AppError> {
+    let session = db
+        .with_connection(|conn| Ok(repo::sessions::get(conn, session_id)?))?
+        .ok_or_else(|| storage_error("Phiên không còn tồn tại"))?;
+
+    if session.kind != "file" {
+        return Ok(RelinkOutcome::NotFileSession);
+    }
+    let Some(expected_hash) = session.source_hash.as_deref() else {
+        return Ok(RelinkOutcome::NotFileSession);
+    };
+
+    let picked_hash = media::sha256_file(picked_path)?;
+    if picked_hash != expected_hash {
+        return Ok(RelinkOutcome::HashMismatch);
+    }
+
+    let job_id = JobId::new();
+    let staging_dir = paths::staging_dir(root, job_id);
+
+    let proxy_info = match media::create_proxy(&staging_dir, picked_path) {
+        Ok(info) => info,
+        Err(err) => {
+            let _ = discard_staging(root, job_id);
+            return Err(err);
+        }
+    };
+
+    let ext = match publish_proxy(root, session_id, &proxy_info.path) {
+        Ok(ext) => ext,
+        Err(err) => {
+            let _ = discard_staging(root, job_id);
+            return Err(err);
+        }
+    };
+
+    let now = now_ms();
+    if let Err(err) = db.with_connection(|conn| {
+        Ok(repo::sessions::set_proxy_ext(
+            conn,
+            session_id,
+            Some(&ext),
+            now,
+        )?)
+    }) {
+        let _ = discard_staging(root, job_id);
+        return Err(err);
+    }
+
+    if let Err(err) = discard_staging(root, job_id) {
+        tracing::warn!(error = %err, "không dọn được staging sau khi chọn lại file nguồn thành công");
+    }
+
+    Ok(RelinkOutcome::Relinked)
+}
+
 /// Chạy lại (2.5): swap nguyên tử một transcript của một Phiên có sẵn trong
 /// một transaction — chỉ ghi khi `expected_transcript_id` vẫn tồn tại đúng
 /// Phiên này lúc bắt đầu (spec Always: "chỉ khi transcript đích vẫn tồn tại
@@ -547,6 +768,19 @@ mod tests {
             .flatten()
             .filter(|entry| entry.file_name() != ".staging")
             .count()
+    }
+
+    /// `relink_proxy` only ever discards its own throwaway job's staging
+    /// subdirectory (`media/.staging/<job-id>`) — `media/.staging` itself
+    /// may already exist (and stay, empty) from an earlier
+    /// `commit_file_session` in the same test, so "no staging left" is
+    /// "the root is gone or has no entries", not "the root doesn't exist".
+    fn staging_root_is_empty(root: &Path) -> bool {
+        match fs::read_dir(paths::staging_root(root)) {
+            Ok(mut entries) => entries.next().is_none(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+            Err(err) => panic!("không đọc được staging root: {err}"),
+        }
     }
 
     fn sample_draft(source_hash: Option<&str>) -> FileSessionDraft {
@@ -1310,5 +1544,267 @@ mod tests {
         let root = tempdir().unwrap();
         let db = open_db(root.path());
         reconcile(&db, root.path()).unwrap();
+    }
+
+    // `get_detail`/`relink_proxy` (story 2.7) — spec I/O Matrix "Mở Phiên",
+    // "Proxy thiếu", "Chọn lại khớp/sai", "Phiên live thiếu Proxy".
+
+    /// Ghi một WAV mono 48 kHz thật (không phải nội dung fLaC giả như
+    /// `stage_fake_proxy`) — `relink_proxy` thành công phải chạy qua
+    /// `media::create_proxy` (decode + encode) thật, không chỉ đổi tên file.
+    fn write_real_wav(path: &Path, seconds: u32) {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 48_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(path, spec).unwrap();
+        for frame in 0..(48_000 * seconds) {
+            let sample = ((frame as f32 * 0.01).sin() * i16::MAX as f32) as i16;
+            writer.write_sample(sample).unwrap();
+        }
+        writer.finalize().unwrap();
+    }
+
+    fn insert_live_session(db: &Db) -> SessionId {
+        let session_id = SessionId::new();
+        db.with_connection(|conn| {
+            repo::sessions::insert(
+                conn,
+                repo::sessions::NewSession {
+                    id: session_id,
+                    kind: "live",
+                    title: "phiên live",
+                    source_hash: None,
+                    source_name: None,
+                    status: "complete",
+                    recovered: false,
+                    duration_sec: 5.0,
+                    proxy_ext: None,
+                    created_at: 0,
+                    updated_at: 0,
+                },
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        session_id
+    }
+
+    #[test]
+    fn get_detail_returns_none_when_session_is_missing() {
+        let root = tempdir().unwrap();
+        let db = open_db(root.path());
+        assert!(get_detail(&db, root.path(), SessionId::new())
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn get_detail_includes_transcript_segments_and_a_proxy_path_that_exists_on_disk() {
+        let root = tempdir().unwrap();
+        let db = open_db(root.path());
+        let job_id = JobId::new();
+        let staged = stage_fake_proxy(root.path(), job_id);
+        let mut draft = sample_draft(Some("detail-hash"));
+        draft
+            .transcript
+            .segments
+            .push(gap_segment(1.0, 2.0, GapReason::ChunkFailed));
+        let outcome = commit_file_session(
+            &db,
+            root.path(),
+            job_id,
+            SessionId::new(),
+            draft,
+            Ok(staged),
+        )
+        .unwrap();
+
+        let detail = get_detail(&db, root.path(), outcome.session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.session_id, outcome.session_id);
+        assert_eq!(detail.kind, "file");
+        assert_eq!(detail.title, "cuộc họp");
+        assert_eq!(detail.source_name.as_deref(), Some("meeting.mp4"));
+        assert!(!detail.recovered);
+        let proxy_path = detail.proxy_path.expect("proxy đã publish phải có path");
+        assert!(Path::new(&proxy_path).is_file());
+
+        let transcript = detail.transcript.expect("Phiên đã commit luôn có primary");
+        assert_eq!(transcript.variant, "primary");
+        assert_eq!(transcript.status, "partial");
+        assert_eq!(transcript.segments.len(), 2);
+        assert_eq!(transcript.segments[0].kind, "text");
+        assert_eq!(transcript.segments[0].text, "xin chào");
+        assert_eq!(transcript.segments[1].kind, "gap");
+        assert_eq!(
+            transcript.segments[1].gap_reason.as_deref(),
+            Some("chunk_failed")
+        );
+    }
+
+    #[test]
+    fn get_detail_proxy_path_is_none_when_proxy_ext_is_null_or_file_is_gone() {
+        let root = tempdir().unwrap();
+        let db = open_db(root.path());
+        let job_id = JobId::new();
+
+        let missing_ext = commit_file_session(
+            &db,
+            root.path(),
+            job_id,
+            SessionId::new(),
+            sample_draft(Some("no-ext")),
+            Err(storage_error("no proxy")),
+        )
+        .unwrap();
+        assert!(get_detail(&db, root.path(), missing_ext.session_id)
+            .unwrap()
+            .unwrap()
+            .proxy_path
+            .is_none());
+
+        let job_id_b = JobId::new();
+        let staged = stage_fake_proxy(root.path(), job_id_b);
+        let has_ext = commit_file_session(
+            &db,
+            root.path(),
+            job_id_b,
+            SessionId::new(),
+            sample_draft(Some("gone-file")),
+            Ok(staged),
+        )
+        .unwrap();
+        fs::remove_file(paths::proxy_path(root.path(), has_ext.session_id, "flac")).unwrap();
+        assert!(get_detail(&db, root.path(), has_ext.session_id)
+            .unwrap()
+            .unwrap()
+            .proxy_path
+            .is_none());
+    }
+
+    #[test]
+    fn relink_proxy_rejects_a_live_session_without_touching_anything() {
+        let root = tempdir().unwrap();
+        let db = open_db(root.path());
+        let session_id = insert_live_session(&db);
+        let picked = root.path().join("picked.wav");
+        write_real_wav(&picked, 1);
+
+        let outcome = relink_proxy(&db, root.path(), session_id, &picked).unwrap();
+        assert_eq!(outcome, RelinkOutcome::NotFileSession);
+        assert!(staging_root_is_empty(root.path()));
+    }
+
+    #[test]
+    fn relink_proxy_returns_hash_mismatch_and_leaves_the_old_proxy_untouched() {
+        let root = tempdir().unwrap();
+        let db = open_db(root.path());
+        let job_id = JobId::new();
+        let staged = stage_fake_proxy(root.path(), job_id);
+        let outcome = commit_file_session(
+            &db,
+            root.path(),
+            job_id,
+            SessionId::new(),
+            sample_draft(Some("expected-hash")),
+            Ok(staged),
+        )
+        .unwrap();
+        let proxy_file = paths::proxy_path(root.path(), outcome.session_id, "flac");
+        let bytes_before = fs::read(&proxy_file).unwrap();
+
+        let picked = root.path().join("wrong.wav");
+        write_real_wav(&picked, 1);
+        let result = relink_proxy(&db, root.path(), outcome.session_id, &picked).unwrap();
+
+        assert_eq!(result, RelinkOutcome::HashMismatch);
+        assert_eq!(fs::read(&proxy_file).unwrap(), bytes_before);
+        assert!(staging_root_is_empty(root.path()));
+        let session = db
+            .with_connection(|conn| Ok(repo::sessions::get(conn, outcome.session_id)?))
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.proxy_ext.as_deref(), Some("flac"));
+    }
+
+    #[test]
+    fn relink_proxy_publishes_a_new_proxy_and_updates_proxy_ext_when_hash_matches() {
+        let root = tempdir().unwrap();
+        let db = open_db(root.path());
+        let job_id = JobId::new();
+        let staged = stage_fake_proxy(root.path(), job_id);
+
+        let source = root.path().join("source.wav");
+        write_real_wav(&source, 1);
+        let source_hash = media::sha256_file(&source).unwrap();
+
+        let draft = sample_draft(Some(&source_hash));
+        let outcome = commit_file_session(
+            &db,
+            root.path(),
+            job_id,
+            SessionId::new(),
+            draft,
+            Ok(staged),
+        )
+        .unwrap();
+        let proxy_file = paths::proxy_path(root.path(), outcome.session_id, "flac");
+        let bytes_before = fs::read(&proxy_file).unwrap();
+
+        let result = relink_proxy(&db, root.path(), outcome.session_id, &source).unwrap();
+
+        assert_eq!(result, RelinkOutcome::Relinked);
+        assert!(staging_root_is_empty(root.path()));
+        let bytes_after = fs::read(&proxy_file).unwrap();
+        assert_ne!(
+            bytes_before, bytes_after,
+            "publish phải thay hẳn nội dung Proxy cũ bằng Proxy mới"
+        );
+        let session = db
+            .with_connection(|conn| Ok(repo::sessions::get(conn, outcome.session_id)?))
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.proxy_ext.as_deref(), Some("flac"));
+
+        let detail = get_detail(&db, root.path(), outcome.session_id)
+            .unwrap()
+            .unwrap();
+        assert!(detail.proxy_path.is_some());
+    }
+
+    #[test]
+    fn relink_proxy_publish_write_failure_leaves_no_staging_and_keeps_the_old_proxy() {
+        let root = tempdir().unwrap();
+        let db = open_db(root.path());
+        let job_id = JobId::new();
+        let staged = stage_fake_proxy(root.path(), job_id);
+
+        let source = root.path().join("source.wav");
+        write_real_wav(&source, 1);
+        let source_hash = media::sha256_file(&source).unwrap();
+        let draft = sample_draft(Some(&source_hash));
+        let outcome = commit_file_session(
+            &db,
+            root.path(),
+            job_id,
+            SessionId::new(),
+            draft,
+            Ok(staged),
+        )
+        .unwrap();
+        let proxy_file = paths::proxy_path(root.path(), outcome.session_id, "flac");
+        let bytes_before = fs::read(&proxy_file).unwrap();
+
+        fault::set(Some(fault::Point::PublishWrite));
+        let result = relink_proxy(&db, root.path(), outcome.session_id, &source);
+        fault::set(None);
+
+        assert!(result.is_err());
+        assert!(staging_root_is_empty(root.path()));
+        assert_eq!(fs::read(&proxy_file).unwrap(), bytes_before);
     }
 }

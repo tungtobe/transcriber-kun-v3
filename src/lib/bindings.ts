@@ -99,6 +99,30 @@ export const commands = {
 	/**  Tra `id` (Job hoặc Phiên) cho route `/session/:id`. */
 	librarySessionGet: (id: string) => typedError<SessionLookup, AppError>(__TAURI_INVOKE("library_session_get", { id })),
 	/**
+	 *  Đọc chi tiết đầy đủ một Phiên cho `/session/:id` (story 2.7) — xem
+	 *  [`library::store::get_detail`] cho logic thật. Caller (`Session.svelte`)
+	 *  chỉ gọi lệnh này sau khi `library_session_get` đã xác định `id` là một
+	 *  Phiên đã lưu, không phải Job đang chạy (spec Design Notes).
+	 */
+	librarySessionDetail: (sessionId: string) => typedError<{
+	sessionId: string,
+	kind: string,
+	title: string,
+	createdAt: number | null,
+	durationSec: number | null,
+	recovered: boolean,
+	sourceName: string | null,
+	proxyPath: string | null,
+	transcript: TranscriptDetail | null,
+} | null, AppError>(__TAURI_INVOKE("library_session_detail", { sessionId })),
+	/**
+	 *  Chọn lại file nguồn cho một Phiên `file` đã lưu (spec Approach, FR-15):
+	 *  hash file được chọn phải khớp đúng `source_hash` của Phiên trước khi
+	 *  publish Proxy mới — xem [`decide_proxy_relink`] cho thứ tự gate thật và
+	 *  [`library::store::relink_proxy`] cho logic publish/DB.
+	 */
+	libraryProxyRelink: (sessionId: string) => typedError<ProxyRelinkOutcome, AppError>(__TAURI_INVOKE("library_proxy_relink", { sessionId })),
+	/**
 	 *  Người dùng xác nhận đóng app khi registry đang bận (spec Design Notes:
 	 *  "đồng ý → huỷ sạch rồi thoát"): huỷ mọi Job hiện có, chờ tối đa ~4 s để
 	 *  mỗi Job dọn xong (huỷ có hiệu lực ≤ 2 s — spec Always), rồi thoát tiến
@@ -284,6 +308,16 @@ export type ModelInfo = {
 export type ModelKind = "transcribe" | "live" | "memo";
 
 /**
+ *  Kết quả `library_proxy_relink` (spec I/O Matrix "Chọn lại khớp/sai/huỷ",
+ *  "Phiên live thiếu Proxy"). `LiveUnsupported` gộp cả nhánh Phiên `live`
+ *  (chặn trước khi mở dialog) lẫn `library::store::RelinkOutcome::
+ *  NotFileSession` (một Phiên `file` bất thường không có `source_hash`) —
+ *  cả hai đều báo cùng một thông điệp "chưa có Recording để tái tạo" phía
+ *  UI (spec I/O Matrix "Phiên live thiếu Proxy").
+ */
+export type ProxyRelinkOutcome = "relinked" | "hashMismatch" | "cancelled" | "liveUnsupported";
+
+/**
  *  Phạm vi Chạy lại nhận từ `transcribe_rerun` (spec Approach: `scope ∈
  *  {missing, all, gap(gap_id)}`). `gap_id` là `idx` của Segment gap trong
  *  đúng `transcript_id` -- không phải một range do UI tự tính.
@@ -296,6 +330,56 @@ export type RerunScope = { kind: "missing" } | { kind: "all" } |
  *  `i32::MAX` segments, so the narrowing is lossless in practice.
  */
 { kind: "gap"; gapId: number };
+
+/**
+ *  Một đoạn (Segment) đã chuẩn hoá cho `/session/:id` (story 2.7) — không có
+ *  `speaker` (spec Boundaries: "Speaker không hiển thị"). `kind`/`gap_reason`
+ *  giữ nguyên chuỗi thô khớp `segments::SegmentKind`/`GapReason` (cùng quy
+ *  ước với `SessionLookup::Session.status` — chuỗi thô thay vì một enum
+ *  specta riêng cho giá trị chỉ dùng để hiển thị).
+ */
+export type SegmentDetail = {
+	/**
+	 *  `i32` không phải `i64` — specta-typescript cấm xuất kiểu BigInt (xem
+	 *  `transcribe::rerun::RerunScope::Gap::gap_id`, cùng lý do: không
+	 *  transcript nào tới gần `i32::MAX` segment). Đây cũng chính là
+	 *  `gap_id` mà `transcribe_rerun` mong đợi cho dòng gap này.
+	 */
+	idx: number,
+	startSec: number | null,
+	endSec: number | null,
+	kind: string,
+	gapReason: string | null,
+	text: string,
+};
+
+/**
+ *  Chi tiết đầy đủ một Phiên cho `/session/:id` (story 2.7, Task:
+ *  "`SessionDetail { session_id, kind, title, created_at, duration_sec,
+ *  recovered, source_name, proxy_path, transcript }`"). `proxy_path` là
+ *  `Some` chỉ khi `proxy_ext` có giá trị **và** file thật còn tồn tại trên
+ *  đĩa — Proxy lỗi hoặc thiếu (spec I/O Matrix "Proxy thiếu") luôn là `None`,
+ *  không bao giờ một đường dẫn trỏ tới file không tồn tại. Giữ dạng `String`
+ *  (đường dẫn tuyệt đối) thay vì `PathBuf` để khớp quy ước sẵn có của mọi
+ *  đường dẫn khác qua IPC trong codebase này (`transcribe_start(path:
+ *  String)`). `source_hash` cố ý không nằm trong struct này — so khớp hash
+ *  chỉ diễn ra phía Rust ở [`relink_proxy`], frontend không bao giờ thấy
+ *  hash. `created_at` là mili-giây kể từ Unix epoch (UTC), giữ dạng `f64`
+ *  (không phải `i64`) vì specta-typescript cấm xuất kiểu BigInt (cùng lý do
+ *  `SegmentDetail::idx` dùng `i32`) — số nguyên tới 2^53 vẫn chính xác tuyệt
+ *  đối trong `f64`, xa hơn nhiều so với bất kỳ mốc thời gian thật nào.
+ */
+export type SessionDetail = {
+	sessionId: string,
+	kind: string,
+	title: string,
+	createdAt: number | null,
+	durationSec: number | null,
+	recovered: boolean,
+	sourceName: string | null,
+	proxyPath: string | null,
+	transcript: TranscriptDetail | null,
+};
 
 /**
  *  Kết quả tra `id` của route `/session/:id` — có thể là Job đang chạy/chờ
@@ -383,6 +467,19 @@ export type TranscribeRerunOutcome = { kind: "started"; jobId: string } | { kind
  *  `source_hash` → có key dùng được → tạo Job").
  */
 export type TranscribeStartOutcome = { kind: "job"; jobId: string; sessionId: string } | { kind: "existing"; sessionId: string };
+
+/**
+ *  Transcript `primary` (hoặc `retranscribe`, giữ tổng quát) của một Phiên
+ *  cho `/session/:id` (story 2.7).
+ */
+export type TranscriptDetail = {
+	id: string,
+	variant: string,
+	status: string,
+	model: string,
+	language: string | null,
+	segments: SegmentDetail[],
+};
 
 /**
  *  Preference ngôn ngữ UI. `System` resolve ở frontend từ locale của WebView;
