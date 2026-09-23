@@ -9,9 +9,15 @@ use symphonia::core::{
     meta::MetadataOptions,
 };
 
-use super::{format_error, storage_error};
+use super::{format_error, no_audio_error, storage_error};
 
-const SUPPORTED_EXTENSIONS: &[&str] = &[
+/// Allow-list đuôi file duy nhất (spec Code Map: "`supported_extension`
+/// (allow-list, `pub(super)` → cần mở cho ipc")) — dùng cả bởi
+/// [`check_supported_extension`] (gate `transcribe_start`) lẫn dialog chọn
+/// nhiều file (`ipc::transcribe_pick_files`), qua re-export ở
+/// `media::SUPPORTED_EXTENSIONS`, để filter dialog không bao giờ lệch khỏi
+/// gate thật.
+pub const SUPPORTED_EXTENSIONS: &[&str] = &[
     "mp3", "m4a", "mp4", "mov", "mkv", "webm", "wav", "flac", "ogg", "aiff", "aif", "caf",
 ];
 
@@ -30,13 +36,13 @@ pub struct MediaInfo {
 /// Reads only container and codec metadata unless the container omits frame
 /// count, in which case it decodes and counts frames without retaining PCM.
 pub fn probe(path: &Path) -> Result<MediaInfo, crate::core::error::AppError> {
-    let extension = supported_extension(path)?;
+    let extension = check_supported_extension(path)?;
     let (mut format, track) = open_media(path, &extension)?;
     let codec_params = track
         .codec_params
         .as_ref()
         .and_then(|params| params.audio())
-        .ok_or_else(|| format_error("No playable audio track was found."))?;
+        .ok_or_else(|| no_audio_error("No playable audio track was found."))?;
 
     if codec_params.codec == symphonia::core::codecs::audio::well_known::CODEC_ID_OPUS {
         return Err(format_error(
@@ -54,7 +60,7 @@ pub fn probe(path: &Path) -> Result<MediaInfo, crate::core::error::AppError> {
 
     if let (Some(frame_count), true) = (metadata_frames, sample_rate > 0 && channels > 0) {
         if frame_count == 0 {
-            return Err(format_error("No playable audio frames were found."));
+            return Err(no_audio_error("No playable audio frames were found."));
         }
         return Ok(media_info(
             extension,
@@ -98,7 +104,7 @@ pub fn probe(path: &Path) -> Result<MediaInfo, crate::core::error::AppError> {
     }
 
     if sample_rate == 0 || frame_count == 0 {
-        return Err(format_error("No playable audio frames were found."));
+        return Err(no_audio_error("No playable audio frames were found."));
     }
 
     Ok(media_info(
@@ -132,6 +138,11 @@ pub(super) fn open_media(
     extension: &str,
 ) -> Result<(Box<dyn FormatReader>, Track), crate::core::error::AppError> {
     let file = File::open(path).map_err(|_| storage_error())?;
+    // File rỗng không phải "sai định dạng" mà là "không có audio" (spec 2.8
+    // I/O Matrix "Không audio / rỗng") — symphonia sẽ báo lỗi probe chung.
+    if file.metadata().map_err(|_| storage_error())?.len() == 0 {
+        return Err(no_audio_error("The media file is empty."));
+    }
     let source = MediaSourceStream::new(Box::new(file), Default::default());
     let mut hint = Hint::new();
     hint.with_extension(extension);
@@ -156,7 +167,7 @@ pub(super) fn open_media(
                 .is_some()
         })
         .cloned()
-        .ok_or_else(|| format_error("No playable audio track was found."))?;
+        .ok_or_else(|| no_audio_error("No playable audio track was found."))?;
 
     Ok((format, track))
 }
@@ -168,13 +179,17 @@ pub(super) fn make_decoder(
         .codec_params
         .as_ref()
         .and_then(|params| params.audio())
-        .ok_or_else(|| format_error("No playable audio track was found."))?;
+        .ok_or_else(|| no_audio_error("No playable audio track was found."))?;
     symphonia::default::get_codecs()
         .make_audio_decoder(params, &AudioDecoderOptions::default())
         .map_err(|_| format_error("The audio codec is unsupported by the pure-Rust decoder."))
 }
 
-pub(super) fn supported_extension(path: &Path) -> Result<String, crate::core::error::AppError> {
+/// Đuôi file thuộc allow-list (không I/O) — spec Always: "đuôi file thuộc
+/// allow-list (không I/O)" là gate đầu tiên có chạm hệ thống trong
+/// `transcribe_start`, trước cả hash. `pub` (không còn `pub(super)`) để
+/// `ipc::` gọi được thẳng, không phải đi vòng qua `probe()` (spec Code Map).
+pub fn check_supported_extension(path: &Path) -> Result<String, crate::core::error::AppError> {
     let extension = path
         .extension()
         .and_then(|value| value.to_str())
@@ -195,7 +210,8 @@ mod tests {
     fn unsupported_container_extensions_are_rejected_before_open() {
         for extension in ["avi", "wmv", "flv", "ts"] {
             let error =
-                supported_extension(Path::new(&format!("does-not-exist.{extension}"))).unwrap_err();
+                check_supported_extension(Path::new(&format!("does-not-exist.{extension}")))
+                    .unwrap_err();
             assert_eq!(error.category, crate::core::error::Category::Format);
             assert!(error.detail_redacted.contains("mp4, m4a, or mp3"));
         }
@@ -208,12 +224,23 @@ mod tests {
         ] {
             let filename = format!("recording.{}", extension.to_ascii_uppercase());
             let path = Path::new(&filename);
-            assert_eq!(supported_extension(path).unwrap(), extension);
+            assert_eq!(check_supported_extension(path).unwrap(), extension);
         }
     }
 
     #[test]
-    fn container_without_audio_is_a_format_error() {
+    fn zero_byte_file_is_a_no_audio_error_not_wrong_format() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("empty.mp4");
+        std::fs::write(&path, b"").unwrap();
+
+        let error = probe(&path).unwrap_err();
+        assert_eq!(error.category, crate::core::error::Category::Format);
+        assert_eq!(error.code, crate::core::error::Code::NoAudio);
+    }
+
+    #[test]
+    fn container_without_audio_frames_is_a_no_audio_error_distinct_from_wrong_format() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("empty.wav");
         let writer = hound::WavWriter::create(
@@ -229,7 +256,11 @@ mod tests {
         writer.finalize().unwrap();
 
         let error = probe(&path).unwrap_err();
+        // Category vẫn Format (spec Code Map) nhưng `code` là `NoAudio`, và
+        // câu không phải câu gợi ý đổi định dạng — UI cần phân biệt được hai
+        // trường hợp (spec Always: câu riêng "File không có audio phát được.").
         assert_eq!(error.category, crate::core::error::Category::Format);
-        assert!(error.detail_redacted.contains("mp4, m4a, or mp3"));
+        assert_eq!(error.code, crate::core::error::Code::NoAudio);
+        assert!(!error.detail_redacted.contains("mp4, m4a, or mp3"));
     }
 }

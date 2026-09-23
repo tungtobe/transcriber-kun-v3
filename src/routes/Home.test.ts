@@ -11,9 +11,15 @@ const mocks = vi.hoisted(() => ({
     status: 'ready' as 'idle' | 'loading' | 'ready' | 'error',
     load: vi.fn(),
   },
+  intakeStore: {
+    notices: [] as unknown[],
+    pick: vi.fn(),
+    dismiss: vi.fn(),
+  },
 }));
 
 vi.mock('../lib/stores/keys.svelte', () => ({ keysStore: mocks.keysStore }));
+vi.mock('../lib/stores/intake.svelte', () => ({ intakeStore: mocks.intakeStore }));
 
 afterEach(() => cleanup());
 
@@ -23,6 +29,9 @@ beforeEach(() => {
   mocks.keysStore.hasUsableKey = false;
   mocks.keysStore.status = 'ready';
   mocks.keysStore.load.mockReset().mockResolvedValue(undefined);
+  mocks.intakeStore.notices = [];
+  mocks.intakeStore.pick.mockReset().mockResolvedValue(undefined);
+  mocks.intakeStore.dismiss.mockReset();
 });
 
 describe('Home locale rendering', () => {
@@ -86,19 +95,77 @@ describe('Home missing-key banner', () => {
 describe('Home disabled actions', () => {
   beforeEach(() => i18n.applyPreference('vi'));
 
-  it('renders the file and Live actions as aria-disabled, focusable, non-activating controls', async () => {
+  it('renders Live as an aria-disabled, focusable, non-activating control', async () => {
     render(Home);
 
-    const fileAction = screen.getByRole('button', { name: 'Chọn file' });
     const liveAction = screen.getByRole('button', { name: 'Bắt đầu Live' });
 
-    for (const action of [fileAction, liveAction]) {
+    expect(liveAction.getAttribute('aria-disabled')).toBe('true');
+    expect(liveAction.hasAttribute('disabled')).toBe(false);
+    liveAction.focus();
+    expect(document.activeElement).toBe(liveAction);
+    await fireEvent.click(liveAction);
+    expect(liveAction.getAttribute('aria-disabled')).toBe('true');
+    expect(mocks.intakeStore.pick).not.toHaveBeenCalled();
+  });
+
+  it('renders both "Chọn file" actions as aria-disabled with a tooltip when there is no usable key', async () => {
+    mocks.keysStore.hasUsableKey = false;
+    mocks.keysStore.status = 'ready';
+    render(Home);
+
+    const fileActions = screen.getAllByRole('button', { name: 'Chọn file' });
+    expect(fileActions).toHaveLength(2);
+
+    for (const action of fileActions) {
       expect(action.getAttribute('aria-disabled')).toBe('true');
       expect(action.hasAttribute('disabled')).toBe(false);
       action.focus();
       expect(document.activeElement).toBe(action);
       await fireEvent.click(action);
+    }
+    expect(mocks.intakeStore.pick).not.toHaveBeenCalled();
+    expect(screen.getAllByText('Thêm key Gemini trước khi chọn file').length).toBeGreaterThan(0);
+  });
+});
+
+describe('Home file intake (story 2.8)', () => {
+  beforeEach(() => i18n.applyPreference('vi'));
+
+  it('enables both "Chọn file" actions and calls intake.pick() once a usable key is present', async () => {
+    mocks.keysStore.hasUsableKey = true;
+    mocks.keysStore.status = 'ready';
+    render(Home);
+
+    const fileActions = screen.getAllByRole('button', { name: 'Chọn file' });
+    expect(fileActions).toHaveLength(2);
+    for (const action of fileActions) {
+      expect(action.getAttribute('aria-disabled')).toBeNull();
+    }
+
+    await fireEvent.click(fileActions[0]);
+    expect(mocks.intakeStore.pick).toHaveBeenCalledTimes(1);
+
+    await fireEvent.click(fileActions[1]);
+    expect(mocks.intakeStore.pick).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps the file actions disabled while the key list is still loading', () => {
+    mocks.keysStore.hasUsableKey = false;
+    mocks.keysStore.status = 'loading';
+    render(Home);
+
+    for (const action of screen.getAllByRole('button', { name: 'Chọn file' })) {
       expect(action.getAttribute('aria-disabled')).toBe('true');
     }
+  });
+
+  it('renders intake notices when present', () => {
+    mocks.intakeStore.notices = [
+      { id: 'n1', variant: 'info', title: 'a.mp4', message: 'Đã thêm vào hàng đợi transcribe.' },
+    ];
+    render(Home);
+
+    expect(screen.getByText('Đã thêm vào hàng đợi transcribe.')).toBeTruthy();
   });
 });

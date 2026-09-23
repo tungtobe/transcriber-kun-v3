@@ -58,6 +58,11 @@ pub enum Code {
     Format,
     Permission,
     Storage,
+    /// File không có track audio phát được, không có frame, hoặc rỗng —
+    /// category vẫn `Format` (spec Code Map: "thêm `Code::NoAudio` (→
+    /// `Format`)") nhưng `code` khác `Format` để UI nói đúng câu ("File
+    /// không có audio phát được." thay vì "Định dạng không hỗ trợ").
+    NoAudio,
 }
 
 impl Code {
@@ -78,6 +83,7 @@ impl Code {
             Code::Format => Category::Format,
             Code::Permission => Category::Permission,
             Code::Storage => Category::Storage,
+            Code::NoAudio => Category::Format,
         }
     }
 }
@@ -147,7 +153,7 @@ mod tests {
 
     /// Phủ mọi biến thể `Code` — thêm biến thể mới mà quên thêm vào đây sẽ
     /// bị bắt vì `ALL` liệt kê tường minh từng biến thể.
-    const ALL: [Code; 12] = [
+    const ALL: [Code; 13] = [
         Code::Quota,
         Code::Auth,
         Code::Model,
@@ -160,6 +166,7 @@ mod tests {
         Code::Format,
         Code::Permission,
         Code::Storage,
+        Code::NoAudio,
     ];
 
     #[test]
@@ -177,6 +184,7 @@ mod tests {
             (Code::Format, Category::Format),
             (Code::Permission, Category::Permission),
             (Code::Storage, Category::Storage),
+            (Code::NoAudio, Category::Format),
         ];
         assert_eq!(
             expected.len(),

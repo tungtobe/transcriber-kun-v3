@@ -4,7 +4,7 @@ use symphonia::core::errors::Error as SymphoniaError;
 
 use super::{
     format_error,
-    probe::{make_decoder, open_media, supported_extension},
+    probe::{check_supported_extension, make_decoder, open_media},
     resample::MonoResampler,
     storage_error, OUTPUT_SAMPLE_RATE,
 };
@@ -27,7 +27,7 @@ pub fn decode_mono_16khz<F>(
 where
     F: FnMut(&[f32]) -> Result<(), crate::core::error::AppError>,
 {
-    let extension = supported_extension(path)?;
+    let extension = check_supported_extension(path)?;
     let (mut format, track) = open_media(path, &extension)?;
     let codec_params = track
         .codec_params

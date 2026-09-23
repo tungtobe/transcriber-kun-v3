@@ -475,8 +475,9 @@ async fn diagnostics_export(
     track_ipc_error(&state.db, result).await
 }
 
-/// Kết quả `transcribe_start` (spec Always: thứ tự gate "Consent → hash + tra
-/// `source_hash` → có key dùng được → tạo Job").
+/// Kết quả `transcribe_start` (spec Always: thứ tự gate "Consent → đuôi file
+/// thuộc allow-list → hash + tra `source_hash` trong DB → tra reservation
+/// JobRegistry → probe → có key dùng được → tạo Job").
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
 #[serde(
     tag = "kind",
@@ -491,31 +492,47 @@ pub enum TranscribeStartOutcome {
     Existing {
         session_id: SessionId,
     },
+    /// Cùng nội dung (`source_hash`) đã có một Job Transcribe đang chờ/chạy,
+    /// chưa commit thành Phiên — mở view Job đó thay vì tạo Job thứ hai
+    /// (spec Always: "tra reservation JobRegistry (trùng → `ExistingJob`)").
+    ExistingJob {
+        job_id: JobId,
+        session_id: SessionId,
+    },
 }
 
-/// Pure gate-order decision for `transcribe_start` (spec Always: "Consent →
-/// hash + tra `source_hash` → có key dùng được → tạo Job"), factored out so
-/// it can be tested without a real `AppState`/DB/gateway: every I/O step is
-/// injected as a closure, so a test can assert both the *outcome* and that a
-/// later step's closure was never invoked once an earlier gate rejects (spec
-/// I/O Matrix "Trùng": "không Job, không Gemini"; "Chưa Consent / thiếu
-/// key": "Không tạo Job").
+/// Pure gate-order decision for `transcribe_start` (spec 2.8 Always: "Consent
+/// → đuôi file thuộc allow-list (không I/O) → hash + tra `source_hash`
+/// trong DB (trùng → `Existing`) → tra reservation JobRegistry (trùng →
+/// `ExistingJob`) → probe (có track audio, có frame) → có key dùng được →
+/// tạo Job"), factored out so it can be tested without a real
+/// `AppState`/DB/gateway: every I/O step is injected as a closure, so a test
+/// can assert both the *outcome* and that a later step's closure was never
+/// invoked once an earlier gate rejects (spec I/O Matrix "Trùng Phiên"/
+/// "Trùng Job": "không cần key, không Gemini"; "Sai định dạng"/"Không audio":
+/// "không Phiên, không Job, không hash"/"không Job").
 ///
-/// `compute_hash`/`lookup_existing_session`/`has_usable_key`/`start_job` are
-/// each called at most once, strictly in gate order, and only when every
-/// prior gate passed.
-async fn decide_transcribe_start<HashFut, LookupFut, KeyFut, StartFut>(
+/// `check_extension` runs synchronously (no I/O — spec Always) right after
+/// Consent; every other closure is called at most once, strictly in gate
+/// order, and only when every prior gate passed.
+#[allow(clippy::too_many_arguments)]
+async fn decide_transcribe_start<HashFut, LookupFut, ReservationFut, ProbeFut, KeyFut, StartFut>(
     consent_current: bool,
+    check_extension: impl FnOnce() -> Result<(), AppError>,
     compute_hash: impl FnOnce() -> HashFut,
     lookup_existing_session: impl FnOnce(String) -> LookupFut,
+    lookup_existing_job: impl FnOnce(String) -> ReservationFut,
+    probe_media: impl FnOnce() -> ProbeFut,
     has_usable_key: impl FnOnce() -> KeyFut,
     start_job: impl FnOnce(String) -> StartFut,
 ) -> Result<TranscribeStartOutcome, AppError>
 where
     HashFut: std::future::Future<Output = Result<String, AppError>>,
     LookupFut: std::future::Future<Output = Result<Option<SessionId>, AppError>>,
+    ReservationFut: std::future::Future<Output = Result<Option<(JobId, SessionId)>, AppError>>,
+    ProbeFut: std::future::Future<Output = Result<(), AppError>>,
     KeyFut: std::future::Future<Output = Result<bool, AppError>>,
-    StartFut: std::future::Future<Output = Result<(JobId, SessionId), AppError>>,
+    StartFut: std::future::Future<Output = Result<registry::StartOutcome, AppError>>,
 {
     if !consent_current {
         return Err(AppError::new(
@@ -524,11 +541,19 @@ where
         ));
     }
 
+    check_extension()?;
+
     let hash = compute_hash().await?;
 
     if let Some(session_id) = lookup_existing_session(hash.clone()).await? {
         return Ok(TranscribeStartOutcome::Existing { session_id });
     }
+
+    if let Some((job_id, session_id)) = lookup_existing_job(hash.clone()).await? {
+        return Ok(TranscribeStartOutcome::ExistingJob { job_id, session_id });
+    }
+
+    probe_media().await?;
 
     if !has_usable_key().await? {
         return Err(AppError::new(
@@ -537,8 +562,18 @@ where
         ));
     }
 
-    let (job_id, session_id) = start_job(hash).await?;
-    Ok(TranscribeStartOutcome::Job { job_id, session_id })
+    Ok(match start_job(hash).await? {
+        registry::StartOutcome::Started { job_id, session_id } => {
+            TranscribeStartOutcome::Job { job_id, session_id }
+        }
+        // Race giữa `lookup_existing_job` (snapshot đọc) và đây: một lời gọi
+        // khác đã thắng và tạo Job trước — actor tự trả `Existing` nguyên tử
+        // (spec Always: "Tạo Job trong actor là nguyên tử"), không tạo Job
+        // thứ hai.
+        registry::StartOutcome::Existing { job_id, session_id } => {
+            TranscribeStartOutcome::ExistingJob { job_id, session_id }
+        }
+    })
 }
 
 async fn transcribe_start_inner(
@@ -558,16 +593,20 @@ async fn transcribe_start_inner(
     let source_name = source_path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned());
+    let extension_path = source_path.clone();
+    let probe_path = source_path.clone();
     let hash_path = source_path.clone();
     let lookup_db = db.clone();
     let secrets = state.secrets.clone();
     let jobs = state.jobs.clone();
+    let reservation_jobs = state.jobs.clone();
     let model = settings.transcribe_model.clone();
     let language = settings.transcribe_language;
     let chunk_minutes = settings.chunk_minutes;
 
     decide_transcribe_start(
         consent.is_current(),
+        move || crate::media::check_supported_extension(&extension_path).map(|_| ()),
         move || blocking(move || crate::media::sha256_file(&hash_path)),
         move |hash: String| {
             blocking(move || {
@@ -575,6 +614,11 @@ async fn transcribe_start_inner(
                     .with_connection(|conn| Ok(repo::sessions::find_by_source_hash(conn, &hash)?))
             })
         },
+        move |hash: String| async move {
+            let jobs = reservation_jobs?;
+            jobs.find_transcribe_by_hash(hash).await
+        },
+        move || blocking(move || crate::media::probe(&probe_path).map(|_| ())),
         move || async move {
             let keys = blocking(move || secrets.list()).await?;
             Ok(!keys.is_empty())
@@ -598,8 +642,8 @@ async fn transcribe_start_inner(
 
 /// Bắt đầu transcribe một file (spec Always: thứ tự gate đầy đủ nằm ở
 /// [`transcribe_start_inner`]). `path` là đường dẫn tuyệt đối do caller cung
-/// cấp — story này không mở dialog/nhận kéo thả (2.8/2.9 sẽ gọi lệnh này với
-/// đường dẫn đã chọn).
+/// cấp — frontend tự dồn mọi đường vào (dialog `transcribe_pick_files`, kéo
+/// thả) về một hàng xử lý tuần tự gọi lệnh này từng file (spec 2.8 Approach).
 #[tauri::command]
 #[specta::specta]
 async fn transcribe_start(
@@ -607,6 +651,56 @@ async fn transcribe_start(
     path: String,
 ) -> Result<TranscribeStartOutcome, AppError> {
     let result = transcribe_start_inner(&state, path).await;
+    track_ipc_error(&state.db, result).await
+}
+
+/// Mở dialog chọn **nhiều** file hệ thống bằng `rfd`, lọc đúng định dạng
+/// `transcribe_start` chấp nhận (spec Code Map: "`transcribe_pick_files() ->
+/// Vec<String>` dùng `rfd::FileDialog::add_filter(..).pick_files()`"). Huỷ
+/// dialog trả `Ok(vec![])`, không phải lỗi — cùng quy ước với
+/// [`pick_source_file`]/[`save_diagnostics_bundle`]. Chỉ trả đường dẫn thô;
+/// gate thật (đuôi/hash/probe/key) vẫn luôn chạy trong `transcribe_start` cho
+/// từng file — dialog này không tự ý bỏ qua bước nào (spec Boundaries:
+/// "Frontend không nhận hay gửi đường dẫn" ngoài việc chuyển tiếp Vec này
+/// sang `transcribe_start`).
+///
+/// Cùng kỹ thuật main-thread + kênh `std::sync::mpsc` như
+/// [`save_diagnostics_bundle`] — xem doc của nó cho lý do (dialog file gốc
+/// hệ điều hành trên macOS bắt buộc chạy trên main thread).
+fn pick_source_files(app: &tauri::AppHandle) -> Result<Vec<std::path::PathBuf>, AppError> {
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<std::path::PathBuf>>();
+
+    app.run_on_main_thread(move || {
+        let picked = rfd::FileDialog::new()
+            .add_filter("Media", crate::media::SUPPORTED_EXTENSIONS)
+            .pick_files()
+            .unwrap_or_default();
+        let _ = tx.send(picked);
+    })
+    .map_err(|err| AppError::new(Code::Storage, err.to_string()))?;
+
+    rx.recv()
+        .map_err(|err| AppError::new(Code::Storage, err.to_string()))
+}
+
+/// Command IPC cho [`pick_source_files`] — trả `Vec<String>` rỗng khi huỷ
+/// dialog (spec I/O Matrix "Chọn file": "Huỷ dialog → không làm gì").
+#[tauri::command]
+#[specta::specta]
+async fn transcribe_pick_files(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<String>, AppError> {
+    let result = tauri::async_runtime::spawn_blocking(move || pick_source_files(&app))
+        .await
+        .map_err(|err| AppError::new(Code::Storage, err.to_string()))
+        .and_then(|inner| inner)
+        .map(|paths| {
+            paths
+                .into_iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect()
+        });
     track_ipc_error(&state.db, result).await
 }
 
@@ -1091,6 +1185,7 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             diagnostics_clear_logs,
             diagnostics_export,
             transcribe_start,
+            transcribe_pick_files,
             transcribe_rerun,
             jobs_subscribe,
             jobs_cancel,
@@ -1267,11 +1362,27 @@ mod tests {
         );
     }
 
-    // `decide_transcribe_start` — spec Always gate order "Consent → hash +
-    // tra `source_hash` → có key dùng được → tạo Job" (I/O Matrix "Trùng",
-    // "Chưa Consent / thiếu key"). Each closure below increments a counter
-    // so a test can assert a later gate's step was never reached once an
-    // earlier gate decided the outcome — no `AppState`/DB/gateway needed.
+    // `decide_transcribe_start` — spec 2.8 Always gate order "Consent → đuôi
+    // file thuộc allow-list → hash + tra `source_hash` trong DB → tra
+    // reservation JobRegistry → probe → có key dùng được → tạo Job" (I/O
+    // Matrix "Trùng Phiên"/"Trùng Job"/"Sai định dạng"/"Không audio"/"Thiếu
+    // key"). Each closure below increments a counter so a test can assert a
+    // later gate's step was never reached once an earlier gate decided the
+    // outcome — no `AppState`/DB/gateway needed.
+
+    fn counting_extension(
+        count: std::sync::Arc<std::sync::atomic::AtomicU32>,
+        ok: bool,
+    ) -> impl FnOnce() -> Result<(), AppError> {
+        move || {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if ok {
+                Ok(())
+            } else {
+                Err(AppError::new(Code::Format, "unsupported extension"))
+            }
+        }
+    }
 
     fn counting_hash(
         count: std::sync::Arc<std::sync::atomic::AtomicU32>,
@@ -1292,6 +1403,31 @@ mod tests {
         }
     }
 
+    fn counting_reservation(
+        count: std::sync::Arc<std::sync::atomic::AtomicU32>,
+        existing: Option<(JobId, SessionId)>,
+    ) -> impl FnOnce(String) -> std::future::Ready<Result<Option<(JobId, SessionId)>, AppError>>
+    {
+        move |_hash: String| {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(Ok(existing))
+        }
+    }
+
+    fn counting_probe(
+        count: std::sync::Arc<std::sync::atomic::AtomicU32>,
+        ok: bool,
+    ) -> impl FnOnce() -> std::future::Ready<Result<(), AppError>> {
+        move || {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(if ok {
+                Ok(())
+            } else {
+                Err(AppError::new(Code::NoAudio, "no playable audio"))
+            })
+        }
+    }
+
     fn counting_key_check(
         count: std::sync::Arc<std::sync::atomic::AtomicU32>,
         has_key: bool,
@@ -1306,24 +1442,30 @@ mod tests {
         count: std::sync::Arc<std::sync::atomic::AtomicU32>,
         job_id: JobId,
         session_id: SessionId,
-    ) -> impl FnOnce(String) -> std::future::Ready<Result<(JobId, SessionId), AppError>> {
+    ) -> impl FnOnce(String) -> std::future::Ready<Result<registry::StartOutcome, AppError>> {
         move |_hash: String| {
             count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            std::future::ready(Ok((job_id, session_id)))
+            std::future::ready(Ok(registry::StartOutcome::Started { job_id, session_id }))
         }
     }
 
     #[tokio::test]
-    async fn decide_transcribe_start_missing_consent_never_computes_hash_or_starts_a_job() {
+    async fn decide_transcribe_start_missing_consent_never_checks_extension_or_starts_a_job() {
+        let ext_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let hash_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let lookup_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let reservation_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let probe_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let key_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let start_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
 
         let result = decide_transcribe_start(
             false,
+            counting_extension(ext_calls.clone(), true),
             counting_hash(hash_calls.clone()),
             counting_lookup(lookup_calls.clone(), None),
+            counting_reservation(reservation_calls.clone(), None),
+            counting_probe(probe_calls.clone(), true),
             counting_key_check(key_calls.clone(), true),
             counting_start(start_calls.clone(), JobId::new(), SessionId::new()),
         )
@@ -1331,24 +1473,77 @@ mod tests {
 
         let err = result.expect_err("thiếu consent phải trả lỗi");
         assert_eq!(err.category, Category::Auth);
+        assert_eq!(ext_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert_eq!(hash_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert_eq!(lookup_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            reservation_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(probe_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert_eq!(key_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert_eq!(start_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
-    async fn decide_transcribe_start_duplicate_hash_returns_existing_without_key_check_or_job() {
+    async fn decide_transcribe_start_wrong_extension_never_hashes_or_starts_a_job() {
+        let ext_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let hash_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let probe_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let start_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+        let result = decide_transcribe_start(
+            true,
+            counting_extension(ext_calls.clone(), false),
+            counting_hash(hash_calls.clone()),
+            counting_lookup(
+                std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                None,
+            ),
+            counting_reservation(
+                std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                None,
+            ),
+            counting_probe(probe_calls.clone(), true),
+            counting_key_check(
+                std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                true,
+            ),
+            counting_start(start_calls.clone(), JobId::new(), SessionId::new()),
+        )
+        .await;
+
+        let err = result.expect_err("sai đuôi file phải trả lỗi");
+        assert_eq!(err.category, Category::Format);
+        assert_eq!(
+            hash_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "sai đuôi không được hash"
+        );
+        assert_eq!(probe_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(start_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn decide_transcribe_start_duplicate_session_hash_returns_existing_without_reservation_probe_or_key(
+    ) {
         let lookup_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let reservation_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let probe_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let key_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let start_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let existing_session = SessionId::new();
 
         let result = decide_transcribe_start(
             true,
-            counting_hash(hash_calls.clone()),
+            counting_extension(
+                std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                true,
+            ),
+            counting_hash(std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0))),
             counting_lookup(lookup_calls.clone(), Some(existing_session)),
+            counting_reservation(reservation_calls.clone(), None),
+            counting_probe(probe_calls.clone(), true),
             counting_key_check(key_calls.clone(), true),
             counting_start(start_calls.clone(), JobId::new(), SessionId::new()),
         )
@@ -1361,31 +1556,155 @@ mod tests {
                 session_id: existing_session
             }
         );
-        assert_eq!(hash_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(lookup_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            reservation_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "trùng Phiên không được tra reservation Job"
+        );
+        assert_eq!(
+            probe_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "trùng Phiên không được probe"
+        );
         assert_eq!(
             key_calls.load(std::sync::atomic::Ordering::SeqCst),
             0,
-            "trùng hash không được kiểm key"
+            "trùng Phiên không được kiểm key"
         );
         assert_eq!(
             start_calls.load(std::sync::atomic::Ordering::SeqCst),
             0,
-            "trùng hash không được tạo Job"
+            "trùng Phiên không được tạo Job"
         );
     }
 
     #[tokio::test]
-    async fn decide_transcribe_start_no_usable_key_never_starts_a_job() {
-        let hash_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let lookup_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    async fn decide_transcribe_start_duplicate_job_reservation_returns_existing_job_without_probe_or_key(
+    ) {
+        let reservation_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let probe_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let key_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let start_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let existing_job = JobId::new();
+        let existing_session = SessionId::new();
+
+        let result = decide_transcribe_start(
+            true,
+            counting_extension(
+                std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                true,
+            ),
+            counting_hash(std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0))),
+            counting_lookup(
+                std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                None,
+            ),
+            counting_reservation(
+                reservation_calls.clone(),
+                Some((existing_job, existing_session)),
+            ),
+            counting_probe(probe_calls.clone(), true),
+            counting_key_check(key_calls.clone(), true),
+            counting_start(start_calls.clone(), JobId::new(), SessionId::new()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result,
+            TranscribeStartOutcome::ExistingJob {
+                job_id: existing_job,
+                session_id: existing_session,
+            }
+        );
+        assert_eq!(
+            reservation_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            probe_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "trùng Job không được probe"
+        );
+        assert_eq!(
+            key_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "trùng Job không được kiểm key"
+        );
+        assert_eq!(
+            start_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "trùng Job không được tạo Job thứ hai"
+        );
+    }
+
+    #[tokio::test]
+    async fn decide_transcribe_start_no_playable_audio_never_checks_key_or_starts_a_job() {
+        let probe_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let key_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let start_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
 
         let result = decide_transcribe_start(
             true,
-            counting_hash(hash_calls.clone()),
-            counting_lookup(lookup_calls.clone(), None),
+            counting_extension(
+                std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                true,
+            ),
+            counting_hash(std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0))),
+            counting_lookup(
+                std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                None,
+            ),
+            counting_reservation(
+                std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                None,
+            ),
+            counting_probe(probe_calls.clone(), false),
+            counting_key_check(key_calls.clone(), true),
+            counting_start(start_calls.clone(), JobId::new(), SessionId::new()),
+        )
+        .await;
+
+        let err = result.expect_err("không audio phải trả lỗi");
+        assert_eq!(err.category, Category::Format);
+        assert_eq!(err.code, Code::NoAudio);
+        assert_eq!(
+            key_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "không audio không được kiểm key"
+        );
+        assert_eq!(
+            start_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "không audio không được tạo Job"
+        );
+    }
+
+    #[tokio::test]
+    async fn decide_transcribe_start_no_usable_key_never_starts_a_job() {
+        let key_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let start_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+        let result = decide_transcribe_start(
+            true,
+            counting_extension(
+                std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                true,
+            ),
+            counting_hash(std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0))),
+            counting_lookup(
+                std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                None,
+            ),
+            counting_reservation(
+                std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                None,
+            ),
+            counting_probe(
+                std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                true,
+            ),
             counting_key_check(key_calls.clone(), false),
             counting_start(start_calls.clone(), JobId::new(), SessionId::new()),
         )
@@ -1403,8 +1722,11 @@ mod tests {
 
     #[tokio::test]
     async fn decide_transcribe_start_every_gate_passing_creates_the_job() {
+        let ext_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let hash_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let lookup_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let reservation_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let probe_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let key_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let start_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let job_id = JobId::new();
@@ -1412,8 +1734,11 @@ mod tests {
 
         let result = decide_transcribe_start(
             true,
+            counting_extension(ext_calls.clone(), true),
             counting_hash(hash_calls.clone()),
             counting_lookup(lookup_calls.clone(), None),
+            counting_reservation(reservation_calls.clone(), None),
+            counting_probe(probe_calls.clone(), true),
             counting_key_check(key_calls.clone(), true),
             counting_start(start_calls.clone(), job_id, session_id),
         )
@@ -1421,10 +1746,61 @@ mod tests {
         .unwrap();
 
         assert_eq!(result, TranscribeStartOutcome::Job { job_id, session_id });
+        assert_eq!(ext_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(hash_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(lookup_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            reservation_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(probe_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(key_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(start_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Race giữa `lookup_existing_job` (snapshot) và `start_job`: actor tự
+    /// trả `Existing` nguyên tử — `decide_transcribe_start` phải ánh xạ đó
+    /// thành `ExistingJob`, không panic hay trả `Job` sai (spec Always: "Tạo
+    /// Job trong actor là nguyên tử").
+    #[tokio::test]
+    async fn decide_transcribe_start_atomic_existing_from_start_job_maps_to_existing_job() {
+        let job_id = JobId::new();
+        let session_id = SessionId::new();
+
+        let result = decide_transcribe_start(
+            true,
+            counting_extension(
+                std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                true,
+            ),
+            counting_hash(std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0))),
+            counting_lookup(
+                std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                None,
+            ),
+            counting_reservation(
+                std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                None,
+            ),
+            counting_probe(
+                std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                true,
+            ),
+            counting_key_check(
+                std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                true,
+            ),
+            move |_hash: String| {
+                std::future::ready(Ok(registry::StartOutcome::Existing { job_id, session_id }))
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result,
+            TranscribeStartOutcome::ExistingJob { job_id, session_id }
+        );
     }
 
     // `decide_transcribe_rerun` — spec Tasks gate order "Consent → tra

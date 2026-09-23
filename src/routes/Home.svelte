@@ -3,12 +3,25 @@
   import { InfoIcon, RadioIcon, UploadIcon } from '../components/icons';
   import DisabledHint from '../components/DisabledHint.svelte';
   import BannerStack, { type BannerItem } from '../components/BannerStack.svelte';
+  import IntakeNotices from '../components/IntakeNotices.svelte';
   import { i18n } from '../i18n/index.svelte';
   import { keysStore } from '../lib/stores/keys.svelte';
+  import { intakeStore } from '../lib/stores/intake.svelte';
 
   onMount(() => {
     void keysStore.load();
   });
+
+  // Loading is treated conservatively (button stays disabled) the same way
+  // `showKeyBanner` below does — a file button that flickers enabled then
+  // disabled as `keysList` resolves is worse than a brief extra disabled
+  // moment (spec Always: "khi chưa có key dùng được thì cả hai vô hiệu").
+  const canChooseFile = $derived(keysStore.status === 'ready' && keysStore.hasUsableKey);
+
+  function chooseFile(): void {
+    if (!canChooseFile) return;
+    void intakeStore.pick();
+  }
 
   // Loading is treated as "not yet confirmed missing" to avoid a flash of
   // the banner while `keysList` is still in flight; a load error is treated
@@ -46,11 +59,29 @@
       <p class="route-kicker">{i18n.t('home.header.kicker')}</p>
       <h1 id="home-title">{i18n.t('home.header.title')}</h1>
     </div>
-    <span class="status-pill status-off"><span class="status-dot" aria-hidden="true"></span> {i18n.t('home.header.emptyStatus')}</span>
+    <div class="header-actions">
+      {#if canChooseFile}
+        <button type="button" class="button button-secondary" onclick={chooseFile}>
+          {i18n.t('home.file.action')}
+        </button>
+      {:else}
+        <DisabledHint
+          reason={i18n.t('home.file.unavailable')}
+          shortcut={i18n.t('home.banner.keyMissingAction')}
+        >
+          <span class="button button-secondary">{i18n.t('home.file.action')}</span>
+        </DisabledHint>
+      {/if}
+      <span class="status-pill status-off"><span class="status-dot" aria-hidden="true"></span> {i18n.t('home.header.emptyStatus')}</span>
+    </div>
   </div>
 
   <div class="key-banner-wrap">
     <BannerStack {banners} />
+  </div>
+
+  <div class="intake-notices-wrap">
+    <IntakeNotices />
   </div>
 
   <div class="empty-grid">
@@ -58,9 +89,18 @@
       <div class="empty-icon" aria-hidden="true"><UploadIcon size={18} strokeWidth={1.75} /></div>
       <h2>{i18n.t('home.file.title')}</h2>
       <p>{i18n.t('home.file.description')}</p>
-      <DisabledHint reason={i18n.t('home.file.unavailable')}>
-        <span class="button button-secondary">{i18n.t('home.file.action')}</span>
-      </DisabledHint>
+      {#if canChooseFile}
+        <button type="button" class="button button-secondary" onclick={chooseFile}>
+          {i18n.t('home.file.action')}
+        </button>
+      {:else}
+        <DisabledHint
+          reason={i18n.t('home.file.unavailable')}
+          shortcut={i18n.t('home.banner.keyMissingAction')}
+        >
+          <span class="button button-secondary">{i18n.t('home.file.action')}</span>
+        </DisabledHint>
+      {/if}
     </article>
 
     <article class="empty-card">
@@ -112,6 +152,16 @@
   h2 {
     margin: 0 0 var(--space-2);
     font-size: var(--text-h2-size);
+  }
+
+  .header-actions {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+  }
+
+  .intake-notices-wrap:not(:empty) {
+    margin-bottom: var(--space-5);
   }
 
   .status-pill {
@@ -183,8 +233,10 @@
     padding: 0 14px;
     border: 1px solid transparent;
     border-radius: var(--radius-md);
+    font-family: inherit;
     font-size: var(--text-body-size);
     font-weight: 500;
+    cursor: pointer;
   }
 
   .button-primary {

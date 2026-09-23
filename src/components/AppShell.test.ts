@@ -3,6 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { fireEvent, cleanup, render, screen } from '@testing-library/svelte';
 import AppShell from './AppShell.svelte';
 import { i18n } from '../i18n/index.svelte';
+import { configureRouter } from '../lib/router';
+import type { DragDropEvent } from '../lib/dragdrop';
 
 const mocks = vi.hoisted(() => ({
   settingsStore: {
@@ -16,14 +18,25 @@ const mocks = vi.hoisted(() => ({
     listenForCloseRequested: vi.fn(() => Promise.resolve(() => {})),
     confirmClose: vi.fn(() => Promise.resolve()),
   },
+  intakeStore: {
+    submit: vi.fn(() => Promise.resolve()),
+  },
+  onDragDropEvent: vi.fn(),
 }));
 
 vi.mock('../lib/stores/settings.svelte', () => ({ settingsStore: mocks.settingsStore }));
 vi.mock('../lib/stores/app.svelte', () => ({ appStore: mocks.appStore }));
+vi.mock('../lib/stores/intake.svelte', () => ({ intakeStore: mocks.intakeStore }));
+vi.mock('../lib/dragdrop', () => ({
+  onDragDropEvent: (...args: unknown[]) => mocks.onDragDropEvent(...args),
+}));
+
+let dragDropHandler: ((event: DragDropEvent) => void) | null = null;
 
 afterEach(() => cleanup());
 
 beforeEach(() => {
+  configureRouter();
   i18n.applyPreference('vi');
   window.history.replaceState({}, '', '/home');
   window.dispatchEvent(new PopStateEvent('popstate', { state: {} }));
@@ -31,6 +44,12 @@ beforeEach(() => {
   mocks.settingsStore.error = null;
   mocks.settingsStore.setTheme.mockReset();
   mocks.settingsStore.load.mockReset();
+  mocks.intakeStore.submit.mockReset().mockResolvedValue(undefined);
+  dragDropHandler = null;
+  mocks.onDragDropEvent.mockReset().mockImplementation((handler: (event: DragDropEvent) => void) => {
+    dragDropHandler = handler;
+    return Promise.resolve(() => {});
+  });
 });
 
 describe('AppShell', () => {
@@ -80,4 +99,51 @@ describe('AppShell', () => {
     expect(screen.getByText(caption)).toBeTruthy();
   });
 
+  describe('drag-and-drop intake (story 2.8)', () => {
+    it('shows the drop overlay while dragging over /home and hides it again on drop', async () => {
+      render(AppShell);
+      expect(dragDropHandler).not.toBeNull();
+
+      dragDropHandler!({ payload: { type: 'enter', paths: [], position: { x: 0, y: 0 } } });
+      await Promise.resolve();
+      expect(screen.getByText('Thả file vào đây để bắt đầu transcribe')).toBeTruthy();
+
+      dragDropHandler!({
+        payload: { type: 'drop', paths: ['/tmp/a.mp4'], position: { x: 0, y: 0 } },
+      });
+      await Promise.resolve();
+      expect(screen.queryByText('Thả file vào đây để bắt đầu transcribe')).toBeNull();
+      expect(mocks.intakeStore.submit).toHaveBeenCalledWith(['/tmp/a.mp4']);
+    });
+
+    it('never shows the overlay or submits a drop outside /home and /session/:id', async () => {
+      window.history.replaceState({}, '', '/settings/general');
+      window.dispatchEvent(new PopStateEvent('popstate', { state: {} }));
+      render(AppShell);
+      expect(dragDropHandler).not.toBeNull();
+
+      dragDropHandler!({ payload: { type: 'enter', paths: [], position: { x: 0, y: 0 } } });
+      await Promise.resolve();
+      expect(screen.queryByText('Thả file vào đây để bắt đầu transcribe')).toBeNull();
+
+      dragDropHandler!({
+        payload: { type: 'drop', paths: ['/tmp/a.mp4'], position: { x: 0, y: 0 } },
+      });
+      await Promise.resolve();
+      expect(mocks.intakeStore.submit).not.toHaveBeenCalled();
+    });
+
+    it('accepts a drop on /session/:id', async () => {
+      window.history.replaceState({}, '', '/session/abc');
+      window.dispatchEvent(new PopStateEvent('popstate', { state: {} }));
+      render(AppShell);
+      expect(dragDropHandler).not.toBeNull();
+
+      dragDropHandler!({
+        payload: { type: 'drop', paths: ['/tmp/b.m4a'], position: { x: 0, y: 0 } },
+      });
+      await Promise.resolve();
+      expect(mocks.intakeStore.submit).toHaveBeenCalledWith(['/tmp/b.m4a']);
+    });
+  });
 });

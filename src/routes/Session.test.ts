@@ -16,8 +16,17 @@ const mocks = vi.hoisted(() => {
     jobsCancel: vi.fn(),
     transcribeRerun: vi.fn(),
     FakeChannel,
+    intakeStore: {
+      notices: [] as Array<{ id: string; variant: string; title: string; message: string }>,
+      dismiss: vi.fn(),
+    },
   };
 });
+
+// story 2.8: `<IntakeNotices>` mounts on Session too (spec Code Map:
+// "notices render trên Home và Session") — mocked the same way Home.test.ts
+// mocks it, so this suite stays about Session's own routing/job/rerun logic.
+vi.mock('../lib/stores/intake.svelte', () => ({ intakeStore: mocks.intakeStore }));
 
 vi.mock('@tauri-apps/api/core', () => ({
   Channel: mocks.FakeChannel,
@@ -55,6 +64,8 @@ beforeEach(async () => {
   mocks.jobsSubscribe.mockReset();
   mocks.jobsCancel.mockReset();
   mocks.transcribeRerun.mockReset();
+  mocks.intakeStore.notices = [];
+  mocks.intakeStore.dismiss.mockReset();
   capturedChannel = null;
   mocks.jobsSubscribe.mockImplementation((channel: CapturedChannel) => {
     capturedChannel = channel;
@@ -340,5 +351,21 @@ describe('Session route', () => {
 
     expect(await screen.findByRole('heading', { name: 'cuộc họp xong' })).toBeTruthy();
     expect(mocks.librarySessionGet).toHaveBeenCalledTimes(2);
+  });
+
+  // story 2.8 Code Map: "notices render trên Home và Session".
+  it('renders intake notices (from a file dropped while on this screen) regardless of view state', async () => {
+    mocks.librarySessionGet.mockResolvedValue({
+      status: 'ok',
+      data: { kind: 'session', sessionId: 's1', title: 'cuộc họp', durationSec: 120, status: 'complete', partial: false, transcriptId: 't1' },
+    });
+    mocks.librarySessionDetail.mockResolvedValue({ status: 'ok', data: detail() });
+    mocks.intakeStore.notices = [
+      { id: 'n1', variant: 'info', title: 'other.mp4', message: 'Đã thêm vào hàng đợi transcribe.' },
+    ];
+    render(Session, { routeParams: { id: 's1' } });
+
+    expect(await screen.findByRole('heading', { name: 'cuộc họp' })).toBeTruthy();
+    expect(screen.getByText('Đã thêm vào hàng đợi transcribe.')).toBeTruthy();
   });
 });

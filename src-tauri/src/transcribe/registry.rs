@@ -60,6 +60,30 @@ fn cancelled_pipeline_error() -> AppError {
     AppError::new(Code::Blocked, "transcribe job was cancelled")
 }
 
+fn source_changed_error() -> AppError {
+    AppError::new(
+        Code::Storage,
+        "the source file changed since it was selected",
+    )
+}
+
+/// Hash lại `source_path` và so với `expected_hash` (spec 2.8 Always: "Job
+/// ... hash lại nguồn trước probe/decode và hash lại lần nữa sau decode
+/// trước commit; thiếu file hoặc hash khác → Job `error`, không commit,
+/// không lưu Phiên"). Chạy trong `spawn_blocking` vì `sha256_file` là I/O
+/// chặn; một file bị xoá tự nhiên rơi vào nhánh lỗi của `sha256_file` (category
+/// `Storage`, giống `source_changed_error` — cùng category nên
+/// `run_job_inner` không cần phân biệt hai nhánh này ở caller).
+async fn verify_source_hash(source_path: &Path, expected_hash: &str) -> Result<(), AppError> {
+    let path = source_path.to_path_buf();
+    match tokio::task::spawn_blocking(move || media::sha256_file(&path)).await {
+        Ok(Ok(actual)) if actual == expected_hash => Ok(()),
+        Ok(Ok(_)) => Err(source_changed_error()),
+        Ok(Err(err)) => Err(err),
+        Err(_) => Err(actor_error()),
+    }
+}
+
 /// Everything `transcribe_start` (ipc) already resolved before deciding to
 /// create a Job — consent was checked, the file was hashed, and the hash was
 /// confirmed not to match an existing session (spec Always: gate order).
@@ -112,6 +136,27 @@ pub struct RerunParams {
 pub enum RerunOutcome {
     Started { job_id: JobId },
     Existing { job_id: JobId },
+}
+
+/// Trả về từ `JobRegistryHandle::start` (spec 2.8 Always: "Tạo Job trong
+/// actor là nguyên tử: nếu cùng lúc đã có Job Transcribe chờ/chạy cùng
+/// `source_hash` thì trả Job đó, không tạo Job thứ hai"). Việc kiểm tra và
+/// tạo entry mới xảy ra trong cùng một lệnh actor (`handle_start`) nên hai
+/// lời gọi `start` đồng thời cùng `source_hash` luôn thấy đúng một Job —
+/// không có khoảng hở giữa "tra" và "tạo" (khác với
+/// [`JobRegistryHandle::find_transcribe_by_hash`], vốn chỉ là một snapshot
+/// đọc dùng để bỏ qua `probe` sớm ở gate `ipc::`, không phải nguồn thật của
+/// tính nguyên tử).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartOutcome {
+    Started {
+        job_id: JobId,
+        session_id: SessionId,
+    },
+    Existing {
+        job_id: JobId,
+        session_id: SessionId,
+    },
 }
 
 pub type TranscribeChunkFuture =
@@ -180,10 +225,29 @@ impl JobRegistryHandle {
     /// `SessionId` right away (spec Always: "Registry cấp trước `session_id`
     /// dự kiến") so the caller can already route to `/session/:id` before
     /// any work — let alone a commit — has happened.
-    pub async fn start(&self, params: StartParams) -> Result<(JobId, SessionId), AppError> {
+    pub async fn start(&self, params: StartParams) -> Result<StartOutcome, AppError> {
         let (reply, response) = oneshot::channel();
         self.commands
             .send(Command::Start { params, reply })
+            .await
+            .map_err(|_| actor_error())?;
+        response.await.map_err(|_| actor_error())
+    }
+
+    /// Tra xem đã có Job Transcribe nào đang chờ/chạy cùng `source_hash` hay
+    /// chưa — một snapshot đọc dùng ở gate `ipc::decide_transcribe_start`
+    /// (spec Always: "tra reservation JobRegistry (trùng → `ExistingJob`)")
+    /// để bỏ qua `probe`/key cho file trùng. Không phải nguồn thật của tính
+    /// nguyên tử — `start` tự kiểm lại bên trong cùng một lệnh actor trước
+    /// khi tạo entry mới, nên một race giữa lần tra này và lúc gọi `start`
+    /// vẫn không thể tạo ra hai Job cho cùng nội dung.
+    pub async fn find_transcribe_by_hash(
+        &self,
+        source_hash: String,
+    ) -> Result<Option<(JobId, SessionId)>, AppError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::FindByHash { source_hash, reply })
             .await
             .map_err(|_| actor_error())?;
         response.await.map_err(|_| actor_error())
@@ -253,7 +317,11 @@ impl JobRegistryHandle {
 enum Command {
     Start {
         params: StartParams,
-        reply: oneshot::Sender<(JobId, SessionId)>,
+        reply: oneshot::Sender<StartOutcome>,
+    },
+    FindByHash {
+        source_hash: String,
+        reply: oneshot::Sender<Option<(JobId, SessionId)>>,
     },
     StartRerun {
         params: RerunParams,
@@ -315,6 +383,10 @@ enum JobOutcome {
 struct JobEntry {
     session_id: SessionId,
     source_name: Option<String>,
+    /// `Some(hash)` cho Job `JobKind::Transcribe` (dùng làm khoá reservation
+    /// — spec Always: "JobRegistry giữ reservation theo `source_hash`");
+    /// luôn `None` cho `JobKind::Rerun`, vốn không nhận file nguồn mới.
+    source_hash: Option<String>,
     kind: JobKind,
     state: JobState,
     processed_ms: u64,
@@ -413,6 +485,9 @@ impl JobRegistryActor {
     fn handle(&mut self, command: Command) {
         match command {
             Command::Start { params, reply } => self.handle_start(params, reply),
+            Command::FindByHash { source_hash, reply } => {
+                let _ = reply.send(self.find_transcribe_job_by_hash(&source_hash));
+            }
             Command::StartRerun { params, reply } => self.handle_start_rerun(params, reply),
             Command::Cancel { job_id, reply } => self.handle_cancel(job_id, reply),
             Command::Subscribe { channel, reply } => self.handle_subscribe(channel, reply),
@@ -437,13 +512,26 @@ impl JobRegistryActor {
             .collect()
     }
 
-    fn handle_start(&mut self, params: StartParams, reply: oneshot::Sender<(JobId, SessionId)>) {
+    /// Nguyên tử theo `source_hash` (spec 2.8 Always: "Tạo Job trong actor là
+    /// nguyên tử: nếu cùng lúc đã có Job Transcribe chờ/chạy cùng
+    /// `source_hash` thì trả Job đó, không tạo Job thứ hai"). Kiểm tra và tạo
+    /// entry mới xảy ra trong cùng lệnh actor này (`&mut self`, không có
+    /// `.await` ở giữa) nên hai lời gọi `start` đồng thời cùng nội dung luôn
+    /// thấy đúng một Job dù `ipc::decide_transcribe_start` đã tra trước đó
+    /// (`find_transcribe_by_hash`) không thấy trùng.
+    fn handle_start(&mut self, params: StartParams, reply: oneshot::Sender<StartOutcome>) {
+        if let Some((job_id, session_id)) = self.find_transcribe_job_by_hash(&params.source_hash) {
+            let _ = reply.send(StartOutcome::Existing { job_id, session_id });
+            return;
+        }
+
         let job_id = JobId::new();
         let session_id = SessionId::new();
         let will_run_now = self.order.is_empty();
         let entry = JobEntry {
             session_id,
             source_name: params.source_name.clone(),
+            source_hash: Some(params.source_hash.clone()),
             kind: JobKind::Transcribe,
             state: if will_run_now {
                 JobState::Running
@@ -462,12 +550,25 @@ impl JobRegistryActor {
         self.order.push_back(job_id);
         self.jobs.insert(job_id, entry);
         self.pending_params.insert(job_id, params);
-        let _ = reply.send((job_id, session_id));
+        let _ = reply.send(StartOutcome::Started { job_id, session_id });
         self.broadcast_updated(job_id);
 
         if will_run_now {
             self.start_pipeline_for(job_id);
         }
+    }
+
+    /// Job `Transcribe` đang chờ/chạy (còn trong `self.jobs`) với cùng
+    /// `source_hash` — dùng cả bởi `handle_start` (kiểm nguyên tử trước khi
+    /// tạo entry mới) lẫn `Command::FindByHash` (snapshot đọc cho gate
+    /// `ipc::`). Entry rời `self.jobs` ngay khi Job commit/huỷ/lỗi
+    /// (`handle_finished`), nên reservation tự giải phóng theo đúng vòng đời
+    /// đó — không có sổ sách riêng nào khác phải dọn.
+    fn find_transcribe_job_by_hash(&self, source_hash: &str) -> Option<(JobId, SessionId)> {
+        self.jobs.iter().find_map(|(job_id, entry)| {
+            (entry.kind == JobKind::Transcribe && entry.source_hash.as_deref() == Some(source_hash))
+                .then_some((*job_id, entry.session_id))
+        })
     }
 
     /// Chạy lại (2.5): trả `Existing` nếu Phiên đã có một Job Chạy lại đang
@@ -489,6 +590,7 @@ impl JobRegistryActor {
         let entry = JobEntry {
             session_id,
             source_name: None,
+            source_hash: None,
             kind: JobKind::Rerun,
             state: if will_run_now {
                 JobState::Running
@@ -803,6 +905,19 @@ async fn run_job_inner(
         return JobOutcome::Cancelled;
     }
 
+    // Hash lại nguồn trước probe/decode (spec 2.8 Always: "Job khi bắt đầu
+    // chạy (kể cả sau khi chờ trong hàng) hash lại nguồn trước probe/decode
+    // ... thiếu file hoặc hash khác → Job `error`, không commit, không lưu
+    // Phiên") — bắt được trường hợp nguồn bị xoá/sửa trong lúc Job trước đó
+    // còn đang chạy.
+    if let Err(err) = verify_source_hash(&params.source_path, &params.source_hash).await {
+        return JobOutcome::Error(err);
+    }
+
+    if cancel.is_cancelled() {
+        return JobOutcome::Cancelled;
+    }
+
     // Probe first: total duration drives every progress event, independent
     // of whether Proxy staging below succeeds (spec Code Map: `probe`
     // "tổng thời lượng").
@@ -857,6 +972,17 @@ async fn run_job_inner(
     .await;
     if let Some(outcome) = decode_outcome {
         return outcome;
+    }
+
+    if cancel.is_cancelled() {
+        return JobOutcome::Cancelled;
+    }
+
+    // Hash lại lần nữa ngay trước commit (spec 2.8 Always) — nguồn có thể đã
+    // đổi/mất trong lúc decode/transcribe chạy (có thể mất nhiều phút);
+    // không bao giờ commit một Phiên với `source_hash` không còn đúng nữa.
+    if let Err(err) = verify_source_hash(&params.source_path, &params.source_hash).await {
+        return JobOutcome::Error(err);
     }
 
     if cancel.is_cancelled() {
@@ -1440,6 +1566,13 @@ mod tests {
     /// A tiny mono WAV fixture — big enough to produce exactly one 5-minute
     /// Chunk, small enough that hash/probe/decode/staging are effectively
     /// instantaneous in every test (spec Code Map: "fixture media nhỏ").
+    ///
+    /// Content is deterministically varied by `name` (folded into the sine
+    /// phase) so two fixtures created with different names never hash the
+    /// same (spec 2.8: `run_job_inner` now re-hashes the real source before
+    /// probe/decode and before commit, so `StartParams::source_hash` must be
+    /// the *real* content hash — tests that want two distinct Jobs need two
+    /// genuinely distinct files, not just distinct labels).
     fn wav_fixture(dir: &Path, name: &str) -> PathBuf {
         let path = dir.join(name);
         let spec = hound::WavSpec {
@@ -1448,24 +1581,48 @@ mod tests {
             bits_per_sample: 16,
             sample_format: hound::SampleFormat::Int,
         };
+        let seed = name.bytes().map(u32::from).sum::<u32>() as f32;
         let mut writer = hound::WavWriter::create(&path, spec).unwrap();
         for frame in 0..1_600_i32 {
-            let sample = ((frame as f32 * 0.05).sin() * 5_000.0) as i16;
+            let sample = (((frame as f32 + seed) * 0.05).sin() * 5_000.0) as i16;
             writer.write_sample(sample).unwrap();
         }
         writer.finalize().unwrap();
         path
     }
 
-    fn start_params(path: PathBuf, hash: &str) -> StartParams {
+    /// Builds `StartParams` for `path`, hashing its *real* current content
+    /// (spec 2.8 Always: Job hash lại nguồn và so với `source_hash` trước
+    /// probe/decode và trước commit — một hash bịa sẽ luôn bị coi là "nguồn
+    /// đã đổi"). `label` no longer feeds `source_hash` — it stays as a
+    /// call-site mnemonic only, kept so every existing `start_params(source,
+    /// "hash-...")` call site reads the same as before.
+    fn start_params(path: PathBuf, label: &str) -> StartParams {
+        let _ = label;
+        let source_hash = media::sha256_file(&path).expect("fixture phải hash được");
         StartParams {
             source_path: path,
-            source_hash: hash.to_string(),
+            source_hash,
             source_name: Some("fixture.wav".to_string()),
             model: "gemini-flash-lite-latest".to_string(),
             language: TranscribeLanguage::Auto,
             chunk_minutes: 5,
             consent: ConsentSnapshot::new(1, false),
+        }
+    }
+
+    /// Hầu hết test chỉ quan tâm trường hợp "vừa tạo Job mới" — helper này
+    /// unwrap thẳng `StartOutcome::Started` và panic với thông điệp rõ ràng
+    /// nếu một hash lặp lại vô tình trả `Existing` (bug test, không phải
+    /// hành vi mong đợi ở các test không kiểm dedup).
+    async fn start_new(handle: &JobRegistryHandle, params: StartParams) -> (JobId, SessionId) {
+        match handle.start(params).await.unwrap() {
+            StartOutcome::Started { job_id, session_id } => (job_id, session_id),
+            StartOutcome::Existing { .. } => {
+                panic!(
+                    "start_new: expected StartOutcome::Started, got Existing (trùng source_hash?)"
+                )
+            }
         }
     }
 
@@ -1526,12 +1683,13 @@ mod tests {
     async fn happy_path_commits_and_emits_a_result_event() {
         let root = tempdir().unwrap();
         let source = wav_fixture(root.path(), "a.wav");
+        let expected_hash = media::sha256_file(&source).unwrap();
         let transcriber = FakeTranscriber::new(vec![Behavior::Success("xin chào".to_string())]);
         let handle = registry_for_test(root.path(), transcriber);
         let (channel, received) = test_channel();
         handle.subscribe(channel).await.unwrap();
 
-        let (job_id, session_id) = handle.start(start_params(source, "hash-a")).await.unwrap();
+        let (job_id, session_id) = start_new(&handle, start_params(source, "hash-a")).await;
         wait_until_empty(&handle, Duration::from_secs(5)).await;
 
         let events = received.lock().unwrap().clone();
@@ -1550,11 +1708,266 @@ mod tests {
         db.with_connection(|conn| {
             let row = repo::sessions::get(conn, session_id)?.unwrap();
             assert_eq!(row.status, "complete");
-            assert_eq!(row.source_hash.as_deref(), Some("hash-a"));
+            assert_eq!(row.source_hash.as_deref(), Some(expected_hash.as_str()));
             Ok(())
         })
         .unwrap();
         assert!(!paths::staging_dir(root.path(), job_id).exists());
+    }
+
+    // ---------------------------------------------------------------------
+    // Story 2.8: reservation theo `source_hash` — nguyên tử qua
+    // `StartOutcome`, tự giải phóng khi Job rời registry, và hash lại nguồn
+    // trước khi chạy (spec Always, Acceptance Criteria hàng 1).
+    // ---------------------------------------------------------------------
+
+    /// Acceptance Criteria hàng 1: "Given hai lời gọi `transcribe_start`
+    /// đồng thời cùng nội dung mới, when cả hai hoàn tất, then đúng một Job
+    /// tồn tại và cả hai trả cùng `jobId`."
+    #[tokio::test]
+    async fn concurrent_starts_with_the_same_source_hash_resolve_to_exactly_one_job() {
+        let root = tempdir().unwrap();
+        let source = wav_fixture(root.path(), "a.wav");
+        let transcriber = FakeTranscriber::new(vec![Behavior::BlockUntilCancelled]);
+        let handle = registry_for_test(root.path(), transcriber);
+        let params = start_params(source, "hash-concurrent");
+
+        let (outcome_a, outcome_b) =
+            tokio::join!(handle.start(params.clone()), handle.start(params.clone()),);
+
+        fn ids(outcome: StartOutcome) -> (JobId, SessionId) {
+            match outcome {
+                StartOutcome::Started { job_id, session_id } => (job_id, session_id),
+                StartOutcome::Existing { job_id, session_id } => (job_id, session_id),
+            }
+        }
+        let (job_a, session_a) = ids(outcome_a.unwrap());
+        let (job_b, session_b) = ids(outcome_b.unwrap());
+
+        assert_eq!(job_a, job_b, "đúng một Job cho cùng source_hash");
+        assert_eq!(session_a, session_b);
+
+        let jobs = handle.snapshot().await.unwrap();
+        assert_eq!(jobs.len(), 1, "chỉ một Job tồn tại trong registry");
+
+        handle.cancel(job_a).await.unwrap();
+        wait_until_empty(&handle, Duration::from_secs(2)).await;
+    }
+
+    /// Gọi `start` lần hai trong khi lần đầu còn đang chạy (không phải
+    /// đồng thời thật sự, nhưng cùng đường: `handle_start` phải tìm thấy
+    /// entry đã có trước khi tạo mới) → vẫn đúng một Job.
+    #[tokio::test]
+    async fn a_second_start_while_the_first_is_still_running_returns_the_existing_job() {
+        let root = tempdir().unwrap();
+        let source = wav_fixture(root.path(), "a.wav");
+        let transcriber = FakeTranscriber::new(vec![Behavior::BlockUntilCancelled]);
+        let handle = registry_for_test(root.path(), transcriber);
+        let params = start_params(source, "hash-repeat");
+
+        let (job_1, session_1) = start_new(&handle, params.clone()).await;
+        wait_until_state(&handle, job_1, JobState::Running).await;
+
+        match handle.start(params).await.unwrap() {
+            StartOutcome::Existing { job_id, session_id } => {
+                assert_eq!(job_id, job_1);
+                assert_eq!(session_id, session_1);
+            }
+            StartOutcome::Started { .. } => panic!("phải trả Existing, không tạo Job thứ hai"),
+        }
+
+        let jobs = handle.snapshot().await.unwrap();
+        assert_eq!(jobs.len(), 1);
+
+        handle.cancel(job_1).await.unwrap();
+        wait_until_empty(&handle, Duration::from_secs(2)).await;
+    }
+
+    #[tokio::test]
+    async fn reservation_is_released_after_commit_so_a_later_start_with_the_same_hash_creates_a_new_job(
+    ) {
+        let root = tempdir().unwrap();
+        let source = wav_fixture(root.path(), "a.wav");
+        let transcriber = FakeTranscriber::new(vec![
+            Behavior::Success("một".to_string()),
+            Behavior::Success("hai".to_string()),
+        ]);
+        let handle = registry_for_test(root.path(), transcriber);
+
+        let (job_1, _) =
+            start_new(&handle, start_params(source.clone(), "hash-commit-reuse")).await;
+        wait_until_empty(&handle, Duration::from_secs(5)).await;
+
+        let (job_2, _) = start_new(&handle, start_params(source, "hash-commit-reuse")).await;
+        assert_ne!(
+            job_1, job_2,
+            "reservation phải giải phóng sau khi Job trước commit xong"
+        );
+        wait_until_empty(&handle, Duration::from_secs(5)).await;
+    }
+
+    #[tokio::test]
+    async fn reservation_is_released_after_cancel_so_a_later_start_with_the_same_hash_creates_a_new_job(
+    ) {
+        let root = tempdir().unwrap();
+        let source = wav_fixture(root.path(), "a.wav");
+        let transcriber = FakeTranscriber::new(vec![Behavior::BlockUntilCancelled]);
+        let handle = registry_for_test(root.path(), transcriber.clone());
+
+        let (job_1, _) =
+            start_new(&handle, start_params(source.clone(), "hash-cancel-reuse")).await;
+        // Chờ tới khi pipeline thật sự tới `transcriber.transcribe()` (chứ
+        // không chỉ `JobState::Running`, vốn được set ngay khi tạo entry,
+        // trước cả `probe`/hash lại nguồn) trước khi huỷ — nếu không, huỷ có
+        // thể trúng một trong các điểm kiểm `cancel.is_cancelled()` sớm hơn,
+        // để lại `Behavior::BlockUntilCancelled` chưa tiêu thụ trong hàng đợi
+        // dùng chung của `FakeTranscriber`, khiến `job_2` phía dưới (dùng lại
+        // cùng transcriber) treo mãi thay vì thấy `Behavior::Success` mặc định.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while transcriber.call_count() < 1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("pipeline phải gọi transcriber trong thời hạn");
+        handle.cancel(job_1).await.unwrap();
+        wait_until_empty(&handle, Duration::from_secs(2)).await;
+
+        let (job_2, _) = start_new(&handle, start_params(source, "hash-cancel-reuse")).await;
+        assert_ne!(
+            job_1, job_2,
+            "reservation phải giải phóng sau khi Job trước bị huỷ"
+        );
+        wait_until_empty(&handle, Duration::from_secs(5)).await;
+    }
+
+    #[tokio::test]
+    async fn reservation_is_released_after_a_fatal_error_so_a_later_start_with_the_same_hash_creates_a_new_job(
+    ) {
+        let root = tempdir().unwrap();
+        let source = wav_fixture(root.path(), "a.wav");
+        let transcriber = FakeTranscriber::new(vec![Behavior::Fail {
+            code: Code::Auth,
+            retryable: false,
+        }]);
+        let handle = registry_for_test(root.path(), transcriber);
+
+        let (job_1, _) = start_new(&handle, start_params(source.clone(), "hash-error-reuse")).await;
+        wait_until_empty(&handle, Duration::from_secs(5)).await;
+
+        let (job_2, _) = start_new(&handle, start_params(source, "hash-error-reuse")).await;
+        assert_ne!(
+            job_1, job_2,
+            "reservation phải giải phóng sau khi Job trước lỗi"
+        );
+        wait_until_empty(&handle, Duration::from_secs(5)).await;
+    }
+
+    /// spec Always: "Job khi bắt đầu chạy ... hash lại nguồn trước
+    /// probe/decode ... thiếu file hoặc hash khác → Job `error`, không
+    /// commit, không lưu Phiên." — nguồn còn đó nhưng nội dung đã đổi so với
+    /// lúc `source_hash` được tính (mô phỏng bằng một `source_hash` không
+    /// khớp thật).
+    #[tokio::test]
+    async fn a_source_hash_mismatch_at_job_start_errors_without_committing_or_leaving_staging() {
+        let root = tempdir().unwrap();
+        let source = wav_fixture(root.path(), "a.wav");
+        let params = StartParams {
+            source_hash: "not-the-real-hash".to_string(),
+            ..start_params(source, "unused")
+        };
+        let transcriber = FakeTranscriber::new(vec![]);
+        let handle = registry_for_test(root.path(), transcriber.clone());
+        let (channel, received) = test_channel();
+        handle.subscribe(channel).await.unwrap();
+
+        let (job_id, session_id) = start_new(&handle, params).await;
+        wait_until_empty(&handle, Duration::from_secs(5)).await;
+
+        assert_eq!(
+            transcriber.call_count(),
+            0,
+            "hash sai phải chặn trước cả probe/decode, không gọi transcriber"
+        );
+        let events = received.lock().unwrap().clone();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            JobEvent::Error { job_id: id, .. } if *id == job_id
+        )));
+
+        let db = Db::open(root.path()).unwrap();
+        db.with_connection(|conn| {
+            assert!(repo::sessions::get(conn, session_id)?.is_none());
+            Ok(())
+        })
+        .unwrap();
+        assert!(!paths::staging_dir(root.path(), job_id).exists());
+    }
+
+    /// Cùng gate, nhánh "thiếu file": nguồn bị xoá trước khi Job kịp chạy.
+    #[tokio::test]
+    async fn a_missing_source_file_at_job_start_errors_without_committing_or_leaving_staging() {
+        let root = tempdir().unwrap();
+        let source = wav_fixture(root.path(), "a.wav");
+        let params = start_params(source.clone(), "hash-missing");
+        std::fs::remove_file(&source).unwrap();
+
+        let transcriber = FakeTranscriber::new(vec![]);
+        let handle = registry_for_test(root.path(), transcriber.clone());
+        let (channel, received) = test_channel();
+        handle.subscribe(channel).await.unwrap();
+
+        let (job_id, session_id) = start_new(&handle, params).await;
+        wait_until_empty(&handle, Duration::from_secs(5)).await;
+
+        assert_eq!(transcriber.call_count(), 0);
+        let events = received.lock().unwrap().clone();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            JobEvent::Error { job_id: id, .. } if *id == job_id
+        )));
+
+        let db = Db::open(root.path()).unwrap();
+        db.with_connection(|conn| {
+            assert!(repo::sessions::get(conn, session_id)?.is_none());
+            Ok(())
+        })
+        .unwrap();
+        assert!(!paths::staging_dir(root.path(), job_id).exists());
+    }
+
+    /// `find_transcribe_by_hash` là snapshot đọc dùng ở gate `ipc::` để bỏ
+    /// qua `probe` sớm cho file trùng Job (spec Code Map) — không tự nó tạo
+    /// hay xoá gì trong registry.
+    #[tokio::test]
+    async fn find_transcribe_by_hash_reports_a_running_job_and_nothing_once_it_is_gone() {
+        let root = tempdir().unwrap();
+        let source = wav_fixture(root.path(), "a.wav");
+        let transcriber = FakeTranscriber::new(vec![Behavior::BlockUntilCancelled]);
+        let handle = registry_for_test(root.path(), transcriber);
+        let params = start_params(source, "hash-findbyhash");
+        let hash = params.source_hash.clone();
+
+        assert_eq!(
+            handle.find_transcribe_by_hash(hash.clone()).await.unwrap(),
+            None,
+            "chưa start thì chưa có gì để tìm"
+        );
+
+        let (job_id, session_id) = start_new(&handle, params).await;
+        assert_eq!(
+            handle.find_transcribe_by_hash(hash.clone()).await.unwrap(),
+            Some((job_id, session_id))
+        );
+
+        handle.cancel(job_id).await.unwrap();
+        wait_until_empty(&handle, Duration::from_secs(2)).await;
+
+        assert_eq!(
+            handle.find_transcribe_by_hash(hash).await.unwrap(),
+            None,
+            "reservation phải biến mất cùng lúc Job rời registry"
+        );
     }
 
     #[tokio::test]
@@ -1568,10 +1981,7 @@ mod tests {
         let (channel, received) = test_channel();
         handle.subscribe(channel).await.unwrap();
 
-        let (job_id, _) = handle
-            .start(start_params(source, "hash-waiting"))
-            .await
-            .unwrap();
+        let (job_id, _) = start_new(&handle, start_params(source, "hash-waiting")).await;
         wait_until_empty(&handle, Duration::from_secs(5)).await;
 
         let events = received.lock().unwrap().clone();
@@ -1595,15 +2005,9 @@ mod tests {
         let transcriber = FakeTranscriber::new(vec![Behavior::BlockUntilCancelled]);
         let handle = registry_for_test(root.path(), transcriber);
 
-        let (job_a, _) = handle
-            .start(start_params(source_a, "hash-a"))
-            .await
-            .unwrap();
+        let (job_a, _) = start_new(&handle, start_params(source_a, "hash-a")).await;
         wait_until_state(&handle, job_a, JobState::Running).await;
-        let (job_b, _) = handle
-            .start(start_params(source_b, "hash-b"))
-            .await
-            .unwrap();
+        let (job_b, _) = start_new(&handle, start_params(source_b, "hash-b")).await;
 
         let jobs = handle.snapshot().await.unwrap();
         assert_eq!(jobs.len(), 2);
@@ -1635,10 +2039,7 @@ mod tests {
         let (channel, received) = test_channel();
         handle.subscribe(channel).await.unwrap();
 
-        let (job_id, session_id) = handle
-            .start(start_params(source, "hash-cancel"))
-            .await
-            .unwrap();
+        let (job_id, session_id) = start_new(&handle, start_params(source, "hash-cancel")).await;
         wait_until_state(&handle, job_id, JobState::Running).await;
 
         let start = std::time::Instant::now();
@@ -1673,10 +2074,7 @@ mod tests {
         let transcriber = FakeTranscriber::new(vec![Behavior::Success("done".to_string())]);
         let handle = registry_for_test(root.path(), transcriber);
 
-        let (job_id, _) = handle
-            .start(start_params(source, "hash-done"))
-            .await
-            .unwrap();
+        let (job_id, _) = start_new(&handle, start_params(source, "hash-done")).await;
         wait_until_empty(&handle, Duration::from_secs(5)).await;
 
         assert_eq!(
@@ -1698,10 +2096,7 @@ mod tests {
             retryable: true,
         }]);
         let handle = registry_for_test(root.path(), transcriber);
-        let (job_id, session_id) = handle
-            .start(start_params(source, "hash-gap"))
-            .await
-            .unwrap();
+        let (job_id, session_id) = start_new(&handle, start_params(source, "hash-gap")).await;
         wait_until_empty(&handle, Duration::from_secs(5)).await;
 
         let db = Db::open(root.path()).unwrap();
@@ -1737,10 +2132,7 @@ mod tests {
         let (channel, received) = test_channel();
         handle.subscribe(channel).await.unwrap();
 
-        let (job_id, session_id) = handle
-            .start(start_params(source, "hash-fatal"))
-            .await
-            .unwrap();
+        let (job_id, session_id) = start_new(&handle, start_params(source, "hash-fatal")).await;
         wait_until_empty(&handle, Duration::from_secs(5)).await;
 
         assert_eq!(
@@ -1769,10 +2161,7 @@ mod tests {
         let transcriber = FakeTranscriber::new(vec![Behavior::BlockUntilCancelled]);
         let handle = registry_for_test(root.path(), transcriber);
 
-        let (job_id, _) = handle
-            .start(start_params(source, "hash-seq"))
-            .await
-            .unwrap();
+        let (job_id, _) = start_new(&handle, start_params(source, "hash-seq")).await;
         wait_until_state(&handle, job_id, JobState::Running).await;
 
         let (channel_a, received_a) = test_channel();
@@ -1803,10 +2192,7 @@ mod tests {
         let transcriber = FakeTranscriber::new(vec![Behavior::BlockUntilCancelled]);
         let handle = registry_for_test(root.path(), transcriber);
 
-        let (job_id, session_id) = handle
-            .start(start_params(source, "hash-busy"))
-            .await
-            .unwrap();
+        let (job_id, session_id) = start_new(&handle, start_params(source, "hash-busy")).await;
         wait_until_state(&handle, job_id, JobState::Running).await;
 
         assert!(handle.is_busy(session_id).await.unwrap());
@@ -1861,7 +2247,7 @@ mod tests {
             chunk_minutes: 1,
             ..start_params(source, "hash-chunk-minutes-one")
         };
-        handle.start(params).await.unwrap();
+        start_new(&handle, params).await;
         wait_until_empty(&handle, Duration::from_secs(10)).await;
 
         assert_eq!(transcriber.call_count(), 3);
@@ -1881,7 +2267,7 @@ mod tests {
             language: TranscribeLanguage::Ja,
             ..start_params(source, "hash-lang-ja")
         };
-        let (_job_id, session_id) = handle.start(params).await.unwrap();
+        let (_job_id, session_id) = start_new(&handle, params).await;
         wait_until_empty(&handle, Duration::from_secs(5)).await;
 
         assert_eq!(transcriber.languages_seen(), vec![TranscribeLanguage::Ja]);
@@ -1906,10 +2292,8 @@ mod tests {
         let (handle, actor) = channel(db.clone(), root.path().to_path_buf(), transcriber);
         tokio::spawn(actor.run());
 
-        let (_job_id, session_id) = handle
-            .start(start_params(source, "hash-lang-auto"))
-            .await
-            .unwrap();
+        let (_job_id, session_id) =
+            start_new(&handle, start_params(source, "hash-lang-auto")).await;
         wait_until_empty(&handle, Duration::from_secs(5)).await;
 
         let transcript_id = db
@@ -1951,8 +2335,8 @@ mod tests {
             ..start_params(source_b, "hash-cfg-b")
         };
 
-        handle.start(params_a).await.unwrap();
-        handle.start(params_b).await.unwrap();
+        start_new(&handle, params_a).await;
+        start_new(&handle, params_b).await;
         wait_until_empty(&handle, Duration::from_secs(5)).await;
 
         assert_eq!(
@@ -2676,10 +3060,7 @@ mod tests {
         .await;
         let handle = registry_for_test(root.path(), gateway_transcriber(gateway));
 
-        let (_job_id, session_id) = handle
-            .start(start_params(source, "hash-429"))
-            .await
-            .unwrap();
+        let (_job_id, session_id) = start_new(&handle, start_params(source, "hash-429")).await;
         wait_until_empty(&handle, Duration::from_secs(5)).await;
 
         let db = Db::open(root.path()).unwrap();
@@ -2715,10 +3096,7 @@ mod tests {
         let gateway = gateway_with(vec![key("a", "AIzaA123456789")], transport.clone()).await;
         let handle = registry_for_test(root.path(), gateway_transcriber(gateway));
 
-        let (_job_id, session_id) = handle
-            .start(start_params(source, "hash-503x4"))
-            .await
-            .unwrap();
+        let (_job_id, session_id) = start_new(&handle, start_params(source, "hash-503x4")).await;
         wait_until_empty(&handle, Duration::from_secs(5)).await;
 
         let db = Db::open(root.path()).unwrap();
@@ -2772,10 +3150,8 @@ mod tests {
         let gateway = gateway_with(vec![key("a", "AIzaA123456789")], transport.clone()).await;
         let handle = registry_for_test(root.path(), gateway_transcriber(gateway));
 
-        let (_job_id, session_id) = handle
-            .start(start_params(source, "hash-truncated"))
-            .await
-            .unwrap();
+        let (_job_id, session_id) =
+            start_new(&handle, start_params(source, "hash-truncated")).await;
         wait_until_empty(&handle, Duration::from_secs(5)).await;
 
         let db = Db::open(root.path()).unwrap();
@@ -2806,10 +3182,7 @@ mod tests {
         let (channel, received) = test_channel();
         handle.subscribe(channel).await.unwrap();
 
-        let (job_id, session_id) = handle
-            .start(start_params(source, "hash-401-all"))
-            .await
-            .unwrap();
+        let (job_id, session_id) = start_new(&handle, start_params(source, "hash-401-all")).await;
         wait_until_empty(&handle, Duration::from_secs(5)).await;
 
         let events = received.lock().unwrap().clone();
@@ -2870,10 +3243,8 @@ mod tests {
         .await;
         let handle = registry_for_test(root.path(), gateway_transcriber(gateway));
 
-        let (_job_id, session_id) = handle
-            .start(start_params(source, "hash-401-mid-job"))
-            .await
-            .unwrap();
+        let (_job_id, session_id) =
+            start_new(&handle, start_params(source, "hash-401-mid-job")).await;
         wait_until_empty(&handle, Duration::from_secs(30)).await;
 
         let db = Db::open(root.path()).unwrap();

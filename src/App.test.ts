@@ -28,6 +28,13 @@ vi.mock('./lib/keymap', () => ({
 }));
 vi.mock('./lib/stores/settings.svelte', () => ({ settingsStore: mocks.settingsStore }));
 vi.mock('./lib/stores/app.svelte', () => ({ appStore: mocks.appStore }));
+// AppShell registers a webview-wide drag-drop listener (story 2.8) — the
+// real `@tauri-apps/api/webview` has no window to bind to outside a real
+// Tauri runtime, so this suite (composing the real App shell) mocks the
+// same seam module AppShell.test.ts mocks.
+vi.mock('./lib/dragdrop', () => ({
+  onDragDropEvent: vi.fn(() => Promise.resolve(() => {})),
+}));
 
 afterEach(() => cleanup());
 
