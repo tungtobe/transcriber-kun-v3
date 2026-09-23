@@ -11,6 +11,10 @@ pub const MODELS_PATH: &str = "/v1beta/models";
 pub const DEFAULT_MODELS_PAGE_SIZE: u32 = 10;
 pub const MODELS_LIST_TIMEOUT: Duration = Duration::from_secs(15);
 pub const KEY_TEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// A transcribe chunk's single-operation deadline, including key-pool wait.
+pub const TRANSCRIBE_CHUNK_TIMEOUT: Duration = Duration::from_secs(120);
+/// Maximum serialized JSON body sent for one inline transcribe request.
+pub const MAX_TRANSCRIBE_REQUEST_BYTES: usize = 20 * 1024 * 1024;
 // Owned by `core::model_defaults` so `settings` can fall back to the same
 // strings without a feature-to-feature import (Story 1.9 Code Map).
 pub use crate::core::model_defaults::{

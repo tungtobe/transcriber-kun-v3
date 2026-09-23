@@ -73,6 +73,7 @@ pub enum RequestOutcome {
     Quota,
     Auth,
     Request,
+    Server,
     Timeout,
 }
 
@@ -528,6 +529,10 @@ impl KeyPoolActor {
                 Code::Request,
                 "Gemini key validation request was rejected",
             )),
+            RequestOutcome::Server => Err(AppError::new(
+                Code::Network,
+                "Gemini service is unavailable",
+            )),
             RequestOutcome::Timeout => Err(AppError::new(
                 Code::Timeout,
                 "Gemini key validation timed out",
@@ -574,6 +579,9 @@ impl KeyPoolActor {
                     Code::Timeout,
                     "request timed out without key rotation",
                 )));
+            }
+            RequestOutcome::Server => {
+                self.retry_or_finish(lease.request_id, Code::Network, reply);
             }
             RequestOutcome::Quota => {
                 let until = self.clock.now() + QUOTA_COOLDOWN;
@@ -933,6 +941,27 @@ mod tests {
             let error = pool.report(lease, outcome).await.unwrap_err();
             assert!(matches!(error.code, Code::Request | Code::Timeout));
         }
+    }
+
+    #[tokio::test]
+    async fn server_failures_retry_serially_within_the_attempt_budget() {
+        let (pool, _provider, _clock) = pool(vec![material("a", "A")]).await;
+        let mut lease = pool.acquire(Priority::Job).await.unwrap();
+        let mut attempts = 1;
+        loop {
+            match pool.report(lease, RequestOutcome::Server).await {
+                Ok(ReportAction::Retry(next)) => {
+                    attempts += 1;
+                    lease = next;
+                }
+                Err(error) => {
+                    assert_eq!(error.code, Code::Network);
+                    break;
+                }
+                Ok(ReportAction::Complete) => panic!("server failure must retry"),
+            }
+        }
+        assert_eq!(attempts, MAX_ATTEMPTS);
     }
 
     #[tokio::test]

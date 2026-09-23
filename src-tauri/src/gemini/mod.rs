@@ -28,7 +28,8 @@ use crate::secrets::KeyId;
 
 use self::keys::{KeyPoolHandle, Priority, ReportAction, RequestOutcome};
 use self::params::{
-    DEFAULT_MODELS_PAGE_SIZE, GEMINI_BASE_URL, KEY_TEST_TIMEOUT, MODELS_LIST_TIMEOUT, MODELS_PATH,
+    DEFAULT_MODELS_PAGE_SIZE, GEMINI_BASE_URL, KEY_TEST_TIMEOUT, MAX_TRANSCRIBE_REQUEST_BYTES,
+    MODELS_LIST_TIMEOUT, MODELS_PATH, TRANSCRIBE_CHUNK_TIMEOUT,
 };
 
 /// Preserve the Story 1.5 seam for callers that only need a consent-gated
@@ -159,6 +160,7 @@ impl CancellationToken {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HttpMethod {
     Get,
+    Post,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -185,6 +187,7 @@ pub struct TransportRequest {
     pub path: String,
     pub query: Vec<(String, String)>,
     pub headers: Vec<TransportHeader>,
+    pub body: Option<Sensitive<String>>,
 }
 
 impl fmt::Debug for TransportRequest {
@@ -195,6 +198,7 @@ impl fmt::Debug for TransportRequest {
             .field("path", &self.path)
             .field("query", &self.query)
             .field("headers", &self.headers)
+            .field("body", &self.body.as_ref().map(|_| "[redacted]"))
             .finish()
     }
 }
@@ -213,6 +217,26 @@ impl TransportRequest {
                 name: "x-goog-api-key".to_string(),
                 value: secret,
             }],
+            body: None,
+        }
+    }
+
+    fn job_post(path: &str, secret: Sensitive<String>, body: String) -> Self {
+        Self {
+            method: HttpMethod::Post,
+            path: path.to_string(),
+            query: Vec::new(),
+            headers: vec![
+                TransportHeader {
+                    name: "x-goog-api-key".to_string(),
+                    value: secret,
+                },
+                TransportHeader {
+                    name: "content-type".to_string(),
+                    value: Sensitive::new("application/json".to_string()),
+                },
+            ],
+            body: Some(Sensitive::new(body)),
         }
     }
 
@@ -307,6 +331,7 @@ impl GeminiTransport for ReqwestTransport {
 
             let method = match request.method {
                 HttpMethod::Get => reqwest::Method::GET,
+                HttpMethod::Post => reqwest::Method::POST,
             };
             let mut builder = client.request(method, url);
             for header in request.headers {
@@ -315,6 +340,9 @@ impl GeminiTransport for ReqwestTransport {
                 let value = reqwest::header::HeaderValue::from_str(header.value.expose())
                     .map_err(|_| TransportError::Network)?;
                 builder = builder.header(name, value);
+            }
+            if let Some(body) = request.body {
+                builder = builder.body(body.into_inner());
             }
 
             let response = builder.send().await.map_err(map_reqwest_error)?;
@@ -439,7 +467,7 @@ impl GeminiGateway {
 
                 if let Some((outcome, error)) = classify_http_status(response.status) {
                     match outcome {
-                        RequestOutcome::Quota | RequestOutcome::Auth => {
+                        RequestOutcome::Quota | RequestOutcome::Auth | RequestOutcome::Server => {
                             let request_id = lease.request_id.clone();
                             let report = self.key_pool.report(lease, outcome);
                             tokio::pin!(report);
@@ -569,6 +597,88 @@ impl GeminiGateway {
         })
     }
 
+    /// Send one sensitive JSON request for a transcribe Job through the shared
+    /// consent, key-pool, cancellation, and deadline path. The deadline starts
+    /// before key acquisition, so queueing and transport share the same 120 s.
+    pub async fn post_job(
+        &self,
+        path: &str,
+        body: String,
+        consent: ConsentSnapshot,
+        cancellation: CancellationToken,
+    ) -> Result<TransportResponse, AppError> {
+        require_consent(consent)?;
+        validate_job_path(path)?;
+        if body.len() >= MAX_TRANSCRIBE_REQUEST_BYTES {
+            return Err(AppError::new(
+                Code::Format,
+                "Gemini transcribe request exceeds the inline JSON size limit",
+            ));
+        }
+
+        let body = Sensitive::new(body);
+        let deadline = Instant::now() + TRANSCRIBE_CHUNK_TIMEOUT;
+        let mut lease = {
+            let budget = remaining(deadline)?;
+            let acquire = self.key_pool.acquire_with_budget(Priority::Job, budget);
+            tokio::pin!(acquire);
+            tokio::select! {
+                result = &mut acquire => result?,
+                _ = cancellation.cancelled() => return Err(cancelled_error()),
+            }
+        };
+
+        loop {
+            if cancellation.is_cancelled() {
+                let _ = self.key_pool.cancel(lease.request_id.clone()).await;
+                return Err(cancelled_error());
+            }
+            let request =
+                TransportRequest::job_post(path, lease.secret.clone(), body.expose().clone());
+            let response = match self
+                .send(request, deadline, &cancellation, &lease.request_id)
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    let _ = self.key_pool.report(lease, outcome_for_error(&error)).await;
+                    return Err(error);
+                }
+            };
+
+            if let Some((outcome, error)) = classify_http_status(response.status) {
+                match outcome {
+                    RequestOutcome::Quota | RequestOutcome::Auth | RequestOutcome::Server => {
+                        let request_id = lease.request_id.clone();
+                        let report = self.key_pool.report(lease, outcome);
+                        tokio::pin!(report);
+                        let reported = tokio::select! {
+                            result = &mut report => result,
+                            _ = cancellation.cancelled() => {
+                                let _ = self.key_pool.cancel(request_id).await;
+                                return Err(cancelled_error());
+                            }
+                        };
+                        match reported {
+                            Ok(ReportAction::Retry(next)) => lease = next,
+                            Ok(ReportAction::Complete) => return Err(error),
+                            Err(report_error) => return Err(report_error),
+                        }
+                    }
+                    RequestOutcome::Request | RequestOutcome::Timeout => {
+                        let _ = self.key_pool.report(lease, outcome).await;
+                        return Err(error);
+                    }
+                    RequestOutcome::Success => unreachable!(),
+                }
+                continue;
+            }
+
+            self.key_pool.report(lease, RequestOutcome::Success).await?;
+            return Ok(response);
+        }
+    }
+
     async fn send(
         &self,
         request: TransportRequest,
@@ -594,6 +704,22 @@ impl GeminiGateway {
                 Err(cancelled_error())
             }
         }
+    }
+}
+
+fn validate_job_path(path: &str) -> Result<(), AppError> {
+    if path.starts_with("/v1beta/")
+        && !path.contains('?')
+        && !path.contains('#')
+        && !path.contains('\\')
+        && !path.split('/').any(|component| component == "..")
+    {
+        Ok(())
+    } else {
+        Err(AppError::new(
+            Code::Request,
+            "Gemini Job request path is invalid",
+        ))
     }
 }
 
@@ -659,7 +785,7 @@ fn classify_http_status(status: u16) -> Option<(RequestOutcome, AppError)> {
             "Gemini request was rejected",
         ),
         500..=599 => (
-            RequestOutcome::Request,
+            RequestOutcome::Server,
             Code::Network,
             "Gemini service is unavailable",
         ),
@@ -991,6 +1117,102 @@ mod tests {
         let requests = transport.requests();
         assert_eq!(requests[0].header("x-goog-api-key"), Some("AIzaA123456789"));
         assert_eq!(requests[1].header("x-goog-api-key"), Some("AQ.B123456789"));
+    }
+
+    #[tokio::test]
+    async fn post_job_retries_5xx_serially_and_locks_request_contract() {
+        let body = r#"{"contents":[{"parts":[{"inline_data":{"mime_type":"audio/flac","data":"Zm9v"}}]}]}"#;
+        let transport = FakeTransport::new(vec![
+            Ok(TransportResponse {
+                status: 503,
+                body: "temporary failure".to_string(),
+            }),
+            Ok(TransportResponse {
+                status: 200,
+                body: "{\"candidates\":[]}".to_string(),
+            }),
+        ]);
+        let gateway = gateway_with(vec![key("a", "AIzaA123456789")], transport.clone()).await;
+        let response = gateway
+            .post_job(
+                "/v1beta/models/models/opaque:generateContent",
+                body.to_string(),
+                ConsentSnapshot::new(1, false),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status, 200);
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 2);
+        for request in requests {
+            assert_eq!(request.method, HttpMethod::Post);
+            assert_eq!(request.path, "/v1beta/models/models/opaque:generateContent");
+            assert!(request.query.is_empty());
+            assert_eq!(request.header("x-goog-api-key"), Some("AIzaA123456789"));
+            assert_eq!(request.header("content-type"), Some("application/json"));
+            assert_eq!(request.body.as_ref().unwrap().expose(), body);
+        }
+    }
+
+    #[tokio::test]
+    async fn post_job_rejects_nonretryable_http_errors_and_oversized_body() {
+        for (status, code) in [
+            (400, Code::Request),
+            (404, Code::Model),
+            (451, Code::Blocked),
+        ] {
+            let transport = FakeTransport::new(vec![Ok(TransportResponse {
+                status,
+                body: "rejected".to_string(),
+            })]);
+            let gateway = gateway_with(vec![key("a", "AIzaA123456789")], transport.clone()).await;
+            let error = gateway
+                .post_job(
+                    "/v1beta/interactions",
+                    "{}".to_string(),
+                    ConsentSnapshot::new(1, false),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, code);
+            assert_eq!(transport.requests().len(), 1);
+        }
+
+        let transport = FakeTransport::new(vec![]);
+        let gateway = gateway_with(vec![key("a", "AIzaA123456789")], transport.clone()).await;
+        let error = gateway
+            .post_job(
+                "/v1beta/interactions",
+                "x".repeat(MAX_TRANSCRIBE_REQUEST_BYTES),
+                ConsentSnapshot::new(1, false),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, Code::Format);
+        assert!(transport.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn post_job_deadline_is_terminal_and_request_body_is_redacted() {
+        let transport = FakeTransport::new(vec![Err(TransportError::Timeout)]);
+        let gateway = gateway_with(vec![key("a", "AIzaA123456789")], transport.clone()).await;
+        let body = "private audio and transcript bytes";
+        let error = gateway
+            .post_job(
+                "/v1beta/interactions",
+                body.to_string(),
+                ConsentSnapshot::new(1, false),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, Code::Timeout);
+        assert_eq!(transport.requests().len(), 1);
+        assert!(!format!("{:?}", transport.requests()[0]).contains(body));
     }
 
     #[tokio::test]
