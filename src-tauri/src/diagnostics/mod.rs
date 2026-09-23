@@ -231,8 +231,10 @@ pub fn default_export_file_name(now: SystemTime) -> String {
 /// runtime không cần biết tới nó.
 fn scrub_paths_and_username(input: &str) -> String {
     static PATH_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?:[A-Za-z]:\\(?:[^\\\r\n]+\\)*[^\\\r\n]+|/(?:Users|home)/[^/\s]+(?:/[^\s]*)?)")
-            .unwrap()
+        Regex::new(
+            r"(?:[A-Za-z]:\\(?:[^\\\r\n]+\\)*[^\\\r\n]+|/(?:Users|home)/[^/\s]+(?:/[^\s]*)?)",
+        )
+        .unwrap()
     });
 
     let mut out = PATH_PATTERN.replace_all(input, "[path]").into_owned();
@@ -387,7 +389,7 @@ mod tests {
     fn boot_after_unclean_shutdown_increments_crash_once() {
         let db = open_db();
         note_boot(&db).unwrap(); // lần chạy đầu tiên (không phải crash)
-        // Không gọi `mark_clean_shutdown` -- mô phỏng thoát không sạch.
+                                 // Không gọi `mark_clean_shutdown` -- mô phỏng thoát không sạch.
         note_boot(&db).unwrap();
         assert_eq!(summary(&db).unwrap().crashes, 1);
     }
@@ -414,8 +416,8 @@ mod tests {
         })
         .unwrap();
 
-        let err = record_error(&db, Category::Model)
-            .expect_err("bảng đã bị xoá nên ghi đếm phải lỗi");
+        let err =
+            record_error(&db, Category::Model).expect_err("bảng đã bị xoá nên ghi đếm phải lỗi");
         assert_eq!(err.category, Category::Storage);
     }
 
@@ -627,7 +629,10 @@ mod tests {
         // thuật toán `civil_from_unix_days` để test tất định, không phụ
         // thuộc đồng hồ hệ thống lúc chạy test.
         let instant = UNIX_EPOCH + std::time::Duration::from_secs(100 * 86_400);
-        assert_eq!(default_export_file_name(instant), "trans-kun-diagnostics-19700411.txt");
+        assert_eq!(
+            default_export_file_name(instant),
+            "trans-kun-diagnostics-19700411.txt"
+        );
     }
 
     #[test]

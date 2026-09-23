@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 use specta::Type;
 
 use crate::core::error::{AppError, Code};
-use crate::core::model_defaults::{DEFAULT_LIVE_MODEL, DEFAULT_MEMO_MODEL, DEFAULT_TRANSCRIBE_MODEL};
+use crate::core::model_defaults::{
+    DEFAULT_LIVE_MODEL, DEFAULT_MEMO_MODEL, DEFAULT_TRANSCRIBE_MODEL,
+};
 use crate::db::{repo, Db};
 
 /// `theme: 'system' | 'light' | 'dark'`, mặc định `system` (spec Decisions).
@@ -93,7 +95,11 @@ const KEY_MEMO_MODEL: &str = "memoModel";
 /// parsed-but-blank string (e.g. a hand-edited DB row) all fall back to
 /// `default` the same way (spec: "load fallback về mặc định khi thiếu hoặc
 /// hỏng").
-fn load_model_field(raw: &std::collections::HashMap<String, String>, key: &str, default: &str) -> String {
+fn load_model_field(
+    raw: &std::collections::HashMap<String, String>,
+    key: &str,
+    default: &str,
+) -> String {
     match raw.get(key) {
         None => default.to_string(),
         Some(value) => match serde_json::from_str::<String>(value) {

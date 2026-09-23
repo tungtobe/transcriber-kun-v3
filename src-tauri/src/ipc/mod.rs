@@ -291,7 +291,11 @@ async fn models_list(
         .and_then(|inner| inner);
     let result = match consent_result {
         Ok(consent) => match state.gateway.clone() {
-            Ok(gateway) => gateway.models_list(kind, consent, CancellationToken::new()).await,
+            Ok(gateway) => {
+                gateway
+                    .models_list(kind, consent, CancellationToken::new())
+                    .await
+            }
             Err(err) => Err(err),
         },
         Err(err) => Err(err),
@@ -314,7 +318,11 @@ async fn keys_test(
         .and_then(|inner| inner);
     let result = match consent_result {
         Ok(consent) => match state.gateway.clone() {
-            Ok(gateway) => gateway.keys_test(id, consent, CancellationToken::new()).await,
+            Ok(gateway) => {
+                gateway
+                    .keys_test(id, consent, CancellationToken::new())
+                    .await
+            }
             Err(err) => Err(err),
         },
         Err(err) => Err(err),
