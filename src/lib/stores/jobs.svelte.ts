@@ -15,6 +15,8 @@ import {
   type CancelOutcome,
   type JobEvent,
   type JobSnapshot,
+  type RerunScope,
+  type TranscribeRerunOutcome,
   type TranscribeStartOutcome,
 } from '../bindings';
 
@@ -116,6 +118,24 @@ export function createJobsStore() {
     }
   }
 
+  /** Chạy lại (2.5): scope `missing`/`all`/`gap(gap_id)` — see
+   * `RerunScope` in bindings.ts. Mirrors `start()`'s try/catch-to-typed-error
+   * contract so callers never need a bare `try`/`catch` of their own. */
+  async function rerun(
+    sessionId: string,
+    transcriptId: string,
+    scope: RerunScope,
+  ): Promise<TranscribeRerunOutcome | { error: AppError }> {
+    try {
+      const result = await commands.transcribeRerun(sessionId, transcriptId, scope);
+      return result.status === 'ok' ? result.data : { error: result.error };
+    } catch {
+      return {
+        error: { category: 'network', code: 'network', detailRedacted: 'transcribe rerun unavailable' },
+      };
+    }
+  }
+
   async function cancel(jobId: string): Promise<CancelOutcome | null> {
     try {
       const result = await commands.jobsCancel(jobId);
@@ -151,6 +171,7 @@ export function createJobsStore() {
     subscribe,
     unsubscribe,
     start,
+    rerun,
     cancel,
     reset,
   };

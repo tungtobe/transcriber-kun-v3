@@ -5,3 +5,4 @@ pub mod job;
 pub mod merge;
 pub mod parser;
 pub mod registry;
+pub mod rerun;

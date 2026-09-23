@@ -17,7 +17,8 @@ use tauri_specta::{collect_commands, collect_events, Builder, Event};
 
 use crate::consent::{self, ConsentPolicy};
 use crate::core::error::{AppError, Code};
-use crate::core::id::{JobId, SessionId};
+use crate::core::id::{JobId, SessionId, TranscriptId};
+use crate::core::paths;
 use crate::db::{repo, Db};
 use crate::diagnostics::{self, DiagnosticsSummary};
 use crate::gemini::{CancellationToken, ConsentSnapshot, KeyTestResult, ModelInfo, ModelKind};
@@ -25,7 +26,8 @@ use crate::library;
 use crate::secrets::{KeyId, KeyMetadata};
 use crate::settings::{self, Settings, SettingsChanged};
 use crate::transcribe::job::{CancelOutcome, JobEvent};
-use crate::transcribe::registry;
+use crate::transcribe::registry::{self, RerunOutcome, RerunParams};
+use crate::transcribe::rerun::{self, RerunScope};
 use boot::AppState;
 
 /// Phát khi cửa sổ chính bị yêu cầu đóng trong lúc registry bận (spec Design
@@ -604,6 +606,188 @@ async fn transcribe_start(
     track_ipc_error(&state.db, result).await
 }
 
+/// Kết quả `transcribe_rerun` (spec I/O Matrix "Chạy lại `missing`/`gap(id)`/
+/// `all`", "Không có gì để chạy", "Gọi trùng").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum TranscribeRerunOutcome {
+    Started { job_id: JobId },
+    Existing { job_id: JobId },
+    NothingToRerun,
+}
+
+/// Pure gate-order decision for `transcribe_rerun` (spec Tasks: "gate tách
+/// hàm test được: Consent → tra Phiên/transcript thuộc Phiên → từ chối
+/// `primary` của Phiên live → giải scope thành vùng (`gap_id` phải là gap
+/// `chunk_failed`) → `NothingToRerun` nếu rỗng → Proxy tồn tại → có key →
+/// Job hiện có hoặc start"). Mirrors [`decide_transcribe_start`]: every
+/// closure is called at most once, strictly in this order, only once every
+/// earlier gate passed.
+#[allow(clippy::too_many_arguments)]
+async fn decide_transcribe_rerun<LoadFut, RangesFut, ProxyFut, KeyFut, StartFut>(
+    consent_current: bool,
+    load_session_and_transcript: impl FnOnce() -> LoadFut,
+    resolve_ranges: impl FnOnce(
+        &repo::sessions::SessionRow,
+        &repo::transcripts::TranscriptRow,
+    ) -> RangesFut,
+    check_proxy: impl FnOnce(&repo::sessions::SessionRow) -> ProxyFut,
+    has_usable_key: impl FnOnce() -> KeyFut,
+    start_rerun: impl FnOnce(Vec<rerun::RerunRange>, std::path::PathBuf) -> StartFut,
+) -> Result<TranscribeRerunOutcome, AppError>
+where
+    LoadFut: std::future::Future<
+        Output = Result<(repo::sessions::SessionRow, repo::transcripts::TranscriptRow), AppError>,
+    >,
+    RangesFut: std::future::Future<Output = Result<Vec<rerun::RerunRange>, AppError>>,
+    ProxyFut: std::future::Future<Output = Result<std::path::PathBuf, AppError>>,
+    KeyFut: std::future::Future<Output = Result<bool, AppError>>,
+    StartFut: std::future::Future<Output = Result<RerunOutcome, AppError>>,
+{
+    if !consent_current {
+        return Err(AppError::new(
+            Code::Auth,
+            "Current consent is required before a rerun can start",
+        ));
+    }
+
+    let (session, transcript) = load_session_and_transcript().await?;
+
+    if session.kind == "live" && transcript.variant == repo::transcripts::Variant::Primary {
+        return Err(AppError::new(
+            Code::Request,
+            "Không thể Chạy lại primary của một Phiên live",
+        ));
+    }
+
+    let ranges = resolve_ranges(&session, &transcript).await?;
+    if ranges.is_empty() {
+        return Ok(TranscribeRerunOutcome::NothingToRerun);
+    }
+
+    let proxy_path = check_proxy(&session).await?;
+
+    if !has_usable_key().await? {
+        return Err(AppError::new(
+            Code::Auth,
+            "No usable Gemini API key is configured",
+        ));
+    }
+
+    Ok(match start_rerun(ranges, proxy_path).await? {
+        RerunOutcome::Started { job_id } => TranscribeRerunOutcome::Started { job_id },
+        RerunOutcome::Existing { job_id } => TranscribeRerunOutcome::Existing { job_id },
+    })
+}
+
+async fn transcribe_rerun_inner(
+    state: &AppState,
+    session_id: SessionId,
+    transcript_id: TranscriptId,
+    scope: RerunScope,
+) -> Result<TranscribeRerunOutcome, AppError> {
+    let db = state.db.clone()?;
+    let data_dir = state.data_dir.clone()?;
+    let settings = blocking({
+        let db = db.clone();
+        move || Ok(settings::load(&db))
+    })
+    .await?;
+    let consent =
+        ConsentSnapshot::new(settings.consent_accepted_version, settings.consent_declined);
+    let model = settings.transcribe_model.clone();
+    let secrets = state.secrets.clone();
+    let jobs = state.jobs.clone();
+
+    let load_db = db.clone();
+    let resolve_db = db.clone();
+
+    decide_transcribe_rerun(
+        consent.is_current(),
+        move || {
+            blocking(move || {
+                load_db.with_connection(|conn| {
+                    let session = repo::sessions::get(conn, session_id)?
+                        .ok_or_else(|| AppError::new(Code::Request, "Phiên không tồn tại"))?;
+                    let transcript = repo::transcripts::get(conn, transcript_id)?
+                        .ok_or_else(|| AppError::new(Code::Request, "Transcript không tồn tại"))?;
+                    if transcript.session_id != session_id {
+                        return Err(AppError::new(
+                            Code::Request,
+                            "Transcript không thuộc Phiên này",
+                        ));
+                    }
+                    Ok((session, transcript))
+                })
+            })
+        },
+        move |session: &repo::sessions::SessionRow,
+              _transcript: &repo::transcripts::TranscriptRow| {
+            let total_duration_ms = (session.duration_sec * 1000.0).round().max(0.0) as u64;
+            blocking(move || {
+                resolve_db.with_connection(|conn| {
+                    let segments = repo::segments::list_for_transcript(conn, transcript_id)?;
+                    rerun::resolve_ranges(scope, &segments, total_duration_ms)
+                })
+            })
+        },
+        move |session: &repo::sessions::SessionRow| {
+            let ext = session.proxy_ext.clone();
+            let data_dir = data_dir.clone();
+            async move {
+                let ext = ext.ok_or_else(|| {
+                    AppError::new(Code::Storage, "Phiên chưa có Proxy đã publish")
+                })?;
+                let path = paths::proxy_path(&data_dir, session_id, &ext);
+                let exists_path = path.clone();
+                let exists = blocking(move || Ok(exists_path.exists())).await?;
+                if !exists {
+                    return Err(AppError::new(Code::Storage, "File Proxy không còn tồn tại"));
+                }
+                Ok(path)
+            }
+        },
+        move || async move {
+            let keys = blocking(move || secrets.list()).await?;
+            Ok(!keys.is_empty())
+        },
+        move |ranges, proxy_path| async move {
+            let jobs = jobs?;
+            jobs.start_rerun(RerunParams {
+                session_id,
+                transcript_id,
+                ranges,
+                discard_old: matches!(scope, RerunScope::All),
+                proxy_path,
+                model,
+                consent,
+            })
+            .await
+        },
+    )
+    .await
+}
+
+/// Chạy lại: vá vùng thiếu, một gap cụ thể, hoặc toàn bộ transcript
+/// `primary` của một Phiên (spec Approach). `session_id`/`transcript_id` là
+/// kiểu đã kiểm định dạng qua IPC (giống `jobs_cancel(job_id: JobId)`) — gate
+/// order thật nằm ở [`decide_transcribe_rerun`].
+#[tauri::command]
+#[specta::specta]
+async fn transcribe_rerun(
+    state: tauri::State<'_, AppState>,
+    session_id: SessionId,
+    transcript_id: TranscriptId,
+    scope: RerunScope,
+) -> Result<TranscribeRerunOutcome, AppError> {
+    let result = transcribe_rerun_inner(&state, session_id, transcript_id, scope).await;
+    track_ipc_error(&state.db, result).await
+}
+
 /// Đăng ký một Channel nhận snapshot rồi các `JobEvent` tiếp theo (spec
 /// Always: "snapshot và đăng ký Channel trong cùng một lệnh actor").
 #[tauri::command]
@@ -656,6 +840,11 @@ pub enum SessionLookup {
         title: String,
         duration_sec: f64,
         status: String,
+        /// `true` khi transcript `primary` hiện tại còn gap `chunk_failed`
+        /// (story 2.5) — điều khiển cảnh báo + nút "Chạy lại phần thiếu" ở
+        /// `/session/:id`.
+        partial: bool,
+        transcript_id: Option<TranscriptId>,
     },
     NotFound,
 }
@@ -689,6 +878,8 @@ async fn library_session_get_inner(
             title: summary.title,
             duration_sec: summary.duration_sec,
             status: summary.status,
+            partial: summary.partial,
+            transcript_id: summary.primary_transcript_id,
         },
         None => SessionLookup::NotFound,
     })
@@ -755,6 +946,7 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             diagnostics_clear_logs,
             diagnostics_export,
             transcribe_start,
+            transcribe_rerun,
             jobs_subscribe,
             jobs_cancel,
             library_session_get,
@@ -1085,6 +1277,354 @@ mod tests {
         assert_eq!(hash_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(lookup_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(key_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(start_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    // `decide_transcribe_rerun` — spec Tasks gate order "Consent → tra
+    // Phiên/transcript thuộc Phiên → từ chối `primary` của Phiên live →
+    // giải scope thành vùng → `NothingToRerun` nếu rỗng → Proxy tồn tại →
+    // có key → Job hiện có hoặc start" (I/O Matrix "Chạy lại ...", "Không có
+    // gì để chạy", "Thiếu Proxy", "Phiên live").
+
+    fn rerun_session_row(kind: &str, proxy_ext: Option<&str>) -> repo::sessions::SessionRow {
+        repo::sessions::SessionRow {
+            id: SessionId::new(),
+            kind: kind.to_string(),
+            title: "cuộc họp".to_string(),
+            source_hash: None,
+            source_name: None,
+            status: "complete".to_string(),
+            recovered: false,
+            duration_sec: 90.0,
+            proxy_ext: proxy_ext.map(str::to_string),
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    fn rerun_transcript_row(
+        session_id: SessionId,
+        variant: repo::transcripts::Variant,
+    ) -> repo::transcripts::TranscriptRow {
+        repo::transcripts::TranscriptRow {
+            id: TranscriptId::new(),
+            session_id,
+            variant,
+            status: repo::transcripts::Status::Partial,
+            model: "m".to_string(),
+            language: None,
+        }
+    }
+
+    fn counting_load(
+        count: std::sync::Arc<std::sync::atomic::AtomicU32>,
+        session: repo::sessions::SessionRow,
+        transcript: repo::transcripts::TranscriptRow,
+    ) -> impl FnOnce() -> std::future::Ready<
+        Result<(repo::sessions::SessionRow, repo::transcripts::TranscriptRow), AppError>,
+    > {
+        move || {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(Ok((session, transcript)))
+        }
+    }
+
+    fn counting_ranges(
+        count: std::sync::Arc<std::sync::atomic::AtomicU32>,
+        ranges: Vec<rerun::RerunRange>,
+    ) -> impl FnOnce(
+        &repo::sessions::SessionRow,
+        &repo::transcripts::TranscriptRow,
+    ) -> std::future::Ready<Result<Vec<rerun::RerunRange>, AppError>> {
+        move |_session, _transcript| {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(Ok(ranges))
+        }
+    }
+
+    fn counting_proxy(
+        count: std::sync::Arc<std::sync::atomic::AtomicU32>,
+        result: Result<std::path::PathBuf, AppError>,
+    ) -> impl FnOnce(
+        &repo::sessions::SessionRow,
+    ) -> std::future::Ready<Result<std::path::PathBuf, AppError>> {
+        move |_session| {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(result)
+        }
+    }
+
+    fn counting_rerun_key_check(
+        count: std::sync::Arc<std::sync::atomic::AtomicU32>,
+        has_key: bool,
+    ) -> impl FnOnce() -> std::future::Ready<Result<bool, AppError>> {
+        move || {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(Ok(has_key))
+        }
+    }
+
+    fn counting_rerun_start(
+        count: std::sync::Arc<std::sync::atomic::AtomicU32>,
+        outcome: RerunOutcome,
+    ) -> impl FnOnce(
+        Vec<rerun::RerunRange>,
+        std::path::PathBuf,
+    ) -> std::future::Ready<Result<RerunOutcome, AppError>> {
+        move |_ranges, _proxy_path| {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(Ok(outcome))
+        }
+    }
+
+    fn zero_range() -> Vec<rerun::RerunRange> {
+        Vec::new()
+    }
+
+    fn one_range() -> Vec<rerun::RerunRange> {
+        vec![rerun::RerunRange {
+            start_sample: 0,
+            start_ms: 0,
+            end_sample: 16_000,
+            end_ms: 1_000,
+        }]
+    }
+
+    #[tokio::test]
+    async fn decide_transcribe_rerun_missing_consent_never_loads_or_starts() {
+        let load_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let ranges_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let proxy_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let key_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let start_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let session_id = SessionId::new();
+
+        let result = decide_transcribe_rerun(
+            false,
+            counting_load(
+                load_calls.clone(),
+                rerun_session_row("file", Some("flac")),
+                rerun_transcript_row(session_id, repo::transcripts::Variant::Primary),
+            ),
+            counting_ranges(ranges_calls.clone(), one_range()),
+            counting_proxy(
+                proxy_calls.clone(),
+                Ok(std::path::PathBuf::from("/tmp/proxy.flac")),
+            ),
+            counting_rerun_key_check(key_calls.clone(), true),
+            counting_rerun_start(
+                start_calls.clone(),
+                RerunOutcome::Started {
+                    job_id: JobId::new(),
+                },
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            result.expect_err("thiếu consent phải trả lỗi").category,
+            Category::Auth
+        );
+        assert_eq!(load_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(ranges_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(proxy_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(key_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(start_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn decide_transcribe_rerun_rejects_primary_of_a_live_session_before_resolving_scope() {
+        let load_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let ranges_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let proxy_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let key_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let start_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let session_id = SessionId::new();
+
+        let result = decide_transcribe_rerun(
+            true,
+            counting_load(
+                load_calls.clone(),
+                rerun_session_row("live", Some("flac")),
+                rerun_transcript_row(session_id, repo::transcripts::Variant::Primary),
+            ),
+            counting_ranges(ranges_calls.clone(), one_range()),
+            counting_proxy(
+                proxy_calls.clone(),
+                Ok(std::path::PathBuf::from("/tmp/proxy.flac")),
+            ),
+            counting_rerun_key_check(key_calls.clone(), true),
+            counting_rerun_start(
+                start_calls.clone(),
+                RerunOutcome::Started {
+                    job_id: JobId::new(),
+                },
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            result
+                .expect_err("primary của Phiên live phải bị chặn")
+                .category,
+            Category::Model
+        );
+        assert_eq!(load_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            ranges_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "không được giải scope khi đã bị chặn ở gate live/primary"
+        );
+        assert_eq!(start_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn decide_transcribe_rerun_empty_ranges_is_nothing_to_rerun_without_proxy_key_or_start() {
+        let load_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let ranges_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let proxy_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let key_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let start_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let session_id = SessionId::new();
+
+        let result = decide_transcribe_rerun(
+            true,
+            counting_load(
+                load_calls.clone(),
+                rerun_session_row("file", Some("flac")),
+                rerun_transcript_row(session_id, repo::transcripts::Variant::Primary),
+            ),
+            counting_ranges(ranges_calls.clone(), zero_range()),
+            counting_proxy(
+                proxy_calls.clone(),
+                Ok(std::path::PathBuf::from("/tmp/proxy.flac")),
+            ),
+            counting_rerun_key_check(key_calls.clone(), true),
+            counting_rerun_start(
+                start_calls.clone(),
+                RerunOutcome::Started {
+                    job_id: JobId::new(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, TranscribeRerunOutcome::NothingToRerun);
+        assert_eq!(proxy_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(key_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(start_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn decide_transcribe_rerun_missing_proxy_never_checks_key_or_starts() {
+        let ranges_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let key_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let start_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let session_id = SessionId::new();
+
+        let result = decide_transcribe_rerun(
+            true,
+            counting_load(
+                std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                rerun_session_row("file", None),
+                rerun_transcript_row(session_id, repo::transcripts::Variant::Primary),
+            ),
+            counting_ranges(ranges_calls.clone(), one_range()),
+            counting_proxy(
+                std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                Err(AppError::new(
+                    Code::Storage,
+                    "Phiên chưa có Proxy đã publish",
+                )),
+            ),
+            counting_rerun_key_check(key_calls.clone(), true),
+            counting_rerun_start(
+                start_calls.clone(),
+                RerunOutcome::Started {
+                    job_id: JobId::new(),
+                },
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            result.expect_err("thiếu Proxy phải trả lỗi").category,
+            Category::Storage
+        );
+        assert_eq!(key_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(start_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn decide_transcribe_rerun_no_usable_key_never_starts() {
+        let key_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let start_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let session_id = SessionId::new();
+
+        let result = decide_transcribe_rerun(
+            true,
+            counting_load(
+                std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                rerun_session_row("file", Some("flac")),
+                rerun_transcript_row(session_id, repo::transcripts::Variant::Primary),
+            ),
+            counting_ranges(
+                std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                one_range(),
+            ),
+            counting_proxy(
+                std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                Ok(std::path::PathBuf::from("/tmp/proxy.flac")),
+            ),
+            counting_rerun_key_check(key_calls.clone(), false),
+            counting_rerun_start(
+                start_calls.clone(),
+                RerunOutcome::Started {
+                    job_id: JobId::new(),
+                },
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            result.expect_err("thiếu key phải trả lỗi").category,
+            Category::Auth
+        );
+        assert_eq!(start_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn decide_transcribe_rerun_every_gate_passing_reports_the_registry_outcome() {
+        let start_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let session_id = SessionId::new();
+        let job_id = JobId::new();
+
+        let result = decide_transcribe_rerun(
+            true,
+            counting_load(
+                std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                rerun_session_row("file", Some("flac")),
+                rerun_transcript_row(session_id, repo::transcripts::Variant::Primary),
+            ),
+            counting_ranges(
+                std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                one_range(),
+            ),
+            counting_proxy(
+                std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                Ok(std::path::PathBuf::from("/tmp/proxy.flac")),
+            ),
+            counting_rerun_key_check(
+                std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                true,
+            ),
+            counting_rerun_start(start_calls.clone(), RerunOutcome::Existing { job_id }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, TranscribeRerunOutcome::Existing { job_id });
         assert_eq!(start_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

@@ -79,6 +79,13 @@ export const commands = {
 	 */
 	transcribeStart: (path: string) => typedError<TranscribeStartOutcome, AppError>(__TAURI_INVOKE("transcribe_start", { path })),
 	/**
+	 *  Chạy lại: vá vùng thiếu, một gap cụ thể, hoặc toàn bộ transcript
+	 *  `primary` của một Phiên (spec Approach). `session_id`/`transcript_id` là
+	 *  kiểu đã kiểm định dạng qua IPC (giống `jobs_cancel(job_id: JobId)`) — gate
+	 *  order thật nằm ở [`decide_transcribe_rerun`].
+	 */
+	transcribeRerun: (sessionId: string, transcriptId: string, scope: RerunScope) => typedError<TranscribeRerunOutcome, AppError>(__TAURI_INVOKE("transcribe_rerun", { sessionId, transcriptId, scope })),
+	/**
 	 *  Đăng ký một Channel nhận snapshot rồi các `JobEvent` tiếp theo (spec
 	 *  Always: "snapshot và đăng ký Channel trong cùng một lệnh actor").
 	 */
@@ -205,6 +212,15 @@ export type JobEvent =
 { kind: "cancelled"; seq: number; jobId: string };
 
 /**
+ *  Loại Job trong cùng một hàng đợi `JobRegistry` (story 2.5): transcribe
+ *  một file mới, hoặc Chạy lại (vá vùng thiếu/toàn bộ) transcript `primary`
+ *  của một Phiên đã có (spec Approach: "Thêm Job loại Chạy lại vào đúng
+ *  hàng đợi `JobRegistry`"). Không phải bảng riêng, không hàng đợi thứ hai —
+ *  chỉ một cờ trên `JobSnapshot` để UI phân biệt hiển thị.
+ */
+export type JobKind = "transcribe" | "rerun";
+
+/**
  *  Ảnh chụp một Job tại một thời điểm — đủ để UI vẽ "32 / 90 phút · 36 %",
  *  Chunk hiện tại, key thứ mấy, số lần thử, và cờ "đang chờ quota" (spec
  *  Tasks: trang Session).
@@ -213,6 +229,7 @@ export type JobSnapshot = {
 	jobId: string,
 	sessionId: string,
 	sourceName: string | null,
+	kind: JobKind,
 	state: JobState,
 	processedMs: number,
 	totalMs: number,
@@ -267,11 +284,31 @@ export type ModelInfo = {
 export type ModelKind = "transcribe" | "live" | "memo";
 
 /**
+ *  Phạm vi Chạy lại nhận từ `transcribe_rerun` (spec Approach: `scope ∈
+ *  {missing, all, gap(gap_id)}`). `gap_id` là `idx` của Segment gap trong
+ *  đúng `transcript_id` -- không phải một range do UI tự tính.
+ */
+export type RerunScope = { kind: "missing" } | { kind: "all" } | 
+/**
+ *  `gap_id` is a Segment `idx` (spec Always) — `i32` at the IPC boundary
+ *  (specta-typescript forbids exporting BigInt-style `i64`, see
+ *  `ipc/spike_channel.rs`); no transcript ever has anywhere close to
+ *  `i32::MAX` segments, so the narrowing is lossless in practice.
+ */
+{ kind: "gap"; gapId: number };
+
+/**
  *  Kết quả tra `id` của route `/session/:id` — có thể là Job đang chạy/chờ
  *  (registry cấp `session_id` trước khi commit), một Phiên đã lưu, hay không
  *  còn gì (spec I/O Matrix "`/session/:id`").
  */
-export type SessionLookup = { kind: "job"; jobId: string; sessionId: string } | { kind: "session"; sessionId: string; title: string; durationSec: number | null; status: string } | { kind: "notFound" };
+export type SessionLookup = { kind: "job"; jobId: string; sessionId: string } | { kind: "session"; sessionId: string; title: string; durationSec: number | null; status: string; 
+/**
+ *  `true` khi transcript `primary` hiện tại còn gap `chunk_failed`
+ *  (story 2.5) — điều khiển cảnh báo + nút "Chạy lại phần thiếu" ở
+ *  `/session/:id`.
+ */
+partial: boolean; transcriptId: string | null } | { kind: "notFound" };
 
 export type Settings = {
 	theme: Theme,
@@ -307,6 +344,12 @@ export type SettingsChanged = Settings;
 
 /**  `theme: 'system' | 'light' | 'dark'`, mặc định `system` (spec Decisions). */
 export type Theme = "system" | "light" | "dark";
+
+/**
+ *  Kết quả `transcribe_rerun` (spec I/O Matrix "Chạy lại `missing`/`gap(id)`/
+ *  `all`", "Không có gì để chạy", "Gọi trùng").
+ */
+export type TranscribeRerunOutcome = { kind: "started"; jobId: string } | { kind: "existing"; jobId: string } | { kind: "nothingToRerun" };
 
 /**
  *  Kết quả `transcribe_start` (spec Always: thứ tự gate "Consent → hash + tra

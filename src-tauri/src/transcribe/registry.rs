@@ -21,17 +21,19 @@ use tauri::ipc::Channel;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::core::error::{AppError, Category, Code};
-use crate::core::id::{JobId, SessionId};
+use crate::core::id::{JobId, SessionId, TranscriptId};
 use crate::core::paths;
+use crate::db::repo::segments::{SegmentDraft, SegmentRow};
 use crate::db::Db;
 use crate::gemini::{CancellationToken, ConsentSnapshot, GeminiGateway, JobObserver};
 use crate::library::store::{self, FileSessionDraft, SessionDraft, TranscriptDraft};
 use crate::media::{self, Chunk, ChunkOptions, Chunker};
 use crate::transcribe::adapter::{transcribe_chunk_observed, TranscribeFailure};
-use crate::transcribe::merge::MergeBuilder;
+use crate::transcribe::merge::{splice_rerun, MergeBuilder};
 use crate::transcribe::parser::ChunkTranscript;
+use crate::transcribe::rerun::{decode_ranges_and_chunk, RerunRange};
 
-use super::job::{CancelOutcome, JobEvent, JobSnapshot, JobState};
+use super::job::{CancelOutcome, JobEvent, JobKind, JobSnapshot, JobState};
 
 const CHUNK_CHANNEL_CAPACITY: usize = 2;
 const COMMAND_CHANNEL_CAPACITY: usize = 256;
@@ -55,6 +57,37 @@ pub struct StartParams {
     pub source_name: Option<String>,
     pub model: String,
     pub consent: ConsentSnapshot,
+}
+
+/// Đã giải quyết đầy đủ trước khi tạo Job Chạy lại (2.5) -- `ipc::` đã kiểm
+/// Consent, tra Phiên/transcript thuộc Phiên, chặn `primary` của Phiên
+/// `live`, giải `scope` thành `ranges`, kiểm Proxy tồn tại, và có key dùng
+/// được (spec Always: "Rust tự tra range từ DB và kiểm transcript thuộc
+/// `session_id` — không nhận range từ UI"). `transcript_id` là transcript
+/// `primary` đang nhắm swap -- `expected_transcript_id` trong
+/// `store::swap_transcript`.
+#[derive(Debug, Clone)]
+pub struct RerunParams {
+    pub session_id: SessionId,
+    pub transcript_id: TranscriptId,
+    /// Vùng cần transcribe lại, tăng dần, không chồng lấp. Rỗng chỉ có thể
+    /// xảy ra nếu caller gọi sai (ipc đã lọc `NothingToRerun` trước khi tới
+    /// đây) -- pipeline coi rỗng là hoàn tất ngay, không gửi Chunk nào.
+    pub ranges: Vec<RerunRange>,
+    /// `true` cho scope `all`: bỏ hẳn Segment cũ thay vì giữ phần ngoài
+    /// vùng (không có "ngoài vùng" khi vùng đã phủ hết Proxy).
+    pub discard_old: bool,
+    pub proxy_path: PathBuf,
+    pub model: String,
+    pub consent: ConsentSnapshot,
+}
+
+/// Trả về từ `JobRegistryHandle::start_rerun` (spec Always: "Mỗi Phiên tối
+/// đa một Job Chạy lại đang chờ/chạy: gọi lại trả Job hiện có").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RerunOutcome {
+    Started { job_id: JobId },
+    Existing { job_id: JobId },
 }
 
 pub type TranscribeChunkFuture =
@@ -129,6 +162,18 @@ impl JobRegistryHandle {
         response.await.map_err(|_| actor_error())
     }
 
+    /// Chạy lại: bắt đầu (hoặc, nếu Phiên đã có một Job Chạy lại đang
+    /// chờ/chạy, trả về Job đó -- spec Always) một Job loại `Rerun` trong
+    /// đúng hàng đợi dùng chung với Job transcribe file.
+    pub async fn start_rerun(&self, params: RerunParams) -> Result<RerunOutcome, AppError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::StartRerun { params, reply })
+            .await
+            .map_err(|_| actor_error())?;
+        response.await.map_err(|_| actor_error())
+    }
+
     pub async fn cancel(&self, job_id: JobId) -> Result<CancelOutcome, AppError> {
         let (reply, response) = oneshot::channel();
         self.commands
@@ -182,6 +227,10 @@ enum Command {
     Start {
         params: StartParams,
         reply: oneshot::Sender<(JobId, SessionId)>,
+    },
+    StartRerun {
+        params: RerunParams,
+        reply: oneshot::Sender<RerunOutcome>,
     },
     Cancel {
         job_id: JobId,
@@ -239,6 +288,7 @@ enum JobOutcome {
 struct JobEntry {
     session_id: SessionId,
     source_name: Option<String>,
+    kind: JobKind,
     state: JobState,
     processed_ms: u64,
     total_ms: u64,
@@ -265,6 +315,7 @@ impl JobEntry {
             job_id,
             session_id: self.session_id,
             source_name: self.source_name.clone(),
+            kind: self.kind,
             state: self.state,
             processed_ms: to_snapshot_ms(self.processed_ms),
             total_ms: to_snapshot_ms(self.total_ms),
@@ -290,6 +341,10 @@ pub struct JobRegistryActor {
     /// pipeline is spawned (immediately for the first Job, later for a
     /// promoted one) — a running Job never has an entry here.
     pending_params: HashMap<JobId, StartParams>,
+    /// Same lifecycle as `pending_params`, for Job loại Chạy lại (2.5). A
+    /// given `JobId` only ever appears in one of the two maps — `kind` on
+    /// its `JobEntry` says which.
+    pending_rerun_params: HashMap<JobId, RerunParams>,
     subscribers: Vec<Channel<JobEvent>>,
 }
 
@@ -315,6 +370,7 @@ pub fn channel(
         order: VecDeque::new(),
         jobs: HashMap::new(),
         pending_params: HashMap::new(),
+        pending_rerun_params: HashMap::new(),
         subscribers: Vec::new(),
     };
     (handle, actor)
@@ -330,6 +386,7 @@ impl JobRegistryActor {
     fn handle(&mut self, command: Command) {
         match command {
             Command::Start { params, reply } => self.handle_start(params, reply),
+            Command::StartRerun { params, reply } => self.handle_start_rerun(params, reply),
             Command::Cancel { job_id, reply } => self.handle_cancel(job_id, reply),
             Command::Subscribe { channel, reply } => self.handle_subscribe(channel, reply),
             Command::IsBusy { session_id, reply } => {
@@ -360,6 +417,7 @@ impl JobRegistryActor {
         let entry = JobEntry {
             session_id,
             source_name: params.source_name.clone(),
+            kind: JobKind::Transcribe,
             state: if will_run_now {
                 JobState::Running
             } else {
@@ -385,6 +443,51 @@ impl JobRegistryActor {
         }
     }
 
+    /// Chạy lại (2.5): trả `Existing` nếu Phiên đã có một Job Chạy lại đang
+    /// chờ/chạy (spec Always: "Mỗi Phiên tối đa một Job Chạy lại đang
+    /// chờ/chạy"), ngược lại tạo Job mới trong cùng hàng đợi.
+    fn handle_start_rerun(&mut self, params: RerunParams, reply: oneshot::Sender<RerunOutcome>) {
+        let existing = self.jobs.iter().find_map(|(job_id, entry)| {
+            (entry.session_id == params.session_id && entry.kind == JobKind::Rerun)
+                .then_some(*job_id)
+        });
+        if let Some(job_id) = existing {
+            let _ = reply.send(RerunOutcome::Existing { job_id });
+            return;
+        }
+
+        let job_id = JobId::new();
+        let session_id = params.session_id;
+        let will_run_now = self.order.is_empty();
+        let entry = JobEntry {
+            session_id,
+            source_name: None,
+            kind: JobKind::Rerun,
+            state: if will_run_now {
+                JobState::Running
+            } else {
+                JobState::Queued
+            },
+            processed_ms: 0,
+            total_ms: 0,
+            chunk_index: 0,
+            chunk_count: 0,
+            key_ordinal: None,
+            attempt: None,
+            waiting_quota: false,
+            cancel: CancellationToken::new(),
+        };
+        self.order.push_back(job_id);
+        self.jobs.insert(job_id, entry);
+        self.pending_rerun_params.insert(job_id, params);
+        let _ = reply.send(RerunOutcome::Started { job_id });
+        self.broadcast_updated(job_id);
+
+        if will_run_now {
+            self.start_pipeline_for(job_id);
+        }
+    }
+
     fn handle_cancel(&mut self, job_id: JobId, reply: oneshot::Sender<CancelOutcome>) {
         let Some(entry) = self.jobs.get(&job_id) else {
             let _ = reply.send(CancelOutcome::AlreadyFinished);
@@ -402,6 +505,7 @@ impl JobRegistryActor {
         self.order.retain(|id| *id != job_id);
         self.jobs.remove(&job_id);
         self.pending_params.remove(&job_id);
+        self.pending_rerun_params.remove(&job_id);
         let _ = reply.send(CancelOutcome::Cancelling);
         let seq = self.next_seq();
         self.broadcast(JobEvent::Cancelled { seq, job_id });
@@ -489,14 +593,13 @@ impl JobRegistryActor {
         self.start_pipeline_for(job_id);
     }
 
-    /// Spawn the pipeline task for `job_id`, consuming its stored
-    /// `StartParams`. A no-op if the Job or its params are gone (already
-    /// cancelled/removed between being queued and being promoted).
+    /// Spawn the pipeline task for `job_id`, consuming its stored params (a
+    /// `StartParams` for `JobKind::Transcribe`, a `RerunParams` for
+    /// `JobKind::Rerun` — never both). A no-op if the Job or its params are
+    /// gone (already cancelled/removed between being queued and being
+    /// promoted).
     fn start_pipeline_for(&mut self, job_id: JobId) {
         let Some(entry) = self.jobs.get(&job_id) else {
-            return;
-        };
-        let Some(params) = self.pending_params.remove(&job_id) else {
             return;
         };
         let session_id = entry.session_id;
@@ -507,8 +610,32 @@ impl JobRegistryActor {
         let db = self.db.clone();
         let root = self.root.clone();
         let transcriber = self.transcriber.clone();
+
+        if let Some(params) = self.pending_params.remove(&job_id) {
+            tokio::spawn(async move {
+                let outcome = run_job(
+                    job_id,
+                    session_id,
+                    &params,
+                    &db,
+                    &root,
+                    &transcriber,
+                    &cancel,
+                    &handle,
+                )
+                .await;
+                handle
+                    .send_internal(Internal::Finished { job_id, outcome })
+                    .await;
+            });
+            return;
+        }
+
+        let Some(params) = self.pending_rerun_params.remove(&job_id) else {
+            return;
+        };
         tokio::spawn(async move {
-            let outcome = run_job(
+            let outcome = run_rerun_job(
                 job_id,
                 session_id,
                 &params,
@@ -872,6 +999,277 @@ async fn decode_and_transcribe(
     (merge.finish(), outcome)
 }
 
+fn segment_row_to_draft(row: SegmentRow) -> SegmentDraft {
+    SegmentDraft {
+        start_sec: row.start_sec,
+        end_sec: row.end_sec,
+        kind: row.kind,
+        gap_reason: row.gap_reason,
+        text: row.text,
+        speaker: row.speaker,
+    }
+}
+
+/// Run one Chạy lại Job's full pipeline (spec Approach). Same never-panics
+/// contract as [`run_job`]: every fallible step becomes a [`JobOutcome`].
+/// Chạy lại never creates its own staging directory (source audio is always
+/// the already-published Proxy — spec Boundaries: "không cần file nguồn"),
+/// but `discard_staging` is still called for symmetry with `run_job`; it is
+/// a harmless no-op when nothing was ever staged under `job_id`.
+#[allow(clippy::too_many_arguments)]
+async fn run_rerun_job(
+    job_id: JobId,
+    session_id: SessionId,
+    params: &RerunParams,
+    db: &Arc<Db>,
+    root: &Path,
+    transcriber: &Arc<dyn ChunkTranscriber>,
+    cancel: &CancellationToken,
+    handle: &JobRegistryHandle,
+) -> JobOutcome {
+    let outcome =
+        run_rerun_job_inner(job_id, session_id, params, db, transcriber, cancel, handle).await;
+    if let Err(err) = store::discard_staging(root, job_id) {
+        tracing::warn!(error = %err, "không dọn được staging sau khi Job Chạy lại kết thúc");
+    }
+    outcome
+}
+
+async fn run_rerun_job_inner(
+    job_id: JobId,
+    session_id: SessionId,
+    params: &RerunParams,
+    db: &Arc<Db>,
+    transcriber: &Arc<dyn ChunkTranscriber>,
+    cancel: &CancellationToken,
+    handle: &JobRegistryHandle,
+) -> JobOutcome {
+    if cancel.is_cancelled() {
+        return JobOutcome::Cancelled;
+    }
+
+    let total_ms: u64 = params.ranges.iter().map(RerunRange::duration_ms).sum();
+    let chunk_count = estimate_chunk_count(total_ms.max(1));
+    handle
+        .send_internal(Internal::Progress {
+            job_id,
+            processed_ms: 0,
+            total_ms,
+            chunk_index: 0,
+            chunk_count,
+        })
+        .await;
+
+    if cancel.is_cancelled() {
+        return JobOutcome::Cancelled;
+    }
+
+    let (per_range_segments, decode_outcome) = decode_and_transcribe_ranges(
+        job_id,
+        &params.model,
+        params.consent,
+        &params.proxy_path,
+        &params.ranges,
+        transcriber,
+        cancel,
+        handle,
+    )
+    .await;
+    if let Some(outcome) = decode_outcome {
+        return outcome;
+    }
+
+    if cancel.is_cancelled() {
+        return JobOutcome::Cancelled;
+    }
+
+    let discard_old = params.discard_old;
+    let expected_transcript_id = params.transcript_id;
+    let read_db = db.clone();
+    let old_drafts = tokio::task::spawn_blocking(move || -> Result<Vec<SegmentDraft>, AppError> {
+        if discard_old {
+            return Ok(Vec::new());
+        }
+        read_db.with_connection(|conn| {
+            let rows =
+                crate::db::repo::segments::list_for_transcript(conn, expected_transcript_id)?;
+            Ok(rows.into_iter().map(segment_row_to_draft).collect())
+        })
+    })
+    .await;
+    let old_drafts = match old_drafts {
+        Ok(Ok(drafts)) => drafts,
+        Ok(Err(err)) => return JobOutcome::Error(err),
+        Err(_) => return JobOutcome::Error(actor_error()),
+    };
+
+    let ranges_sec: Vec<(f64, f64)> = params
+        .ranges
+        .iter()
+        .map(|range| (range.start_ms as f64 / 1000.0, range.end_ms as f64 / 1000.0))
+        .collect();
+    let merged = splice_rerun(old_drafts, &ranges_sec, per_range_segments);
+
+    let db = db.clone();
+    let model = params.model.clone();
+    let commit = tokio::task::spawn_blocking(move || {
+        store::swap_transcript(
+            &db,
+            session_id,
+            expected_transcript_id,
+            TranscriptDraft {
+                model,
+                language: None,
+                segments: merged,
+            },
+        )
+    })
+    .await;
+    match commit {
+        Ok(Ok(Some(_new_transcript_id))) => JobOutcome::Committed(session_id),
+        Ok(Ok(None)) => JobOutcome::Error(AppError::new(
+            Code::Request,
+            "Transcript đích đã bị thay trong lúc Chạy lại",
+        )),
+        Ok(Err(err)) => JobOutcome::Error(err),
+        Err(_) => JobOutcome::Error(actor_error()),
+    }
+}
+
+/// Decode Proxy một lần (qua `rerun::decode_ranges_and_chunk`), transcribe
+/// tuần tự từng Chunk của từng vùng, gộp riêng theo vùng bằng một
+/// `MergeBuilder` mỗi vùng. Trả về Segment đã gộp của từng vùng (theo đúng
+/// thứ tự `ranges`) cộng `Some(outcome)` khi cả Job phải dừng ở đây (huỷ,
+/// hoặc lỗi hệ thống).
+#[allow(clippy::too_many_arguments)]
+async fn decode_and_transcribe_ranges(
+    job_id: JobId,
+    model: &str,
+    consent: ConsentSnapshot,
+    proxy_path: &Path,
+    ranges: &[RerunRange],
+    transcriber: &Arc<dyn ChunkTranscriber>,
+    cancel: &CancellationToken,
+    handle: &JobRegistryHandle,
+) -> (Vec<Vec<SegmentDraft>>, Option<JobOutcome>) {
+    if ranges.is_empty() {
+        return (Vec::new(), None);
+    }
+
+    let (chunk_tx, mut chunk_rx) =
+        mpsc::channel::<Result<(usize, Chunk), AppError>>(CHUNK_CHANNEL_CAPACITY);
+    let cancel_for_decode = cancel.clone();
+    let decode_path = proxy_path.to_path_buf();
+    let decode_ranges = ranges.to_vec();
+    let decode_handle = tokio::task::spawn_blocking(move || {
+        let decode_result = decode_ranges_and_chunk(
+            &decode_path,
+            &decode_ranges,
+            ChunkOptions::default(),
+            &cancel_for_decode,
+            |range_index, chunk| {
+                if cancel_for_decode.is_cancelled() {
+                    return Err(cancelled_pipeline_error());
+                }
+                chunk_tx
+                    .blocking_send(Ok((range_index, chunk)))
+                    .map_err(|_| cancelled_pipeline_error())
+            },
+        );
+        if let Err(err) = decode_result {
+            if !cancel_for_decode.is_cancelled() {
+                let _ = chunk_tx.blocking_send(Err(err));
+            }
+        }
+    });
+
+    let range_offsets_ms: Vec<u64> = ranges
+        .iter()
+        .scan(0u64, |acc, range| {
+            let offset = *acc;
+            *acc += range.duration_ms();
+            Some(offset)
+        })
+        .collect();
+    let total_ms: u64 = ranges.iter().map(RerunRange::duration_ms).sum();
+
+    let mut builders: Vec<MergeBuilder> = ranges.iter().map(|_| MergeBuilder::new()).collect();
+    let mut chunk_index: u32 = 0;
+    let mut chunk_count = estimate_chunk_count(total_ms.max(1));
+    let mut outcome: Option<JobOutcome> = None;
+
+    while let Some(item) = chunk_rx.recv().await {
+        if cancel.is_cancelled() {
+            outcome = Some(JobOutcome::Cancelled);
+            break;
+        }
+        let (range_index, mut chunk) = match item {
+            Ok(pair) => pair,
+            Err(err) => {
+                outcome = Some(if cancel.is_cancelled() {
+                    JobOutcome::Cancelled
+                } else {
+                    JobOutcome::Error(err)
+                });
+                break;
+            }
+        };
+        chunk_index += 1;
+        chunk_count = chunk_count.max(chunk_index);
+        let range = ranges[range_index];
+        // `chunk.start_ms`/`start_sample` are still range-relative here (the
+        // per-range Chunker starts at 0 — spec Design Notes) so they double
+        // as "ms vùng đã xử lý" for progress before being shifted absolute.
+        let processed_ms = range_offsets_ms[range_index] + chunk.start_ms + chunk.duration_ms;
+        handle
+            .send_internal(Internal::Progress {
+                job_id,
+                processed_ms,
+                total_ms,
+                chunk_index,
+                chunk_count,
+            })
+            .await;
+
+        chunk.start_ms += range.start_ms;
+        chunk.start_sample += range.start_sample;
+
+        let observer: Arc<dyn JobObserver> = Arc::new(RegistryObserver {
+            handle: handle.clone(),
+            job_id,
+        });
+        let result = transcriber
+            .transcribe(
+                model.to_string(),
+                chunk.clone(),
+                consent,
+                cancel.clone(),
+                observer,
+            )
+            .await;
+        match result {
+            Ok(transcript) => builders[range_index].push_success(transcript),
+            Err(failure) => {
+                if cancel.is_cancelled() {
+                    outcome = Some(JobOutcome::Cancelled);
+                    break;
+                }
+                if is_fatal(&failure.error) {
+                    outcome = Some(JobOutcome::Error(failure.error));
+                    break;
+                }
+                builders[range_index].push_failed_chunk(&chunk);
+            }
+        }
+    }
+
+    drop(chunk_rx);
+    let _ = decode_handle.await;
+
+    let per_range = builders.into_iter().map(MergeBuilder::finish).collect();
+    (per_range, outcome)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
@@ -905,6 +1303,11 @@ mod tests {
     struct FakeTranscriber {
         behaviors: Mutex<VecDeque<Behavior>>,
         calls: Mutex<u32>,
+        /// Every Chunk this fake was asked to transcribe, in call order —
+        /// used by the Chạy lại tests to assert `start_ms` was already
+        /// shifted absolute before reaching the transcriber (spec Acceptance
+        /// Criteria: "chỉ đúng hai vùng được gửi (start_ms tuyệt đối)").
+        chunks: Mutex<Vec<Chunk>>,
     }
 
     impl FakeTranscriber {
@@ -912,11 +1315,21 @@ mod tests {
             Arc::new(Self {
                 behaviors: Mutex::new(behaviors.into()),
                 calls: Mutex::new(0),
+                chunks: Mutex::new(Vec::new()),
             })
         }
 
         fn call_count(&self) -> u32 {
             *self.calls.lock().unwrap()
+        }
+
+        fn chunk_start_ms(&self) -> Vec<u64> {
+            self.chunks
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|chunk| chunk.start_ms)
+                .collect()
         }
     }
 
@@ -930,6 +1343,7 @@ mod tests {
             observer: Arc<dyn JobObserver>,
         ) -> TranscribeChunkFuture {
             *self.calls.lock().unwrap() += 1;
+            self.chunks.lock().unwrap().push(chunk.clone());
             let behavior = self
                 .behaviors
                 .lock()
@@ -1362,5 +1776,884 @@ mod tests {
         assert_eq!(estimate_chunk_count(300_000), 1);
         assert_eq!(estimate_chunk_count(300_001), 2);
         assert_eq!(estimate_chunk_count(600_000), 2);
+    }
+
+    // ---------------------------------------------------------------------
+    // Story 2.5: `JobKind::Rerun` end-to-end through the real registry actor
+    // (`FakeTranscriber`, per spec Tasks: "test registry với `FakeTranscriber`"
+    // and Acceptance Criteria's four `Given`/`when`/`then` rows).
+    // ---------------------------------------------------------------------
+
+    use crate::db::repo::segments::{GapReason, SegmentDraft, SegmentKind};
+    use crate::db::repo::transcripts::Variant;
+    use crate::library::store::TranscriptDraft;
+    use crate::transcribe::rerun::{self, RerunScope};
+
+    /// A mono 16 kHz WAV of exactly `seconds` seconds — long enough to carve
+    /// deterministic gap ranges out of, short enough to decode instantly.
+    fn wav_fixture_seconds(dir: &Path, name: &str, seconds: u32) -> PathBuf {
+        let path = dir.join(name);
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+        for frame in 0..(16_000 * seconds) {
+            let sample = ((frame as f32 * 0.05).sin() * 5_000.0) as i16;
+            writer.write_sample(sample).unwrap();
+        }
+        writer.finalize().unwrap();
+        path
+    }
+
+    fn rerun_text_draft(start: f64, end: f64, text: &str) -> SegmentDraft {
+        SegmentDraft {
+            start_sec: start,
+            end_sec: end,
+            kind: SegmentKind::Text,
+            gap_reason: None,
+            text: text.to_string(),
+            speaker: None,
+        }
+    }
+
+    fn rerun_gap_draft(start: f64, end: f64) -> SegmentDraft {
+        SegmentDraft {
+            start_sec: start,
+            end_sec: end,
+            kind: SegmentKind::Gap,
+            gap_reason: Some(GapReason::ChunkFailed),
+            text: String::new(),
+            speaker: None,
+        }
+    }
+
+    /// Directly seeds a "committed partial file Phiên" (bypassing
+    /// `commit_file_session` -- that story's own tests already cover
+    /// publish/commit; here we only need a realistic starting point for a
+    /// Chạy lại Job): a `sessions` row, a `primary` transcript with the given
+    /// segments, and a real WAV published as its Proxy.
+    fn seed_partial_session(
+        root: &Path,
+        db: &Db,
+        session_id: SessionId,
+        transcript_id: TranscriptId,
+        duration_sec: f64,
+        segments: &[SegmentDraft],
+    ) -> PathBuf {
+        let proxy_path = paths::proxy_path(root, session_id, "wav");
+        std::fs::create_dir_all(proxy_path.parent().unwrap()).unwrap();
+        wav_fixture_seconds(
+            proxy_path.parent().unwrap(),
+            "proxy.wav",
+            duration_sec as u32,
+        );
+
+        db.with_connection(|conn| {
+            repo::sessions::insert(
+                conn,
+                repo::sessions::NewSession {
+                    id: session_id,
+                    kind: "file",
+                    title: "cuộc họp dở",
+                    source_hash: None,
+                    source_name: Some("meeting.wav"),
+                    status: "complete",
+                    recovered: false,
+                    duration_sec,
+                    proxy_ext: Some("wav"),
+                    created_at: 0,
+                    updated_at: 0,
+                },
+            )?;
+            repo::transcripts::insert_with_segments(
+                conn,
+                transcript_id,
+                session_id,
+                Variant::Primary,
+                "gemini-flash-lite-latest",
+                None,
+                segments,
+                0,
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        proxy_path
+    }
+
+    fn resolved_missing_ranges(
+        db: &Db,
+        transcript_id: TranscriptId,
+        total_duration_ms: u64,
+    ) -> Vec<rerun::RerunRange> {
+        let rows = db
+            .with_connection(|conn| Ok(repo::segments::list_for_transcript(conn, transcript_id)?))
+            .unwrap();
+        rerun::resolve_ranges(RerunScope::Missing, &rows, total_duration_ms).unwrap()
+    }
+
+    #[tokio::test]
+    async fn rerun_missing_sends_only_the_gap_ranges_with_absolute_start_ms_and_swaps_to_complete()
+    {
+        let root = tempdir().unwrap();
+        let db = Arc::new(Db::open(root.path()).unwrap());
+        let session_id = SessionId::new();
+        let old_transcript_id = TranscriptId::new();
+        let proxy_path = seed_partial_session(
+            root.path(),
+            &db,
+            session_id,
+            old_transcript_id,
+            4.0,
+            &[
+                rerun_text_draft(0.0, 1.0, "hello"),
+                rerun_gap_draft(1.0, 2.0),
+                rerun_text_draft(2.0, 3.0, "hello"),
+                rerun_gap_draft(3.0, 4.0),
+            ],
+        );
+        let ranges = resolved_missing_ranges(&db, old_transcript_id, 4_000);
+        assert_eq!(ranges.len(), 2, "hai gap phải giải ra đúng hai vùng");
+
+        let transcriber = FakeTranscriber::new(vec![
+            Behavior::Success("vá 1".to_string()),
+            Behavior::Success("vá 2".to_string()),
+        ]);
+        let (handle, actor) = channel(db.clone(), root.path().to_path_buf(), transcriber.clone());
+        tokio::spawn(actor.run());
+
+        let outcome = handle
+            .start_rerun(RerunParams {
+                session_id,
+                transcript_id: old_transcript_id,
+                ranges,
+                discard_old: false,
+                proxy_path,
+                model: "gemini-flash-lite-latest".to_string(),
+                consent: ConsentSnapshot::new(1, false),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(outcome, RerunOutcome::Started { .. }));
+        wait_until_empty(&handle, Duration::from_secs(5)).await;
+
+        assert_eq!(transcriber.call_count(), 2, "chỉ đúng hai vùng được gửi");
+        assert_eq!(
+            transcriber.chunk_start_ms(),
+            vec![1_000, 3_000],
+            "start_ms phải tuyệt đối, không phải tương đối trong vùng"
+        );
+
+        let new_transcript_id = db
+            .with_connection(|conn| Ok(repo::transcripts::primary_for_session(conn, session_id)?))
+            .unwrap()
+            .unwrap();
+        assert_ne!(new_transcript_id, old_transcript_id);
+        assert!(db
+            .with_connection(|conn| Ok(repo::transcripts::get(conn, old_transcript_id)?))
+            .unwrap()
+            .is_none());
+        let new_transcript = db
+            .with_connection(|conn| Ok(repo::transcripts::get(conn, new_transcript_id)?))
+            .unwrap()
+            .unwrap();
+        assert_eq!(new_transcript.status, repo::transcripts::Status::Complete);
+
+        let segments = db
+            .with_connection(|conn| {
+                Ok(repo::segments::list_for_transcript(
+                    conn,
+                    new_transcript_id,
+                )?)
+            })
+            .unwrap();
+        assert_eq!(
+            segments.iter().map(|s| s.text.as_str()).collect::<Vec<_>>(),
+            vec!["hello", "vá 1", "hello", "vá 2"],
+            "Segment ngoài vùng giữ nguyên, vùng gap được vá đúng vị trí"
+        );
+        assert!(segments.iter().all(|s| s.kind == SegmentKind::Text));
+
+        let session = db
+            .with_connection(|conn| Ok(repo::sessions::get(conn, session_id)?))
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.id, session_id, "session_id giữ nguyên");
+    }
+
+    #[tokio::test]
+    async fn rerun_missing_with_one_gap_still_failing_stays_partial_with_only_that_gap_left() {
+        let root = tempdir().unwrap();
+        let db = Arc::new(Db::open(root.path()).unwrap());
+        let session_id = SessionId::new();
+        let old_transcript_id = TranscriptId::new();
+        let proxy_path = seed_partial_session(
+            root.path(),
+            &db,
+            session_id,
+            old_transcript_id,
+            4.0,
+            &[
+                rerun_text_draft(0.0, 1.0, "hello"),
+                rerun_gap_draft(1.0, 2.0),
+                rerun_text_draft(2.0, 3.0, "hello"),
+                rerun_gap_draft(3.0, 4.0),
+            ],
+        );
+        let ranges = resolved_missing_ranges(&db, old_transcript_id, 4_000);
+        assert_eq!(ranges.len(), 2);
+
+        // First gap [1,2) is repaired; second gap [3,4) fails again
+        // (non-fatal) -- per spec I/O Matrix "Chạy lại `missing`": "Vẫn lỗi
+        // -> vẫn `partial` với gap còn lại".
+        let transcriber = FakeTranscriber::new(vec![
+            Behavior::Success("vá 1".to_string()),
+            Behavior::Fail {
+                code: Code::Network,
+                retryable: true,
+            },
+        ]);
+        let (handle, actor) = channel(db.clone(), root.path().to_path_buf(), transcriber.clone());
+        tokio::spawn(actor.run());
+
+        let outcome = handle
+            .start_rerun(RerunParams {
+                session_id,
+                transcript_id: old_transcript_id,
+                ranges,
+                discard_old: false,
+                proxy_path,
+                model: "gemini-flash-lite-latest".to_string(),
+                consent: ConsentSnapshot::new(1, false),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(outcome, RerunOutcome::Started { .. }));
+        wait_until_empty(&handle, Duration::from_secs(5)).await;
+
+        assert_eq!(
+            transcriber.call_count(),
+            2,
+            "cả hai vùng phải được gửi dù một vùng vẫn lỗi"
+        );
+
+        let new_transcript_id = db
+            .with_connection(|conn| Ok(repo::transcripts::primary_for_session(conn, session_id)?))
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            new_transcript_id, old_transcript_id,
+            "Job vẫn commit (không error) dù còn gap -- Chạy lại vẫn swap"
+        );
+        let new_transcript = db
+            .with_connection(|conn| Ok(repo::transcripts::get(conn, new_transcript_id)?))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            new_transcript.status,
+            repo::transcripts::Status::Partial,
+            "vẫn lỗi một vùng -> transcript mới vẫn partial"
+        );
+
+        let segments = db
+            .with_connection(|conn| {
+                Ok(repo::segments::list_for_transcript(
+                    conn,
+                    new_transcript_id,
+                )?)
+            })
+            .unwrap();
+        assert_eq!(segments.len(), 4);
+        assert_eq!(segments[0].kind, SegmentKind::Text);
+        assert_eq!(segments[0].text, "hello");
+        assert_eq!(segments[1].kind, SegmentKind::Text);
+        assert_eq!(segments[1].text, "vá 1", "gap đầu tiên phải được vá");
+        assert_eq!(segments[2].kind, SegmentKind::Text);
+        assert_eq!(segments[2].text, "hello", "segment ngoài vùng giữ nguyên");
+        assert_eq!(
+            segments[3].kind,
+            SegmentKind::Gap,
+            "gap thứ hai vẫn lỗi -> vẫn còn đúng một gap"
+        );
+        assert_eq!(segments[3].gap_reason, Some(GapReason::ChunkFailed));
+        assert_eq!((segments[3].start_sec, segments[3].end_sec), (3.0, 4.0));
+    }
+
+    #[tokio::test]
+    async fn rerun_fatal_transcriber_error_leaves_the_old_transcript_and_segments_untouched() {
+        let root = tempdir().unwrap();
+        let db = Arc::new(Db::open(root.path()).unwrap());
+        let session_id = SessionId::new();
+        let old_transcript_id = TranscriptId::new();
+        let original_segments = vec![
+            rerun_text_draft(0.0, 1.0, "hello"),
+            rerun_gap_draft(1.0, 2.0),
+        ];
+        let proxy_path = seed_partial_session(
+            root.path(),
+            &db,
+            session_id,
+            old_transcript_id,
+            2.0,
+            &original_segments,
+        );
+        let ranges = resolved_missing_ranges(&db, old_transcript_id, 2_000);
+
+        let transcriber = FakeTranscriber::new(vec![Behavior::Fail {
+            code: Code::Auth,
+            retryable: false,
+        }]);
+        let (handle, actor) = channel(db.clone(), root.path().to_path_buf(), transcriber);
+        tokio::spawn(actor.run());
+        let (channel, received) = test_channel();
+        handle.subscribe(channel).await.unwrap();
+
+        let outcome = handle
+            .start_rerun(RerunParams {
+                session_id,
+                transcript_id: old_transcript_id,
+                ranges,
+                discard_old: false,
+                proxy_path,
+                model: "gemini-flash-lite-latest".to_string(),
+                consent: ConsentSnapshot::new(1, false),
+            })
+            .await
+            .unwrap();
+        let job_id = match outcome {
+            RerunOutcome::Started { job_id } => job_id,
+            RerunOutcome::Existing { .. } => panic!("phải là Job mới"),
+        };
+        wait_until_empty(&handle, Duration::from_secs(5)).await;
+
+        let events = received.lock().unwrap().clone();
+        assert!(events.iter().any(
+            |event| matches!(event, JobEvent::Error { job_id: id, error, .. } if *id == job_id && error.category == Category::Auth)
+        ));
+
+        assert_eq!(
+            db.with_connection(|conn| Ok(repo::transcripts::primary_for_session(
+                conn, session_id
+            )?))
+            .unwrap(),
+            Some(old_transcript_id),
+            "lỗi fatal không được đụng transcript cũ"
+        );
+        let segments = db
+            .with_connection(|conn| {
+                Ok(repo::segments::list_for_transcript(
+                    conn,
+                    old_transcript_id,
+                )?)
+            })
+            .unwrap();
+        assert_eq!(segments.len(), original_segments.len());
+        assert!(!paths::staging_dir(root.path(), job_id).exists());
+    }
+
+    #[tokio::test]
+    async fn rerun_cancelled_leaves_the_old_transcript_untouched() {
+        let root = tempdir().unwrap();
+        let db = Arc::new(Db::open(root.path()).unwrap());
+        let session_id = SessionId::new();
+        let old_transcript_id = TranscriptId::new();
+        let proxy_path = seed_partial_session(
+            root.path(),
+            &db,
+            session_id,
+            old_transcript_id,
+            2.0,
+            &[
+                rerun_text_draft(0.0, 1.0, "hello"),
+                rerun_gap_draft(1.0, 2.0),
+            ],
+        );
+        let ranges = resolved_missing_ranges(&db, old_transcript_id, 2_000);
+
+        let transcriber = FakeTranscriber::new(vec![Behavior::BlockUntilCancelled]);
+        let (handle, actor) = channel(db.clone(), root.path().to_path_buf(), transcriber);
+        tokio::spawn(actor.run());
+
+        let outcome = handle
+            .start_rerun(RerunParams {
+                session_id,
+                transcript_id: old_transcript_id,
+                ranges,
+                discard_old: false,
+                proxy_path,
+                model: "gemini-flash-lite-latest".to_string(),
+                consent: ConsentSnapshot::new(1, false),
+            })
+            .await
+            .unwrap();
+        let job_id = match outcome {
+            RerunOutcome::Started { job_id } => job_id,
+            RerunOutcome::Existing { .. } => panic!("phải là Job mới"),
+        };
+        wait_until_state(&handle, job_id, JobState::Running).await;
+        handle.cancel(job_id).await.unwrap();
+        wait_until_empty(&handle, Duration::from_secs(2)).await;
+
+        assert_eq!(
+            db.with_connection(|conn| Ok(repo::transcripts::primary_for_session(
+                conn, session_id
+            )?))
+            .unwrap(),
+            Some(old_transcript_id),
+            "huỷ không được đụng transcript cũ"
+        );
+        assert!(!paths::staging_dir(root.path(), job_id).exists());
+    }
+
+    #[tokio::test]
+    async fn rerun_calling_again_for_the_same_session_returns_the_existing_job() {
+        let root = tempdir().unwrap();
+        let db = Arc::new(Db::open(root.path()).unwrap());
+        let session_id = SessionId::new();
+        let old_transcript_id = TranscriptId::new();
+        let proxy_path = seed_partial_session(
+            root.path(),
+            &db,
+            session_id,
+            old_transcript_id,
+            2.0,
+            &[
+                rerun_text_draft(0.0, 1.0, "hello"),
+                rerun_gap_draft(1.0, 2.0),
+            ],
+        );
+        let ranges = resolved_missing_ranges(&db, old_transcript_id, 2_000);
+
+        let transcriber = FakeTranscriber::new(vec![Behavior::BlockUntilCancelled]);
+        let (handle, actor) = channel(db.clone(), root.path().to_path_buf(), transcriber);
+        tokio::spawn(actor.run());
+
+        let params = RerunParams {
+            session_id,
+            transcript_id: old_transcript_id,
+            ranges,
+            discard_old: false,
+            proxy_path,
+            model: "gemini-flash-lite-latest".to_string(),
+            consent: ConsentSnapshot::new(1, false),
+        };
+        let first = handle.start_rerun(params.clone()).await.unwrap();
+        let job_id = match first {
+            RerunOutcome::Started { job_id } => job_id,
+            RerunOutcome::Existing { .. } => panic!("phải là Job mới lần đầu"),
+        };
+        wait_until_state(&handle, job_id, JobState::Running).await;
+
+        let second = handle.start_rerun(params).await.unwrap();
+        assert_eq!(second, RerunOutcome::Existing { job_id });
+
+        let jobs = handle.snapshot().await.unwrap();
+        assert_eq!(
+            jobs.iter()
+                .filter(|job| job.session_id == session_id)
+                .count(),
+            1,
+            "registry vẫn chỉ có một Job Chạy lại cho Phiên này"
+        );
+
+        handle.cancel(job_id).await.unwrap();
+        wait_until_empty(&handle, Duration::from_secs(2)).await;
+    }
+
+    #[tokio::test]
+    async fn rerun_commit_with_a_stale_expected_transcript_writes_nothing_and_errors() {
+        let root = tempdir().unwrap();
+        let db = Arc::new(Db::open(root.path()).unwrap());
+        let session_id = SessionId::new();
+        let old_transcript_id = TranscriptId::new();
+        let proxy_path = seed_partial_session(
+            root.path(),
+            &db,
+            session_id,
+            old_transcript_id,
+            2.0,
+            &[
+                rerun_text_draft(0.0, 1.0, "hello"),
+                rerun_gap_draft(1.0, 2.0),
+            ],
+        );
+        let ranges = resolved_missing_ranges(&db, old_transcript_id, 2_000);
+
+        // Simulate "kết quả tới muộn": another commit already swapped the
+        // primary transcript out from under this Job's `expected_transcript_id`
+        // before it reaches its own commit (spec Design Notes: swap so khớp
+        // `expected_transcript_id`, không khoá).
+        let interfering_id = crate::library::store::swap_transcript(
+            &db,
+            session_id,
+            old_transcript_id,
+            TranscriptDraft {
+                model: "gemini-flash-lite-latest".to_string(),
+                language: None,
+                segments: vec![rerun_text_draft(0.0, 2.0, "đã đổi trước")],
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        let transcriber = FakeTranscriber::new(vec![Behavior::Success("quá muộn".to_string())]);
+        let (handle, actor) = channel(db.clone(), root.path().to_path_buf(), transcriber);
+        tokio::spawn(actor.run());
+        let (channel, received) = test_channel();
+        handle.subscribe(channel).await.unwrap();
+
+        let outcome = handle
+            .start_rerun(RerunParams {
+                session_id,
+                transcript_id: old_transcript_id,
+                ranges,
+                discard_old: false,
+                proxy_path,
+                model: "gemini-flash-lite-latest".to_string(),
+                consent: ConsentSnapshot::new(1, false),
+            })
+            .await
+            .unwrap();
+        let job_id = match outcome {
+            RerunOutcome::Started { job_id } => job_id,
+            RerunOutcome::Existing { .. } => panic!("phải là Job mới"),
+        };
+        wait_until_empty(&handle, Duration::from_secs(5)).await;
+
+        let events = received.lock().unwrap().clone();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, JobEvent::Error { job_id: id, .. } if *id == job_id)),
+            "commit với expected_transcript_id lỗi thời phải kết thúc Job bằng error, thực tế: {events:?}"
+        );
+
+        assert_eq!(
+            db.with_connection(|conn| Ok(repo::transcripts::primary_for_session(
+                conn, session_id
+            )?))
+            .unwrap(),
+            Some(interfering_id),
+            "Job Chạy lại không được ghi gì khi expected_transcript_id đã lỗi thời"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Story 2.5 Tasks: "test tích hợp `GatewayTranscriber` qua transport giả
+    // cho 4 kịch bản AR-36" — the real `GatewayTranscriber` (adapter +
+    // `GeminiGateway` + key pool), driven by the real `JobRegistry`, with
+    // only the HTTP transport faked (`gemini::test_support`). This locks the
+    // retry policy at the layer that actually owns it (`gemini/`) *and* that
+    // the registry/merge pipeline reacts to it correctly end to end.
+    // ---------------------------------------------------------------------
+
+    use crate::gemini::test_support::{gateway_with, key, FakeTransport};
+    use crate::gemini::{TransportError, TransportResponse};
+
+    fn gateway_transcriber(gateway: crate::gemini::GeminiGateway) -> Arc<dyn ChunkTranscriber> {
+        Arc::new(GatewayTranscriber::new(Arc::new(gateway)))
+    }
+
+    fn valid_response(
+        status: u16,
+        start: &str,
+        end: &str,
+        text: &str,
+    ) -> Result<TransportResponse, TransportError> {
+        Ok(TransportResponse {
+            status,
+            body: format!(
+                r#"{{"candidates":[{{"finishReason":"STOP","content":{{"parts":[{{"text":"[{{\"start\":\"{start}\",\"end\":\"{end}\",\"text\":\"{text}\"}}]"}}]}}}}]}}"#
+            ),
+        })
+    }
+
+    fn error_response(status: u16) -> Result<TransportResponse, TransportError> {
+        Ok(TransportResponse {
+            status,
+            body: "fake error".to_string(),
+        })
+    }
+
+    /// Every segment (text or gap) of `session_id`'s primary transcript, in
+    /// `idx` order — used to assert full, contiguous time coverage ("no
+    /// Chunk silently disappears" — spec I/O Matrix "JSON cắt cụt").
+    fn primary_segments(
+        db: &Db,
+        session_id: SessionId,
+    ) -> Vec<crate::db::repo::segments::SegmentRow> {
+        db.with_connection(|conn| {
+            let transcript_id = repo::transcripts::primary_for_session(conn, session_id)?
+                .expect("Phiên phải có transcript primary");
+            Ok(repo::segments::list_for_transcript(conn, transcript_id)?)
+        })
+        .unwrap()
+    }
+
+    fn assert_full_coverage(segments: &[crate::db::repo::segments::SegmentRow], total_sec: f64) {
+        assert!(!segments.is_empty(), "phải có ít nhất một segment");
+        assert_eq!(segments[0].start_sec, 0.0, "phải phủ từ đầu file");
+        for pair in segments.windows(2) {
+            assert_eq!(
+                pair[0].end_sec, pair[1].start_sec,
+                "không được có khoảng trống giữa hai segment -- một Chunk biến mất âm thầm: {segments:?}"
+            );
+        }
+        assert_eq!(
+            segments.last().unwrap().end_sec,
+            total_sec,
+            "phải phủ tới hết file, không mất phần cuối"
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_integration_429_on_key_one_rotates_to_key_two_then_the_chunk_succeeds() {
+        let root = tempdir().unwrap();
+        let source = wav_fixture_seconds(root.path(), "a.wav", 2);
+        let transport = FakeTransport::new(vec![
+            error_response(429),
+            valid_response(200, "00:00", "00:01", "xin chào"),
+        ]);
+        let gateway = gateway_with(
+            vec![key("a", "AIzaA123456789"), key("b", "AQ.B123456789")],
+            transport.clone(),
+        )
+        .await;
+        let handle = registry_for_test(root.path(), gateway_transcriber(gateway));
+
+        let (_job_id, session_id) = handle
+            .start(start_params(source, "hash-429"))
+            .await
+            .unwrap();
+        wait_until_empty(&handle, Duration::from_secs(5)).await;
+
+        let db = Db::open(root.path()).unwrap();
+        let session = db
+            .with_connection(|conn| Ok(repo::sessions::get(conn, session_id)?))
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.status, "complete");
+        let segments = primary_segments(&db, session_id);
+        assert!(segments.iter().any(|s| s.text == "xin chào"));
+
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 2, "429 rồi thành công chỉ 2 lần gửi");
+        assert_eq!(requests[0].header("x-goog-api-key"), Some("AIzaA123456789"));
+        assert_eq!(
+            requests[1].header("x-goog-api-key"),
+            Some("AQ.B123456789"),
+            "429 phải xoay sang key 2"
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_integration_four_server_errors_become_a_gap_and_the_job_still_commits_partial()
+    {
+        let root = tempdir().unwrap();
+        let source = wav_fixture_seconds(root.path(), "b.wav", 2);
+        let transport = FakeTransport::new(vec![
+            error_response(503),
+            error_response(503),
+            error_response(503),
+            error_response(503),
+        ]);
+        let gateway = gateway_with(vec![key("a", "AIzaA123456789")], transport.clone()).await;
+        let handle = registry_for_test(root.path(), gateway_transcriber(gateway));
+
+        let (_job_id, session_id) = handle
+            .start(start_params(source, "hash-503x4"))
+            .await
+            .unwrap();
+        wait_until_empty(&handle, Duration::from_secs(5)).await;
+
+        let db = Db::open(root.path()).unwrap();
+        let session = db
+            .with_connection(|conn| Ok(repo::sessions::get(conn, session_id)?))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            session.status, "complete",
+            "sessions.status không đổi theo gap (do transcripts.status suy ra)"
+        );
+        let transcript_status: String = db
+            .with_connection(|conn| {
+                Ok(conn.query_row(
+                    "SELECT status FROM transcripts WHERE session_id = ?1",
+                    [session_id.to_string()],
+                    |row| row.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(
+            transcript_status, "partial",
+            "Chunk lỗi hệ thống -> gap, Job vẫn commit partial"
+        );
+
+        let segments = primary_segments(&db, session_id);
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].kind, SegmentKind::Gap);
+        assert_eq!(segments[0].gap_reason, Some(GapReason::ChunkFailed));
+        assert_full_coverage(&segments, 2.0);
+        assert_eq!(
+            transport.requests().len(),
+            usize::from(crate::gemini::params::MAX_ATTEMPTS)
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_integration_truncated_json_keeps_the_valid_segment_and_the_remainder_becomes_a_gap(
+    ) {
+        let root = tempdir().unwrap();
+        let source = wav_fixture_seconds(root.path(), "c.wav", 2);
+        // A response whose embedded segment array is cut off mid-object
+        // (missing the closing `]`) — `parse_general_text` falls back to its
+        // brace-matching scan, keeps the one complete item, and the parser's
+        // own `incomplete` handling turns the remainder into `unresolved`.
+        let truncated_body = r#"{"candidates":[{"finishReason":"MAX_TOKENS","content":{"parts":[{"text":"[{\"start\":\"00:00\",\"end\":\"00:01\",\"text\":\"hello\"}"}]}}]}"#;
+        let transport = FakeTransport::new(vec![Ok(TransportResponse {
+            status: 200,
+            body: truncated_body.to_string(),
+        })]);
+        let gateway = gateway_with(vec![key("a", "AIzaA123456789")], transport.clone()).await;
+        let handle = registry_for_test(root.path(), gateway_transcriber(gateway));
+
+        let (_job_id, session_id) = handle
+            .start(start_params(source, "hash-truncated"))
+            .await
+            .unwrap();
+        wait_until_empty(&handle, Duration::from_secs(5)).await;
+
+        let db = Db::open(root.path()).unwrap();
+        let segments = primary_segments(&db, session_id);
+        assert_eq!(
+            segments.len(),
+            2,
+            "Segment hợp lệ giữ lại, phần còn lại thành đúng một gap"
+        );
+        assert_eq!(segments[0].kind, SegmentKind::Text);
+        assert_eq!(segments[0].text, "hello");
+        assert_eq!(segments[1].kind, SegmentKind::Gap);
+        assert_eq!(segments[1].gap_reason, Some(GapReason::ChunkFailed));
+        assert_full_coverage(&segments, 2.0);
+    }
+
+    #[tokio::test]
+    async fn gateway_integration_401_on_every_key_fails_the_job_with_no_db_row() {
+        let root = tempdir().unwrap();
+        let source = wav_fixture_seconds(root.path(), "d.wav", 2);
+        let transport = FakeTransport::new(vec![error_response(401), error_response(401)]);
+        let gateway = gateway_with(
+            vec![key("a", "AIzaA123456789"), key("b", "AQ.B123456789")],
+            transport.clone(),
+        )
+        .await;
+        let handle = registry_for_test(root.path(), gateway_transcriber(gateway));
+        let (channel, received) = test_channel();
+        handle.subscribe(channel).await.unwrap();
+
+        let (job_id, session_id) = handle
+            .start(start_params(source, "hash-401-all"))
+            .await
+            .unwrap();
+        wait_until_empty(&handle, Duration::from_secs(5)).await;
+
+        let events = received.lock().unwrap().clone();
+        assert!(events.iter().any(
+            |event| matches!(event, JobEvent::Error { job_id: id, error, .. } if *id == job_id && error.category == Category::Auth)
+        ));
+
+        let db = Db::open(root.path()).unwrap();
+        db.with_connection(|conn| {
+            assert!(
+                repo::sessions::get(conn, session_id)?.is_none(),
+                "mọi key 401 -> không commit"
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// Silence encodes to a tiny FLAC frame regardless of duration, so a
+    /// fixture longer than 5 minutes (needed to force the real `Chunker`'s
+    /// 300 s boundary and get a genuine "Chunk 2") still decodes/encodes
+    /// near instantly.
+    fn silent_wav_fixture_seconds(dir: &Path, name: &str, seconds: u32) -> PathBuf {
+        let path = dir.join(name);
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+        for _ in 0..(16_000 * seconds) {
+            writer.write_sample(0_i16).unwrap();
+        }
+        writer.finalize().unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn gateway_integration_401_mid_job_on_the_second_chunk_rotates_key_then_succeeds() {
+        let root = tempdir().unwrap();
+        // 301 s of silence -> the real 300 s `Chunker` boundary emits exactly
+        // two Chunks (300 s, then 1 s), so this is a genuine "Chunk 2".
+        let source = silent_wav_fixture_seconds(root.path(), "e.wav", 301);
+        let transport = FakeTransport::new(vec![
+            // Chunk 1 -> key a (round-robin cursor starts at 0), healthy.
+            valid_response(200, "00:00", "05:00", "phần một"),
+            // Chunk 2 -> cursor has moved on to key b; it is rejected mid-Job
+            // (disabling it), then the retry rotates back to key a, which
+            // still works.
+            error_response(401),
+            valid_response(200, "00:00", "00:01", "phần hai"),
+        ]);
+        let gateway = gateway_with(
+            vec![key("a", "AIzaA123456789"), key("b", "AQ.B123456789")],
+            transport.clone(),
+        )
+        .await;
+        let handle = registry_for_test(root.path(), gateway_transcriber(gateway));
+
+        let (_job_id, session_id) = handle
+            .start(start_params(source, "hash-401-mid-job"))
+            .await
+            .unwrap();
+        wait_until_empty(&handle, Duration::from_secs(30)).await;
+
+        let db = Db::open(root.path()).unwrap();
+        let session = db
+            .with_connection(|conn| Ok(repo::sessions::get(conn, session_id)?))
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.status, "complete");
+        let segments = primary_segments(&db, session_id);
+        assert_eq!(
+            segments.iter().map(|s| s.text.as_str()).collect::<Vec<_>>(),
+            vec!["phần một", "phần hai"],
+            "cả hai Chunk phải có mặt, đúng thứ tự"
+        );
+
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(
+            requests[0].header("x-goog-api-key"),
+            Some("AIzaA123456789"),
+            "Chunk 1 dùng key a"
+        );
+        assert_eq!(
+            requests[1].header("x-goog-api-key"),
+            Some("AQ.B123456789"),
+            "Chunk 2 (con trỏ round-robin đã sang key b) bị 401"
+        );
+        assert_eq!(
+            requests[2].header("x-goog-api-key"),
+            Some("AIzaA123456789"),
+            "401 ở Chunk 2 phải xoay lại key a, vẫn thành công"
+        );
     }
 }
