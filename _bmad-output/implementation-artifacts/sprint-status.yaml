@@ -52,7 +52,7 @@ development_status:
 
   epic-2: in-progress
   2-1-media-pipeline-thuần-rust-và-kiểm-chứng-phát-flac-spike-s1-s: review
-  2-2-gemini-transcribe-adapter-theo-họ-model-và-parser-chịu-lỗi-s: backlog
+  2-2-gemini-transcribe-adapter-theo-họ-model-và-parser-chịu-lỗi-s: review
   2-3-lưu-phiên-và-transcript-bền-vững: backlog
   2-4-job-transcribe-file-hàng-đợi-tiến-độ-và-huỷ: backlog
   2-5-chịu-lỗi-chunk-khoảng-thiếu-và-chạy-lại: backlog

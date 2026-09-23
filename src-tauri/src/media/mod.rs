@@ -12,7 +12,7 @@ mod probe;
 mod proxy;
 mod resample;
 
-pub use chunk::{Chunk, ChunkBudget, ChunkOptions, Chunker};
+pub use chunk::{serialize_transcribe_request, Chunk, ChunkBudget, ChunkOptions, Chunker};
 pub use decode::{decode_mono_16khz, DecodeStats};
 pub use hash::sha256_file;
 pub use probe::{probe, MediaInfo};

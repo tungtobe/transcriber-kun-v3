@@ -1,1 +1,4 @@
-//! Transcribe: hàng đợi Job transcribe file, Chạy lại, Transcribe lại (chưa cài đặt).
+//! Gemini transcription normalization. Job orchestration follows in Story 2.4.
+
+pub mod adapter;
+pub mod parser;

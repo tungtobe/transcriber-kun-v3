@@ -2,8 +2,12 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::Serialize;
 
 use super::{flac::encode_flac, format_error, OUTPUT_SAMPLE_RATE};
+use crate::gemini::params::MAX_TRANSCRIBE_REQUEST_BYTES;
 
 const DEFAULT_CHUNK_SECONDS: u64 = 5 * 60;
+// Leave room for the method, schema, prompt, and content framing added by the
+// Gemini adapter. The final request builder still checks its exact JSON size.
+const TRANSCRIBE_REQUEST_FRAMING_RESERVE_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChunkBudget {
@@ -15,8 +19,11 @@ impl Default for ChunkBudget {
     fn default() -> Self {
         Self {
             max_flac_bytes: 14 * 1024 * 1024,
-            // Safe spike budget pending confirmation by the 2.2 request adapter.
-            max_serialized_payload_bytes: 20 * 1024 * 1024,
+            // The serialized Chunk contributes most of the inline request.
+            // Reserve framing space here, then check the actual request JSON
+            // again at the adapter boundary.
+            max_serialized_payload_bytes: MAX_TRANSCRIBE_REQUEST_BYTES
+                - TRANSCRIBE_REQUEST_FRAMING_RESERVE_BYTES,
         }
     }
 }
@@ -45,6 +52,22 @@ pub struct Chunk {
     pub sample_count: u64,
     pub mime_type: &'static str,
     pub flac_base64: String,
+}
+
+/// Serialize the exact JSON request body and enforce the Gemini inline limit.
+/// Use this after inserting a [`Chunk`] into its final model-specific request;
+/// measuring the Chunk alone omits the schema and prompt framing.
+pub fn serialize_transcribe_request<T: Serialize>(
+    request: &T,
+) -> Result<String, crate::core::error::AppError> {
+    let body = serde_json::to_string(request)
+        .map_err(|_| format_error("The audio request could not be validated."))?;
+    if body.len() >= MAX_TRANSCRIBE_REQUEST_BYTES {
+        return Err(format_error(
+            "The serialized audio request exceeds Gemini's inline size limit.",
+        ));
+    }
+    Ok(body)
 }
 
 /// Bounds working PCM to at most one configured chunk while emitting FLAC
