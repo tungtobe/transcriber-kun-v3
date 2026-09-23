@@ -5,6 +5,7 @@ const mocks = vi.hoisted(() => ({
   jobsSubscribe: vi.fn(),
   jobsCancel: vi.fn(),
   transcribeStart: vi.fn(),
+  transcribeRerun: vi.fn(),
 }));
 
 class FakeChannel<T> {
@@ -20,6 +21,7 @@ vi.mock('../bindings', () => ({
     jobsSubscribe: (...args: unknown[]) => mocks.jobsSubscribe(...args),
     jobsCancel: (...args: unknown[]) => mocks.jobsCancel(...args),
     transcribeStart: (...args: unknown[]) => mocks.transcribeStart(...args),
+    transcribeRerun: (...args: unknown[]) => mocks.transcribeRerun(...args),
   },
 }));
 
@@ -48,6 +50,7 @@ describe('jobsStore', () => {
     mocks.jobsSubscribe.mockReset();
     mocks.jobsCancel.mockReset();
     mocks.transcribeStart.mockReset();
+    mocks.transcribeRerun.mockReset();
     capturedChannel = null;
     mocks.jobsSubscribe.mockImplementation((channel: FakeChannel<unknown>) => {
       capturedChannel = channel;
@@ -138,6 +141,23 @@ describe('jobsStore', () => {
 
     mocks.transcribeStart.mockRejectedValueOnce(new Error('bridge down'));
     const failed = await store.start('/tmp/a.wav');
+    expect('error' in failed).toBe(true);
+  });
+
+  it('rerun returns the typed outcome on success and a safe error when IPC rejects', async () => {
+    mocks.transcribeRerun.mockResolvedValueOnce({
+      status: 'ok',
+      data: { kind: 'started', jobId: 'j1' },
+    });
+    const { createJobsStore } = await import('./jobs.svelte');
+    const store = createJobsStore();
+
+    const outcome = await store.rerun('s1', 't1', { kind: 'missing' });
+    expect(outcome).toEqual({ kind: 'started', jobId: 'j1' });
+    expect(mocks.transcribeRerun).toHaveBeenCalledWith('s1', 't1', { kind: 'missing' });
+
+    mocks.transcribeRerun.mockRejectedValueOnce(new Error('bridge down'));
+    const failed = await store.rerun('s1', 't1', { kind: 'missing' });
     expect('error' in failed).toBe(true);
   });
 

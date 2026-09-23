@@ -11,13 +11,23 @@
   type ViewState =
     | { kind: 'loading' }
     | { kind: 'job'; jobId: string; sessionId: string }
-    | { kind: 'saved'; sessionId: string; title: string; durationSec: number | null; sessionStatus: string }
+    | {
+        kind: 'saved';
+        sessionId: string;
+        title: string;
+        durationSec: number | null;
+        sessionStatus: string;
+        partial: boolean;
+        transcriptId: string | null;
+      }
     | { kind: 'notFound' }
     | { kind: 'error' };
 
   let view = $state<ViewState>({ kind: 'loading' });
   let subscribed = false;
   let cancelling = $state(false);
+  let rerunStarting = $state(false);
+  let rerunError = $state<string | null>(null);
 
   function applyLookup(lookup: SessionLookup): void {
     if (lookup.kind === 'job') {
@@ -29,6 +39,8 @@
         title: lookup.title,
         durationSec: lookup.durationSec,
         sessionStatus: lookup.status,
+        partial: lookup.partial,
+        transcriptId: lookup.transcriptId,
       };
     } else {
       view = { kind: 'notFound' };
@@ -96,6 +108,29 @@
       cancelling = false;
     }
   }
+
+  // Phiên partial -> nút "Chạy lại phần thiếu" (scope `missing`, spec Tasks).
+  // `Started`/`Existing` chuyển sang xem tiến độ Job như bình thường;
+  // `NothingToRerun`/lỗi hiện thông điệp đã dịch, ở lại trang saved.
+  async function handleRerunMissing(sessionId: string, transcriptId: string | null): Promise<void> {
+    if (!transcriptId || rerunStarting) return;
+    rerunStarting = true;
+    rerunError = null;
+    try {
+      const outcome = await jobsStore.rerun(sessionId, transcriptId, { kind: 'missing' });
+      if ('error' in outcome) {
+        rerunError = i18n.t('session.rerun.error');
+        return;
+      }
+      if (outcome.kind === 'nothingToRerun') {
+        rerunError = i18n.t('session.rerun.nothingToRerun');
+        return;
+      }
+      view = { kind: 'job', jobId: outcome.jobId, sessionId };
+    } finally {
+      rerunStarting = false;
+    }
+  }
 </script>
 
 <svelte:head>
@@ -108,7 +143,9 @@
   {#if view.kind === 'loading'}
     <h1 id="session-title">{i18n.t('session.state.loading')}</h1>
   {:else if view.kind === 'job'}
-    <h1 id="session-title">{job?.sourceName ?? i18n.t('session.header.titleJob')}</h1>
+    <h1 id="session-title">
+      {job?.kind === 'rerun' ? i18n.t('session.job.kindRerun') : (job?.sourceName ?? i18n.t('session.header.titleJob'))}
+    </h1>
     {#if job}
       <div class="job-card">
         <p class="job-state">
@@ -144,13 +181,28 @@
       </div>
     {/if}
   {:else if view.kind === 'saved'}
-    <h1 id="session-title">{view.title}</h1>
+    {@const saved = view}
+    <h1 id="session-title">{saved.title}</h1>
     <div class="job-card">
-      <p class="job-detail">{i18n.t('session.saved.statusLabel', { status: view.sessionStatus })}</p>
-      {#if view.durationSec !== null}
+      <p class="job-detail">{i18n.t('session.saved.statusLabel', { status: saved.sessionStatus })}</p>
+      {#if saved.durationSec !== null}
         <p class="job-detail">
-          {i18n.t('session.saved.durationLabel', { minutes: Math.round(view.durationSec / 60) })}
+          {i18n.t('session.saved.durationLabel', { minutes: Math.round(saved.durationSec / 60) })}
         </p>
+      {/if}
+      {#if saved.partial}
+        <p class="job-waiting" role="status">{i18n.t('session.saved.partialWarning')}</p>
+        <button
+          type="button"
+          class="button button-secondary"
+          disabled={rerunStarting}
+          onclick={() => handleRerunMissing(saved.sessionId, saved.transcriptId)}
+        >
+          {rerunStarting ? i18n.t('session.saved.rerunStarting') : i18n.t('session.saved.rerunMissingAction')}
+        </button>
+        {#if rerunError}
+          <p class="job-error" role="alert">{rerunError}</p>
+        {/if}
       {/if}
     </div>
   {:else}
@@ -216,6 +268,13 @@
   .job-waiting {
     margin: 0;
     color: var(--color-warning);
+    font-size: var(--text-help-size);
+    font-weight: 600;
+  }
+
+  .job-error {
+    margin: 0;
+    color: var(--color-danger);
     font-size: var(--text-help-size);
     font-weight: 600;
   }

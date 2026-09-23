@@ -105,6 +105,60 @@ impl MergeBuilder {
     }
 }
 
+/// Kẹp một segment mới trong đúng vùng retry `[range_start, range_end]`
+/// (spec Always: "Segment mới được kẹp trong vùng"). Bỏ mục suy biến sau khi
+/// kẹp (vùng đã hết hoặc segment nằm hẳn ngoài vùng).
+fn clamp_to_range(
+    mut draft: SegmentDraft,
+    range_start: f64,
+    range_end: f64,
+) -> Option<SegmentDraft> {
+    let start = draft.start_sec.max(range_start);
+    let end = draft.end_sec.min(range_end);
+    if start >= end {
+        return None;
+    }
+    draft.start_sec = start;
+    draft.end_sec = end;
+    Some(draft)
+}
+
+/// Hợp nhất kết quả Chạy lại (2.5): Segment cũ nằm hẳn ngoài mọi vùng retry
+/// giữ nguyên; Segment mới của mỗi vùng (đã qua `MergeBuilder` riêng của
+/// vùng đó) được kẹp trong đúng vùng rồi chèn, tất cả sắp lại theo thời gian
+/// bắt đầu (spec Tasks: "hàm hợp nhất ... kẹp trong vùng ... đơn điệu, không
+/// trùng text/gap"). `old_segments` rỗng cho scope `all` (spec Always: "bỏ
+/// Segment cũ").
+pub fn splice_rerun(
+    old_segments: Vec<SegmentDraft>,
+    ranges: &[(f64, f64)],
+    per_range_new: Vec<Vec<SegmentDraft>>,
+) -> Vec<SegmentDraft> {
+    let mut items: Vec<SegmentDraft> = old_segments
+        .into_iter()
+        .filter(|segment| {
+            !ranges
+                .iter()
+                .any(|&(start, end)| segment.start_sec < end && segment.end_sec > start)
+        })
+        .collect();
+
+    for (range, new_segments) in ranges.iter().zip(per_range_new) {
+        for draft in new_segments {
+            if let Some(clamped) = clamp_to_range(draft, range.0, range.1) {
+                items.push(clamped);
+            }
+        }
+    }
+
+    items.sort_by(|a, b| {
+        a.start_sec
+            .total_cmp(&b.start_sec)
+            .then(a.end_sec.total_cmp(&b.end_sec))
+    });
+    items
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,5 +271,87 @@ mod tests {
             confirmed_silence: true,
         });
         assert!(builder.finish().is_empty());
+    }
+
+    fn draft(start: f64, end: f64, kind: SegmentKind, text: &str) -> SegmentDraft {
+        SegmentDraft {
+            start_sec: start,
+            end_sec: end,
+            kind,
+            gap_reason: if kind == SegmentKind::Gap {
+                Some(GapReason::ChunkFailed)
+            } else {
+                None
+            },
+            text: text.to_string(),
+            speaker: None,
+        }
+    }
+
+    #[test]
+    fn splice_rerun_keeps_old_segments_outside_the_retried_ranges() {
+        let old = vec![
+            draft(0.0, 10.0, SegmentKind::Text, "trước"),
+            draft(10.0, 20.0, SegmentKind::Gap, ""),
+            draft(20.0, 30.0, SegmentKind::Text, "sau"),
+        ];
+        let ranges = [(10.0, 20.0)];
+        let new_for_range = vec![vec![draft(10.0, 20.0, SegmentKind::Text, "đã vá")]];
+
+        let merged = splice_rerun(old, &ranges, new_for_range);
+
+        assert_eq!(merged.len(), 3);
+        assert_eq!(merged[0].text, "trước");
+        assert_eq!(merged[1].text, "đã vá");
+        assert_eq!(merged[1].kind, SegmentKind::Text);
+        assert_eq!(merged[2].text, "sau");
+    }
+
+    #[test]
+    fn splice_rerun_discards_every_old_segment_for_the_all_scope() {
+        let old = vec![draft(0.0, 30.0, SegmentKind::Text, "cũ")];
+        let ranges = [(0.0, 30.0)];
+        let new_for_range = vec![vec![draft(0.0, 30.0, SegmentKind::Text, "toàn bộ mới")]];
+
+        let merged = splice_rerun(old, &ranges, new_for_range);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "toàn bộ mới");
+    }
+
+    #[test]
+    fn splice_rerun_clamps_new_segments_to_their_own_range() {
+        let old = vec![];
+        let ranges = [(10.0, 20.0)];
+        // A hallucinated timestamp that overruns the retried range on both
+        // ends must be clamped, never allowed to swallow neighboring time.
+        let new_for_range = vec![vec![draft(5.0, 25.0, SegmentKind::Text, "tràn vùng")]];
+
+        let merged = splice_rerun(old, &ranges, new_for_range);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].start_sec, 10.0);
+        assert_eq!(merged[0].end_sec, 20.0);
+    }
+
+    #[test]
+    fn splice_rerun_supports_two_disjoint_missing_ranges_independently() {
+        let old = vec![
+            draft(0.0, 5.0, SegmentKind::Text, "a"),
+            draft(5.0, 10.0, SegmentKind::Gap, ""),
+            draft(10.0, 15.0, SegmentKind::Text, "b"),
+            draft(15.0, 20.0, SegmentKind::Gap, ""),
+            draft(20.0, 25.0, SegmentKind::Text, "c"),
+        ];
+        let ranges = [(5.0, 10.0), (15.0, 20.0)];
+        let new_for_range = vec![
+            vec![draft(5.0, 10.0, SegmentKind::Text, "vá 1")],
+            vec![draft(15.0, 20.0, SegmentKind::Text, "vá 2")],
+        ];
+
+        let merged = splice_rerun(old, &ranges, new_for_range);
+
+        let texts: Vec<&str> = merged.iter().map(|segment| segment.text.as_str()).collect();
+        assert_eq!(texts, vec!["a", "vá 1", "b", "vá 2", "c"]);
     }
 }

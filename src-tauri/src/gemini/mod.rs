@@ -916,15 +916,22 @@ fn supports_kind(model: &ModelInfo, kind: ModelKind) -> bool {
         .any(|method| allowed.iter().any(|allowed| method == allowed))
 }
 
+/// Test-only helpers for building a real [`GeminiGateway`] backed by a fake
+/// transport and an in-memory key pool — no network, no real clock. `pub(crate)`
+/// (not private to `mod tests` below) so other modules' tests can drive the
+/// real Gemini stack end to end (story 2.5 Tasks: "test tích hợp
+/// `GatewayTranscriber` qua transport giả cho 4 kịch bản AR-36", exercised
+/// from `transcribe::registry::tests`). `mod tests` below uses these same
+/// helpers instead of keeping its own duplicate copies.
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use super::*;
     use crate::gemini::keys::{Clock, KeyPoolHandle, KeyProvider};
     use crate::secrets::KeyMaterial;
     use std::sync::Mutex;
     use tokio::sync::Notify;
 
-    struct FakeProvider {
+    pub(crate) struct FakeProvider {
         keys: Mutex<Vec<KeyMaterial>>,
     }
 
@@ -934,13 +941,13 @@ mod tests {
         }
     }
 
-    struct FakeClock {
+    pub(crate) struct FakeClock {
         now: Mutex<Instant>,
         changed: Notify,
     }
 
     impl FakeClock {
-        fn new() -> Arc<Self> {
+        pub(crate) fn new() -> Arc<Self> {
             Arc::new(Self {
                 now: Mutex::new(Instant::now()),
                 changed: Notify::new(),
@@ -962,11 +969,11 @@ mod tests {
         }
     }
 
-    fn key(id: &str, secret: &str) -> KeyMaterial {
+    pub(crate) fn key(id: &str, secret: &str) -> KeyMaterial {
         KeyMaterial::new(KeyId::from_opaque(id), secret.to_string())
     }
 
-    async fn gateway_with(
+    pub(crate) async fn gateway_with(
         keys: Vec<KeyMaterial>,
         transport: Arc<dyn GeminiTransport>,
     ) -> GeminiGateway {
@@ -981,20 +988,20 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct FakeTransport {
+    pub(crate) struct FakeTransport {
         responses: Arc<Mutex<Vec<Result<TransportResponse, TransportError>>>>,
         requests: Arc<Mutex<Vec<TransportRequest>>>,
     }
 
     impl FakeTransport {
-        fn new(responses: Vec<Result<TransportResponse, TransportError>>) -> Arc<Self> {
+        pub(crate) fn new(responses: Vec<Result<TransportResponse, TransportError>>) -> Arc<Self> {
             Arc::new(Self {
                 responses: Arc::new(Mutex::new(responses)),
                 requests: Arc::new(Mutex::new(Vec::new())),
             })
         }
 
-        fn requests(&self) -> Vec<TransportRequest> {
+        pub(crate) fn requests(&self) -> Vec<TransportRequest> {
             self.requests.lock().unwrap().clone()
         }
     }
@@ -1006,6 +1013,13 @@ mod tests {
             Box::pin(async move { response })
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::{gateway_with, key, FakeTransport};
+    use super::*;
+    use std::sync::Mutex;
 
     #[derive(Default)]
     struct PendingTransport {
@@ -1218,6 +1232,158 @@ mod tests {
             assert_eq!(request.header("content-type"), Some("application/json"));
             assert_eq!(request.body.as_ref().unwrap().expose(), body);
         }
+    }
+
+    // Story 2.5 Tasks: "thêm test chuỗi response cho: 429 xoay key, 3×5xx rồi
+    // thành công, 4×5xx cạn ngân sách, 400/404/451 không gửi lại, timeout
+    // không fan-out, 401 key 1 rồi key 2 thành công -- khoá AC retry ở đúng
+    // tầng sở hữu bộ đếm (`gemini/`)." 400/404/451 is covered by
+    // `post_job_rejects_nonretryable_http_errors_and_oversized_body` below
+    // and timeout fan-out by `post_job_deadline_is_terminal_and_request_body_is_redacted`
+    // above; the four tests here cover the remaining rows of the AR-36
+    // matrix (spec I/O Matrix "429 xoay key", "5xx", "401 giữa chừng").
+
+    #[tokio::test]
+    async fn post_job_quota_rotates_to_the_next_key_then_succeeds() {
+        let transport = FakeTransport::new(vec![
+            Ok(TransportResponse {
+                status: 429,
+                body: "quota body containing AIzaSECRET".to_string(),
+            }),
+            Ok(TransportResponse {
+                status: 200,
+                body: "{\"candidates\":[]}".to_string(),
+            }),
+        ]);
+        let gateway = gateway_with(
+            vec![key("a", "AIzaA123456789"), key("b", "AQ.B123456789")],
+            transport.clone(),
+        )
+        .await;
+        let response = gateway
+            .post_job(
+                "/v1beta/interactions",
+                "{}".to_string(),
+                ConsentSnapshot::new(1, false),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status, 200);
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].header("x-goog-api-key"), Some("AIzaA123456789"));
+        assert_eq!(requests[1].header("x-goog-api-key"), Some("AQ.B123456789"));
+    }
+
+    #[tokio::test]
+    async fn post_job_retries_three_server_errors_then_succeeds_on_the_fourth_attempt() {
+        let transport = FakeTransport::new(vec![
+            Ok(TransportResponse {
+                status: 503,
+                body: "e1".to_string(),
+            }),
+            Ok(TransportResponse {
+                status: 503,
+                body: "e2".to_string(),
+            }),
+            Ok(TransportResponse {
+                status: 503,
+                body: "e3".to_string(),
+            }),
+            Ok(TransportResponse {
+                status: 200,
+                body: "{\"candidates\":[]}".to_string(),
+            }),
+        ]);
+        let gateway = gateway_with(vec![key("a", "AIzaA123456789")], transport.clone()).await;
+        let observer = Arc::new(RecordingObserver::default());
+        let response = gateway
+            .post_job_observed(
+                "/v1beta/interactions",
+                "{}".to_string(),
+                ConsentSnapshot::new(1, false),
+                CancellationToken::new(),
+                Some(observer.clone() as Arc<dyn JobObserver>),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            transport.requests().len(),
+            usize::from(params::MAX_ATTEMPTS)
+        );
+        assert_eq!(*observer.attempts.lock().unwrap(), vec![1, 2, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn post_job_exhausts_the_attempt_budget_after_four_server_errors() {
+        let transport = FakeTransport::new(vec![
+            Ok(TransportResponse {
+                status: 503,
+                body: "e1".to_string(),
+            }),
+            Ok(TransportResponse {
+                status: 503,
+                body: "e2".to_string(),
+            }),
+            Ok(TransportResponse {
+                status: 503,
+                body: "e3".to_string(),
+            }),
+            Ok(TransportResponse {
+                status: 503,
+                body: "e4".to_string(),
+            }),
+        ]);
+        let gateway = gateway_with(vec![key("a", "AIzaA123456789")], transport.clone()).await;
+        let error = gateway
+            .post_job(
+                "/v1beta/interactions",
+                "{}".to_string(),
+                ConsentSnapshot::new(1, false),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, Code::Network);
+        assert_eq!(
+            transport.requests().len(),
+            usize::from(params::MAX_ATTEMPTS)
+        );
+    }
+
+    #[tokio::test]
+    async fn post_job_auth_rejection_rotates_to_the_next_key_then_succeeds() {
+        let transport = FakeTransport::new(vec![
+            Ok(TransportResponse {
+                status: 401,
+                body: "rejected".to_string(),
+            }),
+            Ok(TransportResponse {
+                status: 200,
+                body: "{\"candidates\":[]}".to_string(),
+            }),
+        ]);
+        let gateway = gateway_with(
+            vec![key("a", "AIzaA123456789"), key("b", "AQ.B123456789")],
+            transport.clone(),
+        )
+        .await;
+        let response = gateway
+            .post_job(
+                "/v1beta/interactions",
+                "{}".to_string(),
+                ConsentSnapshot::new(1, false),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status, 200);
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].header("x-goog-api-key"), Some("AIzaA123456789"));
+        assert_eq!(requests[1].header("x-goog-api-key"), Some("AQ.B123456789"));
     }
 
     #[tokio::test]

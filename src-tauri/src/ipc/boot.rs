@@ -18,6 +18,11 @@ use crate::transcribe::registry::{self, GatewayTranscriber, JobRegistryHandle};
 /// (spec I/O Matrix: "App vẫn khởi động; ... trả AppError category storage").
 pub struct AppState {
     pub db: Result<Arc<Db>, AppError>,
+    /// Cùng gốc `app_data_dir` dùng bởi `db`/`registry::channel` (Proxy nằm
+    /// dưới `<data_dir>/media/<session-id>/proxy.<ext>` -- spec 2.5: Chạy lại
+    /// cần tra Proxy này trước khi tạo Job, không qua registry actor cho một
+    /// việc thuần đọc đường dẫn).
+    pub data_dir: Result<std::path::PathBuf, AppError>,
     pub secrets: Arc<SecretService<NativeCredentialStore>>,
     pub key_pool: KeyPoolHandle,
     /// One process-wide HTTP client/gateway. A client-construction failure is
@@ -118,8 +123,14 @@ pub fn boot<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
         (_, _, Err(err)) => Err(AppError::new(Code::Storage, err.to_string())),
     };
 
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|err| AppError::new(Code::Storage, err.to_string()));
+
     AppState {
         db,
+        data_dir,
         secrets,
         key_pool,
         gateway,

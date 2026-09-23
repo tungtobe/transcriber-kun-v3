@@ -254,28 +254,94 @@ pub fn commit_file_session(
 
 /// Tóm tắt một Phiên đã lưu — dùng bởi route `/session/:id` (story 2.4) khi
 /// `id` không khớp Job nào đang chạy trong `JobRegistry`: đủ để hiển thị tên
-/// Phiên, không phải toàn bộ `SessionRow`.
+/// Phiên, không phải toàn bộ `SessionRow`. `partial`/`primary_transcript_id`
+/// (story 2.5) phản ánh transcript `primary` hiện tại — `None` chỉ khi Phiên
+/// chưa có `primary` nào (không xảy ra với một Phiên đã commit qua
+/// `commit_file_session`, nhưng giữ `Option` để không giả định điều đó ở
+/// đây).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionSummary {
     pub session_id: SessionId,
     pub title: String,
     pub duration_sec: f64,
     pub status: String,
+    pub partial: bool,
+    pub primary_transcript_id: Option<TranscriptId>,
 }
 
 /// Đọc tóm tắt một Phiên theo id, `None` nếu không còn tồn tại (spec I/O
 /// Matrix "`/session/:id`": "Phiên đã lưu / không còn").
 pub fn get(db: &Db, session_id: SessionId) -> Result<Option<SessionSummary>, AppError> {
     db.with_connection(|conn| {
-        Ok(
-            repo::sessions::get(conn, session_id)?.map(|row| SessionSummary {
-                session_id: row.id,
-                title: row.title,
-                duration_sec: row.duration_sec,
-                status: row.status,
-            }),
-        )
+        let Some(row) = repo::sessions::get(conn, session_id)? else {
+            return Ok(None);
+        };
+        let primary_transcript_id = repo::transcripts::primary_for_session(conn, session_id)?;
+        let partial = match primary_transcript_id {
+            Some(id) => repo::transcripts::get(conn, id)?
+                .is_some_and(|transcript| transcript.status == repo::transcripts::Status::Partial),
+            None => false,
+        };
+        Ok(Some(SessionSummary {
+            session_id: row.id,
+            title: row.title,
+            duration_sec: row.duration_sec,
+            status: row.status,
+            partial,
+            primary_transcript_id,
+        }))
     })
+}
+
+/// Chạy lại (2.5): swap nguyên tử một transcript của một Phiên có sẵn trong
+/// một transaction — chỉ ghi khi `expected_transcript_id` vẫn tồn tại đúng
+/// Phiên này lúc bắt đầu (spec Always: "chỉ khi transcript đích vẫn tồn tại
+/// với đúng id lúc bắt đầu, xoá nó và chèn bản mới cùng `variant`"; spec
+/// Design Notes: "swap so khớp `expected_transcript_id` trong transaction
+/// thay vì khoá"). Bản mới giữ đúng `variant` của bản cũ (`repo::transcripts::
+/// swap` tự đọc lại) — caller quyết định việc chặn Chạy lại vào `primary`
+/// của Phiên `live` trước khi gọi tới đây. Trả `Ok(None)` (không ghi gì) khi
+/// transcript đích đã bị thay/xoá giữa chừng (spec I/O Matrix "Kết quả tới
+/// muộn"); không chạm media/Proxy — Chạy lại chỉ transcribe lại, không tạo
+/// Proxy mới.
+pub fn swap_transcript(
+    db: &Db,
+    session_id: SessionId,
+    expected_transcript_id: TranscriptId,
+    draft: TranscriptDraft,
+) -> Result<Option<TranscriptId>, AppError> {
+    let new_id = TranscriptId::new();
+    let now = now_ms();
+
+    let swapped: bool = db.with_connection(|conn| {
+        let tx = conn.transaction()?;
+        let result = repo::transcripts::swap(
+            &tx,
+            session_id,
+            expected_transcript_id,
+            new_id,
+            &draft.model,
+            draft.language.as_deref(),
+            &draft.segments,
+            now,
+        )?;
+        if result.is_none() {
+            // Không khớp `expected_transcript_id` -- không ghi gì, để `tx`
+            // rollback qua Drop (không gọi `commit()`), giống nhánh lỗi ở
+            // `commit_file_session`/`replace_primary_transcript`.
+            return Ok(false);
+        }
+
+        #[cfg(test)]
+        if fault::should_fail(fault::Point::Commit) {
+            return Err(storage_error("injected: commit failure"));
+        }
+
+        tx.commit()?;
+        Ok(true)
+    })?;
+
+    Ok(swapped.then_some(new_id))
 }
 
 /// Chạy lại: thay transcript `primary` của một Phiên có sẵn trong một
@@ -919,6 +985,202 @@ mod tests {
             })
             .unwrap();
         assert_eq!(current_primary_id, old_primary_id);
+    }
+
+    #[test]
+    fn swap_transcript_replaces_primary_when_expected_id_still_matches() {
+        let root = tempdir().unwrap();
+        let db = open_db(root.path());
+        let job_id = JobId::new();
+        let staged = stage_fake_proxy(root.path(), job_id);
+        let outcome = commit_file_session(
+            &db,
+            root.path(),
+            job_id,
+            SessionId::new(),
+            sample_draft(Some("swap-a")),
+            Ok(staged),
+        )
+        .unwrap();
+
+        let old_id = db
+            .with_connection(|conn| {
+                Ok(repo::transcripts::primary_for_session(
+                    conn,
+                    outcome.session_id,
+                )?)
+            })
+            .unwrap()
+            .unwrap();
+
+        let new_id = swap_transcript(
+            &db,
+            outcome.session_id,
+            old_id,
+            TranscriptDraft {
+                model: "gemini-2.5".to_string(),
+                language: None,
+                segments: vec![text_segment(0.0, 2.0, "chạy lại")],
+            },
+        )
+        .unwrap();
+        assert!(new_id.is_some());
+        assert_ne!(new_id, Some(old_id));
+
+        let current_primary_id = db
+            .with_connection(|conn| {
+                Ok(repo::transcripts::primary_for_session(
+                    conn,
+                    outcome.session_id,
+                )?)
+            })
+            .unwrap();
+        assert_eq!(current_primary_id, new_id);
+
+        let session = db
+            .with_connection(|conn| Ok(repo::sessions::get(conn, outcome.session_id)?))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            session.id, outcome.session_id,
+            "session_id giữ nguyên sau swap"
+        );
+    }
+
+    #[test]
+    fn swap_transcript_returns_none_and_writes_nothing_when_expected_id_is_stale() {
+        let root = tempdir().unwrap();
+        let db = open_db(root.path());
+        let job_id = JobId::new();
+        let staged = stage_fake_proxy(root.path(), job_id);
+        let outcome = commit_file_session(
+            &db,
+            root.path(),
+            job_id,
+            SessionId::new(),
+            sample_draft(Some("swap-b")),
+            Ok(staged),
+        )
+        .unwrap();
+        let real_primary_id = db
+            .with_connection(|conn| {
+                Ok(repo::transcripts::primary_for_session(
+                    conn,
+                    outcome.session_id,
+                )?)
+            })
+            .unwrap()
+            .unwrap();
+
+        let stale_id = TranscriptId::new();
+        let result = swap_transcript(
+            &db,
+            outcome.session_id,
+            stale_id,
+            TranscriptDraft {
+                model: "m2".to_string(),
+                language: None,
+                segments: vec![text_segment(0.0, 1.0, "không được ghi")],
+            },
+        )
+        .unwrap();
+        assert_eq!(result, None);
+
+        let current_primary_id = db
+            .with_connection(|conn| {
+                Ok(repo::transcripts::primary_for_session(
+                    conn,
+                    outcome.session_id,
+                )?)
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(current_primary_id, real_primary_id);
+    }
+
+    #[test]
+    fn swap_transcript_failure_leaves_old_primary_intact() {
+        let root = tempdir().unwrap();
+        let db = open_db(root.path());
+        let job_id = JobId::new();
+        let staged = stage_fake_proxy(root.path(), job_id);
+        let outcome = commit_file_session(
+            &db,
+            root.path(),
+            job_id,
+            SessionId::new(),
+            sample_draft(Some("swap-c")),
+            Ok(staged),
+        )
+        .unwrap();
+        let old_primary_id = db
+            .with_connection(|conn| {
+                Ok(repo::transcripts::primary_for_session(
+                    conn,
+                    outcome.session_id,
+                )?)
+            })
+            .unwrap()
+            .unwrap();
+
+        fault::set(Some(fault::Point::Commit));
+        let err = swap_transcript(
+            &db,
+            outcome.session_id,
+            old_primary_id,
+            TranscriptDraft {
+                model: "m2".to_string(),
+                language: None,
+                segments: vec![text_segment(0.0, 1.0, "bị huỷ")],
+            },
+        );
+        fault::set(None);
+        assert!(err.is_err());
+
+        let current_primary_id = db
+            .with_connection(|conn| {
+                Ok(repo::transcripts::primary_for_session(
+                    conn,
+                    outcome.session_id,
+                )?)
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(current_primary_id, old_primary_id);
+    }
+
+    #[test]
+    fn get_reflects_partial_and_primary_transcript_id() {
+        let root = tempdir().unwrap();
+        let db = open_db(root.path());
+        let job_id = JobId::new();
+        let staged = stage_fake_proxy(root.path(), job_id);
+        let mut draft = sample_draft(Some("partial-summary"));
+        draft
+            .transcript
+            .segments
+            .push(gap_segment(1.0, 2.0, GapReason::ChunkFailed));
+        let outcome = commit_file_session(
+            &db,
+            root.path(),
+            job_id,
+            SessionId::new(),
+            draft,
+            Ok(staged),
+        )
+        .unwrap();
+
+        let summary = get(&db, outcome.session_id).unwrap().unwrap();
+        assert!(summary.partial);
+        let primary_id = db
+            .with_connection(|conn| {
+                Ok(repo::transcripts::primary_for_session(
+                    conn,
+                    outcome.session_id,
+                )?)
+            })
+            .unwrap();
+        assert_eq!(summary.primary_transcript_id, primary_id);
     }
 
     #[test]

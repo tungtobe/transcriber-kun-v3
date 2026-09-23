@@ -20,6 +20,18 @@ pub enum JobState {
     Running,
 }
 
+/// Loại Job trong cùng một hàng đợi `JobRegistry` (story 2.5): transcribe
+/// một file mới, hoặc Chạy lại (vá vùng thiếu/toàn bộ) transcript `primary`
+/// của một Phiên đã có (spec Approach: "Thêm Job loại Chạy lại vào đúng
+/// hàng đợi `JobRegistry`"). Không phải bảng riêng, không hàng đợi thứ hai —
+/// chỉ một cờ trên `JobSnapshot` để UI phân biệt hiển thị.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "lowercase")]
+pub enum JobKind {
+    Transcribe,
+    Rerun,
+}
+
 /// Ảnh chụp một Job tại một thời điểm — đủ để UI vẽ "32 / 90 phút · 36 %",
 /// Chunk hiện tại, key thứ mấy, số lần thử, và cờ "đang chờ quota" (spec
 /// Tasks: trang Session).
@@ -29,6 +41,7 @@ pub struct JobSnapshot {
     pub job_id: JobId,
     pub session_id: SessionId,
     pub source_name: Option<String>,
+    pub kind: JobKind,
     pub state: JobState,
     // `u32`, not `u64`: specta-typescript forbids exporting BigInt-style
     // integers (see `ipc/spike_channel.rs`). Milliseconds in `u32` still

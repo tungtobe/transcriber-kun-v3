@@ -12,6 +12,7 @@ const mocks = vi.hoisted(() => {
     librarySessionGet: vi.fn(),
     jobsSubscribe: vi.fn(),
     jobsCancel: vi.fn(),
+    transcribeRerun: vi.fn(),
     FakeChannel,
   };
 });
@@ -23,6 +24,7 @@ vi.mock('../lib/bindings', () => ({
     librarySessionGet: (...args: unknown[]) => mocks.librarySessionGet(...args),
     jobsSubscribe: (...args: unknown[]) => mocks.jobsSubscribe(...args),
     jobsCancel: (...args: unknown[]) => mocks.jobsCancel(...args),
+    transcribeRerun: (...args: unknown[]) => mocks.transcribeRerun(...args),
   },
 }));
 
@@ -36,6 +38,7 @@ beforeEach(async () => {
   mocks.librarySessionGet.mockReset();
   mocks.jobsSubscribe.mockReset();
   mocks.jobsCancel.mockReset();
+  mocks.transcribeRerun.mockReset();
   capturedChannel = null;
   mocks.jobsSubscribe.mockImplementation((channel: CapturedChannel) => {
     capturedChannel = channel;
@@ -50,6 +53,7 @@ function job(overrides: Record<string, unknown> = {}) {
     jobId: 'job-1',
     sessionId: 'session-1',
     sourceName: 'meeting.wav',
+    kind: 'transcribe',
     state: 'running',
     processedMs: 30 * 60_000,
     totalMs: 90 * 60_000,
@@ -72,6 +76,102 @@ describe('Session route', () => {
 
     expect(await screen.findByRole('heading', { name: 'cuộc họp' })).toBeTruthy();
     expect(mocks.jobsSubscribe).not.toHaveBeenCalled();
+  });
+
+  it('shows a partial warning with a rerun button, and starts a rerun Job on click', async () => {
+    mocks.librarySessionGet.mockResolvedValue({
+      status: 'ok',
+      data: {
+        kind: 'session',
+        sessionId: 's1',
+        title: 'cuộc họp dở',
+        durationSec: 120,
+        status: 'partial',
+        partial: true,
+        transcriptId: 't1',
+      },
+    });
+    mocks.transcribeRerun.mockResolvedValue({ status: 'ok', data: { kind: 'started', jobId: 'job-rerun' } });
+    render(Session, { routeParams: { id: 's1' } });
+
+    expect(await screen.findByText('Bản ghi còn thiếu một số đoạn do lỗi khi transcribe.')).toBeTruthy();
+    const button = screen.getByRole('button', { name: 'Chạy lại phần thiếu' });
+
+    await fireEvent.click(button);
+
+    expect(mocks.transcribeRerun).toHaveBeenCalledWith('s1', 't1', { kind: 'missing' });
+    await waitFor(() => expect(mocks.jobsSubscribe).toHaveBeenCalledTimes(1));
+    capturedChannel!.onmessage({
+      kind: 'snapshot',
+      seq: 1,
+      jobs: [job({ jobId: 'job-rerun', sessionId: 's1', kind: 'rerun', sourceName: null })],
+    });
+    expect(await screen.findByRole('heading', { name: 'Đang chạy lại' })).toBeTruthy();
+  });
+
+  it('shows the nothingToRerun message without leaving the saved view', async () => {
+    mocks.librarySessionGet.mockResolvedValue({
+      status: 'ok',
+      data: {
+        kind: 'session',
+        sessionId: 's1',
+        title: 'cuộc họp dở',
+        durationSec: 120,
+        status: 'partial',
+        partial: true,
+        transcriptId: 't1',
+      },
+    });
+    mocks.transcribeRerun.mockResolvedValue({ status: 'ok', data: { kind: 'nothingToRerun' } });
+    render(Session, { routeParams: { id: 's1' } });
+
+    const button = await screen.findByRole('button', { name: 'Chạy lại phần thiếu' });
+    await fireEvent.click(button);
+
+    expect(await screen.findByText('Không còn đoạn nào thiếu để chạy lại.')).toBeTruthy();
+    expect(mocks.jobsSubscribe).not.toHaveBeenCalled();
+  });
+
+  it('shows a translated error when the rerun IPC call fails', async () => {
+    mocks.librarySessionGet.mockResolvedValue({
+      status: 'ok',
+      data: {
+        kind: 'session',
+        sessionId: 's1',
+        title: 'cuộc họp dở',
+        durationSec: 120,
+        status: 'partial',
+        partial: true,
+        transcriptId: 't1',
+      },
+    });
+    mocks.transcribeRerun.mockRejectedValue(new Error('bridge down'));
+    render(Session, { routeParams: { id: 's1' } });
+
+    const button = await screen.findByRole('button', { name: 'Chạy lại phần thiếu' });
+    await fireEvent.click(button);
+
+    expect(await screen.findByText('Không chạy lại được. Thử lại sau.')).toBeTruthy();
+  });
+
+  it('does not show a partial warning for a complete saved Phiên', async () => {
+    mocks.librarySessionGet.mockResolvedValue({
+      status: 'ok',
+      data: {
+        kind: 'session',
+        sessionId: 's1',
+        title: 'cuộc họp',
+        durationSec: 120,
+        status: 'complete',
+        partial: false,
+        transcriptId: 't1',
+      },
+    });
+    render(Session, { routeParams: { id: 's1' } });
+
+    await screen.findByRole('heading', { name: 'cuộc họp' });
+    expect(screen.queryByText('Bản ghi còn thiếu một số đoạn do lỗi khi transcribe.')).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Chạy lại phần thiếu' })).toBeNull();
   });
 
   it('shows "not found" with a link home when the id matches nothing', async () => {
