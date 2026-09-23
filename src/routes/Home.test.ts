@@ -5,6 +5,37 @@ import { i18n } from '../i18n/index.svelte';
 import { configureRouter } from '../lib/router';
 import Home from './Home.svelte';
 
+function job(jobId: string, overrides: Partial<Record<string, unknown>> = {}) {
+  return {
+    jobId,
+    sessionId: `session-${jobId}`,
+    sourceName: 'fixture.wav',
+    kind: 'transcribe',
+    state: 'running',
+    processedMs: 30 * 60_000,
+    totalMs: 90 * 60_000,
+    chunkIndex: 6,
+    chunkCount: 18,
+    keyOrdinal: 2,
+    attempt: 1,
+    waitingQuota: false,
+    ...overrides,
+  };
+}
+
+function item(sessionId: string, overrides: Partial<Record<string, unknown>> = {}) {
+  return {
+    sessionId,
+    kind: 'file',
+    title: `phiên ${sessionId}`,
+    createdAt: 1_000,
+    durationSec: 65,
+    recovered: false,
+    missingGapCount: 0,
+    ...overrides,
+  };
+}
+
 const mocks = vi.hoisted(() => ({
   keysStore: {
     hasUsableKey: false,
@@ -16,10 +47,28 @@ const mocks = vi.hoisted(() => ({
     pick: vi.fn(),
     dismiss: vi.fn(),
   },
+  jobsStore: {
+    jobs: new Map<string, unknown>(),
+    resultSeq: 0,
+    synced: true,
+    status: 'subscribed' as 'idle' | 'subscribed' | 'error',
+    subscribe: vi.fn(() => Promise.resolve()),
+    unsubscribe: vi.fn(),
+    cancel: vi.fn(() => Promise.resolve('cancelling')),
+  },
+  libraryStore: {
+    sessions: [] as unknown[],
+    status: 'ready' as 'loading' | 'ready' | 'error',
+    error: null as null | { category: string; code: string; detailRedacted: string },
+    reloadError: false,
+    load: vi.fn(() => Promise.resolve()),
+  },
 }));
 
 vi.mock('../lib/stores/keys.svelte', () => ({ keysStore: mocks.keysStore }));
 vi.mock('../lib/stores/intake.svelte', () => ({ intakeStore: mocks.intakeStore }));
+vi.mock('../lib/stores/jobs.svelte', () => ({ jobsStore: mocks.jobsStore }));
+vi.mock('../lib/stores/library.svelte', () => ({ libraryStore: mocks.libraryStore }));
 
 afterEach(() => cleanup());
 
@@ -32,6 +81,17 @@ beforeEach(() => {
   mocks.intakeStore.notices = [];
   mocks.intakeStore.pick.mockReset().mockResolvedValue(undefined);
   mocks.intakeStore.dismiss.mockReset();
+  mocks.jobsStore.jobs = new Map();
+  mocks.jobsStore.synced = true;
+  mocks.jobsStore.status = 'subscribed';
+  mocks.jobsStore.subscribe.mockReset().mockResolvedValue(undefined);
+  mocks.jobsStore.unsubscribe.mockReset();
+  mocks.jobsStore.cancel.mockReset().mockResolvedValue('cancelling');
+  mocks.libraryStore.sessions = [];
+  mocks.libraryStore.status = 'ready';
+  mocks.libraryStore.error = null;
+  mocks.libraryStore.reloadError = false;
+  mocks.libraryStore.load.mockReset().mockResolvedValue(undefined);
 });
 
 describe('Home locale rendering', () => {
@@ -167,5 +227,159 @@ describe('Home file intake (story 2.8)', () => {
     render(Home);
 
     expect(screen.getByText('Đã thêm vào hàng đợi transcribe.')).toBeTruthy();
+  });
+});
+
+describe('Home mount/unmount subscribes and unsubscribes jobsStore (story 2.9)', () => {
+  beforeEach(() => i18n.applyPreference('vi'));
+
+  it('subscribes jobsStore on mount and unsubscribes on unmount, and loads the library once', () => {
+    const view = render(Home);
+    expect(mocks.jobsStore.subscribe).toHaveBeenCalledTimes(1);
+    expect(mocks.libraryStore.load).toHaveBeenCalledTimes(1);
+
+    view.unmount();
+    expect(mocks.jobsStore.unsubscribe).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('Home session list (story 2.9)', () => {
+  beforeEach(() => i18n.applyPreference('vi'));
+
+  it('shows the thin drop-zone and session rows, newest first, instead of the two big empty cards', () => {
+    mocks.libraryStore.sessions = [item('a', { title: 'cuộc họp A' }), item('b', { title: 'cuộc họp B' })];
+    render(Home);
+
+    expect(screen.getByText('Kéo file vào đây hoặc')).toBeTruthy();
+    expect(screen.queryByText('Bắt đầu Live')).toBeNull();
+    expect(screen.getByText('cuộc họp A')).toBeTruthy();
+    expect(screen.getByText('cuộc họp B')).toBeTruthy();
+  });
+
+  it('shows the "Thiếu N khoảng" badge only when missingGapCount > 0, and "Phục hồi" when recovered', () => {
+    mocks.libraryStore.sessions = [
+      item('a', { title: 'còn thiếu', missingGapCount: 2 }),
+      item('b', { title: 'đã phục hồi', recovered: true }),
+      item('c', { title: 'bình thường' }),
+    ];
+    render(Home);
+
+    expect(screen.getByText('Thiếu 2 khoảng')).toBeTruthy();
+    expect(screen.getByText('Phục hồi')).toBeTruthy();
+  });
+
+  it('renders each row as a link to /session/:id', () => {
+    mocks.libraryStore.sessions = [item('abc', { title: 'phiên abc' })];
+    render(Home);
+
+    const rowLink = screen.getByRole('link', { name: /phiên abc/ });
+    expect(rowLink.getAttribute('href')).toBe('/session/abc');
+  });
+
+  it('shows a skeleton while the library is loading', () => {
+    mocks.libraryStore.status = 'loading';
+    render(Home);
+
+    expect(screen.getAllByRole('status').length).toBeGreaterThan(0);
+    expect(screen.queryByText('Kéo file vào đây')).toBeNull();
+  });
+
+  it('shows a load error with a Retry button that calls load() again', async () => {
+    mocks.libraryStore.status = 'error';
+    render(Home);
+
+    expect(screen.getByText('Không tải được danh sách phiên.')).toBeTruthy();
+    mocks.libraryStore.load.mockClear();
+    await fireEvent.click(screen.getByRole('button', { name: 'Thử lại' }));
+    expect(mocks.libraryStore.load).toHaveBeenCalledTimes(1);
+  });
+
+  it('shows a transient reload-error notice while keeping the old list visible', () => {
+    mocks.libraryStore.sessions = [item('a')];
+    mocks.libraryStore.reloadError = true;
+    render(Home);
+
+    expect(screen.getByText('Không tải lại được danh sách mới nhất.')).toBeTruthy();
+    expect(screen.getByText('phiên a')).toBeTruthy();
+  });
+});
+
+describe('Home job card (story 2.9)', () => {
+  beforeEach(() => i18n.applyPreference('vi'));
+
+  it('shows the running job at the top with progress, chunk/key/attempt detail, Mở and Huỷ', async () => {
+    mocks.jobsStore.jobs = new Map([['j1', job('j1')]]);
+    render(Home);
+
+    expect(screen.getByText('fixture.wav')).toBeTruthy();
+    expect(screen.getByText('30 / 90 phút · 33 %')).toBeTruthy();
+    expect(screen.getByText(/Đoạn 6 \/ 18.*Key thứ 2.*Lần thử 1/)).toBeTruthy();
+    const openLink = screen.getByRole('link', { name: 'Mở' });
+    expect(openLink.getAttribute('href')).toBe('/session/session-j1');
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Huỷ' }));
+    expect(mocks.jobsStore.cancel).toHaveBeenCalledWith('j1');
+  });
+
+  it('keeps the job card and re-enables Huỷ when cancelling fails', async () => {
+    mocks.jobsStore.jobs = new Map([['j1', job('j1')]]);
+    mocks.jobsStore.cancel.mockResolvedValueOnce(null);
+    render(Home);
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Huỷ' }));
+    await Promise.resolve();
+
+    const cancel = await screen.findByRole('button', { name: 'Huỷ' });
+    expect((cancel as HTMLButtonElement).disabled).toBe(false);
+    expect(screen.getByText('fixture.wav')).toBeTruthy();
+  });
+
+  it('shows the queued job (Job đầu hàng) when nothing is running yet', () => {
+    mocks.jobsStore.jobs = new Map([['j1', job('j1', { state: 'queued', sourceName: 'queued.wav' })]]);
+    render(Home);
+
+    expect(screen.getByText('queued.wav')).toBeTruthy();
+  });
+
+  it('shows "Đang chờ quota…" and "N file đang chờ" when applicable', () => {
+    mocks.jobsStore.jobs = new Map([
+      ['j1', job('j1', { waitingQuota: true })],
+      ['j2', job('j2', { state: 'queued' })],
+    ]);
+    render(Home);
+
+    expect(screen.getByText('Đang chờ quota…')).toBeTruthy();
+    expect(screen.getByText('1 file đang chờ')).toBeTruthy();
+  });
+
+  it('uses the "Đang chạy lại" label for a rerun job with no sourceName', () => {
+    mocks.jobsStore.jobs = new Map([['j1', job('j1', { kind: 'rerun', sourceName: null })]]);
+    render(Home);
+
+    expect(screen.getByText('Đang chạy lại')).toBeTruthy();
+  });
+
+  it('still shows the job card in the otherwise-empty state (a Job but no Phiên yet)', () => {
+    mocks.jobsStore.jobs = new Map([['j1', job('j1')]]);
+    mocks.libraryStore.sessions = [];
+    render(Home);
+
+    expect(screen.getByText('fixture.wav')).toBeTruthy();
+    expect(screen.queryByText('Bắt đầu Live')).toBeNull();
+  });
+
+  it('renders the true empty state (two big cards) only with no Phiên and no Job', () => {
+    render(Home);
+
+    expect(screen.getByRole('heading', { name: 'Kéo file vào đây' })).toBeTruthy();
+    expect(screen.getByRole('heading', { name: 'Bắt đầu Live' })).toBeTruthy();
+  });
+
+  it('does not flash the two big empty cards before the first Job snapshot arrives', () => {
+    mocks.jobsStore.synced = false;
+    mocks.jobsStore.status = 'idle';
+    render(Home);
+
+    expect(screen.queryByRole('heading', { name: 'Bắt đầu Live' })).toBeNull();
   });
 });

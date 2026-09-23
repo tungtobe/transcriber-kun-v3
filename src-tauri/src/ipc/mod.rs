@@ -1019,6 +1019,57 @@ async fn library_session_detail(
     track_ipc_error(&state.db, result).await
 }
 
+/// Một dòng phiên cho danh sách Home (story 2.9) — xem
+/// [`repo::sessions::SessionListRow`] cho logic đọc thật. `created_at` giữ
+/// dạng `f64` (mili-giây epoch, UTC) chứ không phải `i64`, cùng lý do
+/// `SessionDetail::created_at`: specta-typescript cấm xuất kiểu BigInt.
+/// `missing_gap_count` là `i32` (không phải `i64`), cùng lý do
+/// `SegmentDetail::idx` — không Phiên nào tới gần `i32::MAX` gap.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionListItem {
+    pub session_id: SessionId,
+    pub kind: String,
+    pub title: String,
+    pub created_at: f64,
+    pub duration_sec: f64,
+    pub recovered: bool,
+    pub missing_gap_count: i32,
+}
+
+fn session_list_row_to_item(row: repo::sessions::SessionListRow) -> SessionListItem {
+    SessionListItem {
+        session_id: row.id,
+        kind: row.kind,
+        title: row.title,
+        created_at: row.created_at as f64,
+        duration_sec: row.duration_sec,
+        recovered: row.recovered,
+        missing_gap_count: row.missing_gap_count as i32,
+    }
+}
+
+/// Liệt kê mọi Phiên cho Home (story 2.9): một truy vấn, mới nhất trước, kèm
+/// `missing_gap_count` (gap `chunk_failed` của transcript `primary`) — xem
+/// [`repo::sessions::list_for_home`] cho logic đọc thật.
+#[tauri::command]
+#[specta::specta]
+async fn library_sessions_list(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<SessionListItem>, AppError> {
+    let db = state.db.clone();
+    let result = async {
+        let db = db?;
+        blocking(move || {
+            db.with_connection(|conn| Ok(repo::sessions::list_for_home(conn)?))
+                .map(|rows| rows.into_iter().map(session_list_row_to_item).collect())
+        })
+        .await
+    }
+    .await;
+    track_ipc_error(&state.db, result).await
+}
+
 /// Kết quả `library_proxy_relink` (spec I/O Matrix "Chọn lại khớp/sai/huỷ",
 /// "Phiên live thiếu Proxy"). `LiveUnsupported` gộp cả nhánh Phiên `live`
 /// (chặn trước khi mở dialog) lẫn `library::store::RelinkOutcome::
@@ -1191,6 +1242,7 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             jobs_cancel,
             library_session_get,
             library_session_detail,
+            library_sessions_list,
             library_proxy_relink,
             app_close_confirm
         ])

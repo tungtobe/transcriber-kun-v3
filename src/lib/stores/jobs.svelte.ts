@@ -49,9 +49,21 @@ export function createJobsStore() {
   // not "no Job running" (a consumer must not read absence as truth until
   // this flips true).
   let synced = $state(false);
+  // Tăng mỗi khi một Job commit (event `result`) — story 2.9: `library`
+  // store theo dõi giá trị này để tự tải lại danh sách Home mà không cần
+  // người dùng thao tác (spec Code Map: "đếm `resultSeq` ... để store khác
+  // phản ứng"). Chỉ tăng, không bao giờ giảm hay reset ngoài `reset()`.
+  let resultSeq = $state(0);
 
   let lastSeq: number | null = null;
   let generation = 0;
+  // Đếm tham chiếu subscribe/unsubscribe (spec Design Notes): sidebar
+  // (`AppShell`, gắn suốt vòng đời app) và `/session/:id` cùng gọi
+  // `subscribe()`/`unsubscribe()` độc lập mà không xoá state của nhau —
+  // `subscribe()` chỉ thật sự mở Channel ở lần đầu (đếm 0 -> 1) hoặc khi
+  // đang `error` (mở lại); `unsubscribe()` chỉ xoá state khi đếm về 0.
+  let subscriberCount = 0;
+  let pendingSubscribe: Promise<void> | null = null;
 
   function appendLog(jobId: string, entry: JobLogEntry): void {
     const nextLogs = new Map(logs);
@@ -100,6 +112,7 @@ export function createJobsStore() {
     // 'result' | 'error' | 'cancelled': the Job left the registry.
     if (event.kind === 'result') {
       appendLog(event.jobId, { seq: event.seq, kind: 'result' });
+      resultSeq += 1;
     } else if (event.kind === 'error') {
       appendLog(event.jobId, { seq: event.seq, kind: 'error', error: event.error });
     } else {
@@ -135,20 +148,39 @@ export function createJobsStore() {
     }
   }
 
-  /** Call from a route's mount. Safe to call again (e.g. after an error). */
+  /** Call from a mount (route or shell). Reference-counted (spec Design
+   * Notes): the first call opens the Channel; later calls while already
+   * subscribed just bump the count and reuse the existing subscription —
+   * except when the current state is `error`, which reopens it. Multiple
+   * callers (sidebar + `/session/:id`) can hold a subscription at once
+   * without tearing down each other's state. */
   function subscribe(): Promise<void> {
-    return doSubscribe();
+    subscriberCount += 1;
+    if (subscriberCount === 1 || (status === 'error' && !pendingSubscribe)) {
+      const request = doSubscribe().finally(() => {
+        if (pendingSubscribe === request) pendingSubscribe = null;
+      });
+      pendingSubscribe = request;
+      return request;
+    }
+    return pendingSubscribe ?? Promise.resolve();
   }
 
-  /** Call from a route's unmount — drops the Channel and clears local state
-   * so a later `subscribe()` starts from a clean snapshot. */
+  /** Call from a mount's teardown. Reference-counted counterpart of
+   * `subscribe()`: only drops the Channel and clears local state once every
+   * caller has unsubscribed (count back to 0) — one caller leaving must not
+   * blank the state another caller (e.g. the sidebar) still reads. */
   function unsubscribe(): void {
+    if (subscriberCount === 0) return;
+    subscriberCount -= 1;
+    if (subscriberCount > 0) return;
     generation += 1;
     jobs = new Map();
     logs = new Map();
     lastSeq = null;
     synced = false;
     status = 'idle';
+    pendingSubscribe = null;
   }
 
   async function start(path: string): Promise<TranscribeStartOutcome | { error: AppError }> {
@@ -198,6 +230,9 @@ export function createJobsStore() {
     error = null;
     synced = false;
     lastSeq = null;
+    resultSeq = 0;
+    subscriberCount = 0;
+    pendingSubscribe = null;
   }
 
   return {
@@ -217,6 +252,12 @@ export function createJobsStore() {
     },
     get synced() {
       return synced;
+    },
+    /** Tăng mỗi lần một Job commit (event `result`) — theo dõi giá trị này
+     * (không phải nội dung `jobs`) để biết "có commit mới" mà không phải so
+     * sánh snapshot cũ/mới (spec Code Map). */
+    get resultSeq() {
+      return resultSeq;
     },
     subscribe,
     unsubscribe,

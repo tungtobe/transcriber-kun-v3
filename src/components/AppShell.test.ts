@@ -22,11 +22,19 @@ const mocks = vi.hoisted(() => ({
     submit: vi.fn(() => Promise.resolve()),
   },
   onDragDropEvent: vi.fn(),
+  jobsStore: {
+    jobs: new Map<string, unknown>(),
+    resultSeq: 0,
+    subscribe: vi.fn(() => Promise.resolve()),
+    unsubscribe: vi.fn(),
+    cancel: vi.fn(() => Promise.resolve('cancelling')),
+  },
 }));
 
 vi.mock('../lib/stores/settings.svelte', () => ({ settingsStore: mocks.settingsStore }));
 vi.mock('../lib/stores/app.svelte', () => ({ appStore: mocks.appStore }));
 vi.mock('../lib/stores/intake.svelte', () => ({ intakeStore: mocks.intakeStore }));
+vi.mock('../lib/stores/jobs.svelte', () => ({ jobsStore: mocks.jobsStore }));
 vi.mock('../lib/dragdrop', () => ({
   onDragDropEvent: (...args: unknown[]) => mocks.onDragDropEvent(...args),
 }));
@@ -45,6 +53,10 @@ beforeEach(() => {
   mocks.settingsStore.setTheme.mockReset();
   mocks.settingsStore.load.mockReset();
   mocks.intakeStore.submit.mockReset().mockResolvedValue(undefined);
+  mocks.jobsStore.jobs = new Map();
+  mocks.jobsStore.subscribe.mockReset().mockResolvedValue(undefined);
+  mocks.jobsStore.unsubscribe.mockReset();
+  mocks.jobsStore.cancel.mockReset().mockResolvedValue('cancelling');
   dragDropHandler = null;
   mocks.onDragDropEvent.mockReset().mockImplementation((handler: (event: DragDropEvent) => void) => {
     dragDropHandler = handler;
@@ -64,6 +76,60 @@ describe('AppShell', () => {
     expect(screen.getByText('Không có job nào đang chạy.')).toBeTruthy();
     expect(screen.getByRole('link', { name: 'Trang chủ' }).getAttribute('aria-current')).toBe('page');
     expect(screen.getByRole('button', { name: 'Live — sẽ có ở story Live' }).getAttribute('aria-disabled')).toBe('true');
+  });
+
+  it('subscribes jobsStore on mount and unsubscribes on unmount (story 2.9)', () => {
+    const view = render(AppShell);
+    expect(mocks.jobsStore.subscribe).toHaveBeenCalledTimes(1);
+
+    view.unmount();
+    expect(mocks.jobsStore.unsubscribe).toHaveBeenCalledTimes(1);
+  });
+
+  it('shows the running Job name and percent in the compact sidebar card, linking to /session/:id (story 2.9)', () => {
+    mocks.jobsStore.jobs = new Map([
+      [
+        'j1',
+        {
+          jobId: 'j1',
+          sessionId: 'session-1',
+          sourceName: 'meeting.wav',
+          kind: 'transcribe',
+          state: 'running',
+          processedMs: 30 * 60_000,
+          totalMs: 90 * 60_000,
+          chunkIndex: 6,
+          chunkCount: 18,
+          keyOrdinal: 2,
+          attempt: 1,
+          waitingQuota: false,
+        },
+      ],
+      [
+        'j2',
+        {
+          jobId: 'j2',
+          sessionId: 'session-2',
+          sourceName: 'queued.wav',
+          kind: 'transcribe',
+          state: 'queued',
+          processedMs: 0,
+          totalMs: 1,
+          chunkIndex: 0,
+          chunkCount: 1,
+          keyOrdinal: null,
+          attempt: null,
+          waitingQuota: false,
+        },
+      ],
+    ]);
+    render(AppShell);
+
+    expect(screen.queryByText('Không có job nào đang chạy.')).toBeNull();
+    expect(screen.getByText('meeting.wav')).toBeTruthy();
+    expect(screen.getByText('33 %')).toBeTruthy();
+    const link = screen.getByRole('link', { name: /meeting\.wav/ });
+    expect(link.getAttribute('href')).toBe('/session/session-1');
   });
 
   it('renders a generic typed persistence error and can reload settings', async () => {

@@ -150,6 +150,58 @@ pub fn find_by_source_hash(
     .transpose()
 }
 
+/// Một dòng cho danh sách Home (story 2.9): đủ để vẽ dòng phiên (tên, kind,
+/// ngày, thời lượng, badge `partial`/`recover`) mà không cần chi tiết
+/// segment. `missing_gap_count` là số Segment gap `chunk_failed` của
+/// transcript `primary` hiện tại của Phiên (`disconnected` không tính, và
+/// Phiên chưa có `primary` -> 0) — spec I/O Matrix "Partial".
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionListRow {
+    pub id: SessionId,
+    pub kind: String,
+    pub title: String,
+    pub created_at: i64,
+    pub duration_sec: f64,
+    pub recovered: bool,
+    pub missing_gap_count: i64,
+}
+
+/// Đọc toàn bộ Phiên cho Home, mới nhất trước, tie-break `id` giảm dần (spec
+/// Boundaries: "Sắp `created_at` giảm dần (tie-break theo `id` giảm dần)") —
+/// UUIDv7 nên so sánh chuỗi cũng xấp xỉ thứ tự tạo. Một truy vấn duy nhất:
+/// `LEFT JOIN transcripts` (chỉ variant `primary`) rồi `LEFT JOIN` một
+/// subquery đếm `segments` gap `chunk_failed` theo `transcript_id` — không
+/// N+1 (spec Code Map). Phiên chưa có transcript `primary` khớp `NULL` ở cả
+/// hai JOIN, `COALESCE` về 0.
+pub fn list_for_home(conn: &Connection) -> rusqlite::Result<Vec<SessionListRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT s.id, s.kind, s.title, s.created_at, s.duration_sec, s.recovered, \
+             COALESCE(gap_counts.cnt, 0) AS missing_gap_count \
+         FROM sessions s \
+         LEFT JOIN transcripts t ON t.session_id = s.id AND t.variant = 'primary' \
+         LEFT JOIN ( \
+             SELECT transcript_id, COUNT(*) AS cnt \
+             FROM segments \
+             WHERE kind = 'gap' AND gap_reason = 'chunk_failed' \
+             GROUP BY transcript_id \
+         ) gap_counts ON gap_counts.transcript_id = t.id \
+         ORDER BY s.created_at DESC, s.id DESC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        let id: String = row.get(0)?;
+        Ok(SessionListRow {
+            id: parse_session_id(&id)?,
+            kind: row.get(1)?,
+            title: row.get(2)?,
+            created_at: row.get(3)?,
+            duration_sec: row.get(4)?,
+            recovered: row.get::<_, i64>(5)? != 0,
+            missing_gap_count: row.get(6)?,
+        })
+    })?;
+    rows.collect()
+}
+
 /// Đọc `(id, proxy_ext)` của mọi Phiên — dùng bởi `library::store::reconcile`
 /// để biết thư mục `media/<id>` nào có dòng DB tham chiếu và Proxy nào đang
 /// được tham chiếu, không cần toàn bộ cột khác của [`SessionRow`].
@@ -172,6 +224,7 @@ pub fn list_media_refs(conn: &Connection) -> rusqlite::Result<Vec<(SessionId, Op
 mod tests {
     use super::*;
     use crate::db::migrations;
+    use crate::db::repo::segments::GapReason;
 
     fn open_migrated() -> Connection {
         let mut conn = Connection::open_in_memory().unwrap();
@@ -297,6 +350,185 @@ mod tests {
 
         assert_eq!(find_by_source_hash(&conn, "hash-a").unwrap(), Some(a));
         assert_eq!(find_by_source_hash(&conn, "hash-missing").unwrap(), None);
+    }
+
+    fn open_migrated_fk() -> Connection {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        migrations::run(&mut conn).unwrap();
+        conn
+    }
+
+    fn insert_session_at(conn: &Connection, id: SessionId, created_at: i64) {
+        insert(
+            conn,
+            NewSession {
+                id,
+                source_hash: None,
+                created_at,
+                updated_at: created_at,
+                ..sample(id)
+            },
+        )
+        .unwrap();
+    }
+
+    fn insert_primary_with_segments(
+        conn: &Connection,
+        session_id: SessionId,
+        segment_drafts: &[crate::db::repo::segments::SegmentDraft],
+    ) {
+        crate::db::repo::transcripts::insert_with_segments(
+            conn,
+            crate::core::id::TranscriptId::new(),
+            session_id,
+            crate::db::repo::transcripts::Variant::Primary,
+            "m",
+            None,
+            segment_drafts,
+            0,
+        )
+        .unwrap();
+    }
+
+    fn text_seg(start: f64, end: f64) -> crate::db::repo::segments::SegmentDraft {
+        crate::db::repo::segments::SegmentDraft {
+            start_sec: start,
+            end_sec: end,
+            kind: crate::db::repo::segments::SegmentKind::Text,
+            gap_reason: None,
+            text: "hi".to_string(),
+            speaker: None,
+        }
+    }
+
+    fn gap_seg(
+        start: f64,
+        end: f64,
+        reason: crate::db::repo::segments::GapReason,
+    ) -> crate::db::repo::segments::SegmentDraft {
+        crate::db::repo::segments::SegmentDraft {
+            start_sec: start,
+            end_sec: end,
+            kind: crate::db::repo::segments::SegmentKind::Gap,
+            gap_reason: Some(reason),
+            text: String::new(),
+            speaker: None,
+        }
+    }
+
+    #[test]
+    fn list_for_home_orders_newest_created_at_first_tie_broken_by_id_desc() {
+        let conn = open_migrated_fk();
+        let older = SessionId::new();
+        let newer_a = SessionId::new();
+        let newer_b = SessionId::new();
+        insert_session_at(&conn, older, 1_000);
+        // Cùng `created_at` -- tie-break theo `id` giảm dần.
+        let (first_by_id, second_by_id) = if newer_a.to_string() > newer_b.to_string() {
+            (newer_a, newer_b)
+        } else {
+            (newer_b, newer_a)
+        };
+        insert_session_at(&conn, first_by_id, 2_000);
+        insert_session_at(&conn, second_by_id, 2_000);
+
+        let rows = list_for_home(&conn).unwrap();
+        assert_eq!(
+            rows.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![first_by_id, second_by_id, older]
+        );
+    }
+
+    #[test]
+    fn list_for_home_counts_only_chunk_failed_gaps_of_the_primary_transcript() {
+        let conn = open_migrated_fk();
+        let id = SessionId::new();
+        insert_session_at(&conn, id, 1_000);
+        insert_primary_with_segments(
+            &conn,
+            id,
+            &[
+                text_seg(0.0, 1.0),
+                gap_seg(1.0, 2.0, GapReason::ChunkFailed),
+                gap_seg(2.0, 3.0, GapReason::Disconnected),
+                gap_seg(3.0, 4.0, GapReason::ChunkFailed),
+            ],
+        );
+
+        let rows = list_for_home(&conn).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].missing_gap_count, 2, "disconnected không tính");
+    }
+
+    #[test]
+    fn list_for_home_ignores_gaps_belonging_to_a_retranscribe_variant() {
+        let conn = open_migrated_fk();
+        let id = SessionId::new();
+        insert_session_at(&conn, id, 1_000);
+        crate::db::repo::transcripts::insert_with_segments(
+            &conn,
+            crate::core::id::TranscriptId::new(),
+            id,
+            crate::db::repo::transcripts::Variant::Primary,
+            "m",
+            None,
+            &[text_seg(0.0, 1.0)],
+            0,
+        )
+        .unwrap();
+        crate::db::repo::transcripts::insert_with_segments(
+            &conn,
+            crate::core::id::TranscriptId::new(),
+            id,
+            crate::db::repo::transcripts::Variant::Retranscribe,
+            "m",
+            None,
+            &[gap_seg(1.0, 2.0, GapReason::ChunkFailed)],
+            0,
+        )
+        .unwrap();
+
+        let rows = list_for_home(&conn).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].missing_gap_count, 0,
+            "gap của transcript retranscribe không được tính vào Home"
+        );
+    }
+
+    #[test]
+    fn list_for_home_session_without_any_transcript_has_zero_missing_gaps() {
+        let conn = open_migrated_fk();
+        let id = SessionId::new();
+        insert_session_at(&conn, id, 1_000);
+
+        let rows = list_for_home(&conn).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].missing_gap_count, 0);
+        assert_eq!(rows[0].id, id);
+    }
+
+    #[test]
+    fn list_for_home_reads_500_sessions_quickly_and_in_order() {
+        let conn = open_migrated_fk();
+        let mut ids = Vec::with_capacity(500);
+        for i in 0..500i64 {
+            let id = SessionId::new();
+            insert_session_at(&conn, id, 1_000 + i);
+            ids.push(id);
+        }
+
+        let started = std::time::Instant::now();
+        let rows = list_for_home(&conn).unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "500 Phiên phải đọc nhanh (một truy vấn, không N+1)"
+        );
+        assert_eq!(rows.len(), 500);
+        // Mới nhất trước -> id cuối cùng chèn (created_at lớn nhất) đứng đầu.
+        assert_eq!(rows[0].id, *ids.last().unwrap());
+        assert_eq!(rows[499].id, ids[0]);
     }
 
     #[test]
