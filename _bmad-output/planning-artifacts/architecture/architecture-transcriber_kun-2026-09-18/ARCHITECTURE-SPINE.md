@@ -271,7 +271,7 @@ Môi trường: `dev` (ký bằng cert team `B2U85XPU55` vì TCC khoá theo Team
 
 - **Proxy FLAC vs AAC native / player trong Rust** — chờ spike S8; `media/proxy` là điểm đổi duy nhất.
 - **Opus trong webm/mkv** — chờ spike S1; mọi đường Opus hiện kéo theo libopus (C), phải cân với AD-17.
-- **Model `*-transcribe`: inline hay Files API** — chờ spike S2; nằm gọn trong `gemini/interactions`.
+- **Transcribe file qua generateContent inline FLAC/JSON schema** — kiểm chứng S2 với model tổng quát được chọn; Live Translate là đường WebSocket riêng ở `live/`. Không triển khai Interactions/Files API cho file.
 - **tauri-specta rc.25 với Tauri 2.11 và `Channel<T>` typed** — spike Phase 0; nếu gãy, bọc Channel bằng type viết tay, AD-3 giữ nguyên.
 - **Core Audio process tap qua objc2/coreaudio-sys; keyring 4 trong MAS sandbox (entitlement `keychain-access-groups`)** — spike S4/S5.
 - **Ngưỡng NFR-5/NFR-10** — đo ở Phase 0/2; không đổi ranh giới module.

@@ -38,7 +38,7 @@ Tài liệu phân rã trans-kun v3 thành 7 epic và 55 story để đội phát
 | C2 | Định dạng tải Recording | EXPERIENCE.md (WAV/FLAC "+M4A nếu có encoder") | **Chỉ WAV/FLAC** — PRD FR-31: không có lựa chọn M4A/AAC. |
 | C3 | Bundle ID | doc 03 (`com.transcriberkun.app`) | `com.transkun.app` — Q9. |
 | C4 | Cột Model/Segment/Trạng thái ở dòng phiên | PRD FR-27 (bản gốc), doc 01, doc 06 (bản cũ) | **Theo quyết định đã ghi trong bản epics ngày 2026-09-20 và EXPERIENCE.md** — bỏ Model, số Segment (và cột Trạng thái) khỏi dòng phiên; FR-27 trong PRD hiện vẫn giữ danh sách cột cũ, **chưa được sửa tương ứng**. Giữ quyết định giao diện đã ghi ở epics/EXPERIENCE; cần đồng bộ PRD trước khi baseline triển khai. Không có Copilot (Q1). |
-| C5 | Inline vs Files API | NFR-8 yêu cầu inline; addendum §D và Architecture Deferred để mở Files API | S2 phải chứng minh inline; nếu không, OQ2 là gate thay đổi phạm vi/nguồn, không tự thêm upload ở story 2.2. |
+| C5 | Inline FLAC cho model tổng quát | NFR-8 yêu cầu inline; quyết định người dùng ngày 2026-09-23 dùng generateContent cho file | S2 kiểm chứng inline FLAC/JSON schema với model generateContent được chọn; không thêm Files API. |
 | C6 | Trạng thái kết nối sống | AD-10/addendum §H chỉ có connecting/reconnecting/stopped; UX cần “Đang transcribe” | Story 4.6 bổ sung `connected` sau setupComplete vào snapshot/event. Đồng bộ contract nguồn trước khi sinh binding; không suy ra từ Recording. |
 | C7 | Không mất ghi chú vs debounce | FR-36 hứa force-quit không mất; UX chỉ nêu debounce 800 ms/flush khi finalize | Story 3.5 nêu ACK bền và test kill trước/sau debounce; OQ10 chốt durability, chưa coi lời hứa tuyệt đối là đã chứng minh. |
 | C8 | Recording khi lỗi lưu trữ | FR-23 chỉ nêu Dừng/lỗi thiết bị, chưa có disk-full hoặc writer failure | Story 4.5 dừng an toàn và báo storage khi không còn ghi được; bảo toàn bytes đã lưu, cần đồng bộ ngoại lệ vật lý vào PRD. |
@@ -57,7 +57,7 @@ Người dùng cài bản beta từ kênh store nội bộ (TestFlight for Mac /
 ### Epic 2: Transcribe file & xem kết quả
 Người dùng kéo file ghi âm/video họp vào và có transcript có timestamp; nghe lại và click-to-seek từ proxy trong Container (không phụ thuộc file nguồn); tìm trong transcript, export, copy; lỗi từng Chunk không bao giờ bị giấu và chạy lại được phần thiếu; mở lại file trùng không tốn token. Home xuất hiện ở epic này (drop-zone, danh sách phiên, card job).
 **FRs covered:** FR-8, FR-9, FR-10, FR-11, FR-12, FR-13, FR-14, FR-15, FR-16, FR-27, FR-32, FR-33, FR-34, FR-35
-**Ghi chú triển khai:** Spike S1 (media thuần Rust, Opus), S2 (inline vs Files API cho model `*-transcribe`), S8 (FLAC trong WebView) ở các story đầu; ADR của chúng quyết định FR-9, FR-14, FR-32. `JobRegistry` + hàng đợi tuần tự (AD-11), staging + transaction DB + publish file có phục hồi (AD-16, story 2.3), asset protocol scope `$APPDATA/media/**` (AD-12). Tiêu chí QA: lệch timestamp ≤ 2 s so với transcript v2 cùng model (AR-53). Bổ sung trường Chunking vào Settings.
+**Ghi chú triển khai:** Spike S1 (media thuần Rust, Opus), S2 (inline FLAC với model `generateContent`), S8 (FLAC trong WebView) ở các story đầu; ADR của chúng quyết định FR-9, FR-14, FR-32. `JobRegistry` + hàng đợi tuần tự (AD-11), staging + transaction DB + publish file có phục hồi (AD-16, story 2.3), asset protocol scope `$APPDATA/media/**` (AD-12). Tiêu chí QA: lệch timestamp ≤ 2 s so với transcript v2 cùng model (AR-53). Bổ sung trường Chunking vào Settings.
 
 ### Epic 3: Thư viện phiên, Ghi chú & Memo
 Người dùng tìm lại phiên cũ theo tên và tag (UJ-4), đổi tên inline, xoá sạch dữ liệu, xem dung lượng lưu trữ và xoá toàn bộ; gõ ghi chú tự lưu; sinh, sinh lại và copy memo/議事録 theo template của mình, quản lý template trong Settings (UJ-3 cao trào).
@@ -114,7 +114,7 @@ ID story là tham chiếu ổn định, **không phải thứ tự bắt buộc*
 | Mã | Cần chốt/bằng chứng | Chủ trì | Trước story |
 |---|---|---|---|
 | OQ1 | Opus hỗ trợ hay từ chối rõ, theo S1 | Đội build | 2.1, 2.8 |
-| OQ2 / C5 | Inline của model chuyên transcribe; nếu không được phải giải quyết xung đột NFR-8 | Build + chủ sản phẩm/kiến trúc | 2.2 |
+| OQ2 / C5 | Inline FLAC/JSON schema của model generateContent đã chọn; nếu không được phải giải quyết xung đột NFR-8 | Build + chủ sản phẩm/kiến trúc | 2.2 |
 | OQ3 | FLAC seek trên hai WebView; phương án thay thế khi S8 fail | Đội build | 2.1, 2.7 |
 | OQ4 | Chủ key demo, quota và rotation | Chủ sản phẩm | 7.3, 7.5 |
 | OQ5 | Tên store, tài khoản, cert/profile/identity | Chủ sản phẩm + release | 1.11, 1.12 |
@@ -637,37 +637,32 @@ So that transcribe file chạy được ngay trên máy công ty sau khi cài t�
 **When** WebView cố đọc file ngoài `$APPDATA/media/**`
 **Then** bị từ chối; scope chỉ gồm `$APPDATA/media/**` (AD-12)
 
-### Story 2.2: Gemini transcribe — adapter theo họ model và parser chịu lỗi (spike S2)
+### Story 2.2: Gemini transcribe file — model tổng quát và parser chịu lỗi (spike S2)
 
 **Phụ thuộc:** 1.7, 2.1
 
 As Minh,
-I want app gửi từng Chunk cho Gemini và nhận về Segment đúng định dạng dù model thuộc họ nào,
+I want app gửi từng Chunk tới model Gemini generateContent đã chọn và nhận về Segment đúng định dạng,
 So that transcript có timestamp đáng tin và không phụ thuộc việc tôi chọn model gì.
 
 **Acceptance Criteria:**
 
-**Given** model tổng quát
+**Given** model Gemini thông thường hỗ trợ generateContent
 **When** gửi một Chunk
 **Then** gọi `POST /v1beta/models/{model}:generateContent` với `inline_data {mime_type: audio/flac}`, `responseMimeType: application/json` và `responseSchema` mảng `{start: "MM:SS", end: "MM:SS", text}`, prompt yêu cầu Segment 5–15 s
 **And** test khoá exact JSON shape của request (FR-14, AR-37, AR-36)
 
 **Given** tên model
 **When** dựng `generationConfig`
-**Then** với tên version đã kiểm chứng ở S2: ≥ 3 dùng cấu hình thinking tương ứng, 2.x dùng cấu hình tương ứng AR-37; alias như `gemini-flash-lite-latest` hoặc tên tự nhập phải qua capability/adapter đã kiểm chứng, không đoán version từ chuỗi và không tự đổi model (FR-7)
+**Then** tên version đã kiểm chứng dùng thinking config phù hợp; alias `gemini-flash-lite-latest` và tên tự nhập không đoán version, để model dùng mặc định và giữ nguyên lựa chọn của người dùng (FR-7)
 
-**Given** model tên `*-transcribe`
-**When** gọi
-**Then** dùng `POST /v1beta/interactions` với `transcription_config {mode: verbatim, timestamp_granularities: [word]}` và `language_codes`
-**And** word được gộp thành Segment ≈ 8 s (tối đa 15 s), cắt khi đổi speaker, speaker lưu trong Segment nhưng không hiển thị ở UI (FR-14)
+**Given** file có tiếng Việt và tiếng Nhật xen kẽ
+**When** transcribe bằng model generateContent đã chọn
+**Then** prompt yêu cầu tự nhận diện ngôn ngữ, giữ nguyên lời nói từng ngôn ngữ và không dịch; `*-transcribe` và Live Translate không nằm trong luồng file (FR-14)
 
-**Given** kết quả spike S2
-**When** chốt cách gửi audio cho Interactions API
-**Then** ADR ghi bằng chứng inline có hoạt động cho model mục tiêu hay không. Nếu chỉ Files API hoạt động, story bị chặn bởi OQ2/C5: không tự thêm upload vì trái NFR-8. Chủ sản phẩm/kiến trúc phải chốt và cập nhật nguồn (kể cả vòng đời file Google, key ownership và xoá file) trước khi triển khai ngoại lệ; không âm thầm bỏ hỗ trợ họ model FR-14
-
-**Given** app tự chọn cách gọi theo tên model
-**When** người dùng đổi model trong Settings
-**Then** không cần biết họ model; cả hai họ trả về cùng dạng Segment (FR-14)
+**Given** spike S2
+**When** kiểm chứng model generateContent được chọn
+**Then** ADR ghi bằng chứng inline FLAC, JSON schema và giới hạn payload. Nếu model từ chối, trả lỗi model rõ ràng; không dùng Files API hoặc tự đổi model (NFR-8)
 
 **Given** response JSON bị cắt cụt, vỡ hoặc bọc trong fence markdown
 **When** parse
@@ -2559,7 +2554,7 @@ FR-12: Job hiển thị tiến độ theo phút audio đã xử lý trên tổng
 
 FR-13: Cắt Chunk `chunkMinutes` (mặc định 5, tối thiểu 1); Segment trả về theo `MM:SS` tương đối Chunk và được cộng offset tuyệt đối; người dùng đặt được offset timestamp toàn cục (giây) áp dụng lúc hiển thị/export. Segment không bao giờ lùi thời gian; Chunk quá lớn để gửi inline → tự chia nhỏ hơn (ví dụ 3 phút) và ghi log.
 
-FR-14: Hỗ trợ hai họ model transcribe: tổng quát (JSON Segment, prompt yêu cầu Segment 5–15 s) và chuyên transcribe (word timestamps + speaker; gộp word thành Segment ≈ 8 s, tối đa 15 s, cắt khi đổi speaker). Hợp nhất về cùng dạng Segment; speaker lưu trong Segment và export `.json`, **không hiển thị trên UI v3**. App tự chọn cách gọi theo tên model.
+FR-14: Transcribe file dùng model Gemini generateContent thông thường, nhận JSON Segment 5–15 s và tự nhận diện tiếng Việt/tiếng Nhật xen kẽ mà không dịch. Live dùng model Live Translate riêng để nhận input transcript, output transcript và audio dịch. Không dùng model `*-transcribe` cho luồng file v3.
 
 FR-15: Chịu lỗi từng Chunk, không giấu Khoảng thiếu: mỗi Chunk thử tối đa 4 lần theo chính sách Key pool; Chunk thất bại hẳn thành Khoảng thiếu; Transcript Partial hiển thị cảnh báo mốc thiếu và **không** được lưu như hoàn chỉnh. UI liệt kê từng Khoảng thiếu, cho "Chạy lại phần thiếu" (chỉ Chunk thiếu) hoặc "Chạy lại toàn bộ". Phiên Partial có badge `partial` ở Home. Không bao giờ ghi đè Transcript live bằng Transcript Partial. 5xx thử lại trong 4 lần; 400/404 hoặc nội dung bị chặn → fail ngay. JSON vỡ/cắt cụt → parser cứu Segment hợp lệ, phần không cứu được thành Khoảng thiếu.
 
@@ -2685,7 +2680,7 @@ NFR-12 An toàn đường dẫn: Không dùng chuỗi do người dùng hoặc s
 **Phase 0 — Spike bắt buộc trước khi cam kết kiến trúc (ADR cho từng spike)**
 
 - AR-7 S1 Media thuần Rust: symphonia decode mp3/m4a/mp4/mov/mkv/webm/wav/flac (10 file mẫu, ≥ 20× realtime, chunk FLAC < 14 MB); quyết định Opus.
-- AR-8 S2 Gemini inline: `generateContent` nhận `inline_data audio/flac` 5 phút với responseSchema; Interactions API (`*-transcribe`) nhận inline hay bắt buộc Files API; nếu chỉ Files API hoạt động thì chặn OQ2/C5, không tự vượt NFR-8.
+- AR-8 S2 Gemini inline: kiểm chứng `generateContent` với model tổng quát được chọn nhận `inline_data audio/flac` 5 phút, responseSchema và payload dưới giới hạn. Không triển khai Interactions/Files API cho transcribe file.
 - AR-9 S3 Live WS Rust: port setup/resumption/goAway/reconnect sang tokio-tungstenite; chạy 60 phút liên tục không mất chunk.
 - AR-10 S4 Core Audio process tap: global tap trong app Tauri **sandboxed**, loại trừ PID chính app, chạy cùng cpal mic; ghi được Zoom/Teams/Meet; prompt quyền "System Audio Recording Only"; không loop TTS; kiểm trên ≥ 3 máy (Intel, M-series, 14.4 và 15.x).
 - AR-11 S5 MAS build: hello-world Tauri với entitlements sandbox + provisioning profile, `productbuild`, TestFlight for Mac; kiểm `keyring` 4 trong sandbox (entitlement `keychain-access-groups`).
@@ -2723,7 +2718,7 @@ NFR-12 An toàn đường dẫn: Không dùng chuỗi do người dùng hoặc s
 
 **Gemini, media, audio (addendum §D–F)**
 
-- AR-37 Gọi REST/WS thuần, không SDK. REST `POST /v1beta/models/{model}:generateContent`, header `x-goog-api-key`, chunk `inline_data {mime_type: audio/flac}` (giới hạn inline 20 MB đã tính base64 → chia nhỏ tiếp nếu > 14 MB, kiểm kích thước toàn payload theo story 2.1), `responseMimeType: application/json` + `responseSchema` mảng `{start:"MM:SS", end:"MM:SS", text}`. Model `*-transcribe`: `POST /v1beta/interactions` với `transcription_config {mode: verbatim, timestamp_granularities:[word]}`, `language_codes`. Thinking config theo major version parse từ tên (≥ 3 → `thinkingLevel: LOW`; 2.x → `thinkingBudget: 0`). Test khoá exact JSON shape; test với key `AIza…` và `AQ.…`.
+- AR-37 Gọi REST/WS thuần, không SDK. REST `POST /v1beta/models/{model}:generateContent`, header `x-goog-api-key`, chunk `inline_data {mime_type: audio/flac}` (giới hạn inline 20 MB đã tính base64 → chia nhỏ tiếp nếu > 14 MB, kiểm kích thước toàn payload theo story 2.1), `responseMimeType: application/json` + `responseSchema` mảng `{start:"MM:SS", end:"MM:SS", text}`. Thinking config chỉ áp dụng cho model ID đã kiểm chứng; alias/tên tự nhập bỏ cấu hình thinking thay vì đoán major version. Live Translate dùng WebSocket riêng ở AR-38. Test khoá exact JSON shape; test với key `AIza…` và `AQ.…`.
 - AR-38 Live WS `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=…`: `inputAudioTranscription`/`outputAudioTranscription` ở **top-level setup** (không trong `generationConfig`); `responseModalities: ["AUDIO"]`, `translationConfig {targetLanguageCode, echoTargetLanguage: true}`; `sessionResumption` + `contextWindowCompression.slidingWindow`; audio `realtimeInput.audio {data: base64 PCM16, mimeType: "audio/pcm;rate=16000"}` mỗi 100 ms; `goAway` → reconnect trong suốt; resend chunk chưa ack. Tắt dịch = setup không có `outputAudioTranscription`, target = source (hoặc `ja` khi auto), không `echoTargetLanguage`.
 - AR-39 Reconnect: mọi lỗi transport (timeout, EOF, DNS, TLS, close code ≠ setup-reject) → backoff `min(30 s, (1 s × 2^n) × (1 + jitter))`, jitter trong ±20 %, không giới hạn số lần, reset `n` sau `setupComplete`; `MAX_FAILURES=5` chỉ đếm server từ chối setup (1007/1008 trước `setupComplete`, 401/403/404 ở handshake); ring buffer audio pending 60 s (600 chunk 100 ms); capture → WAV writer không đi qua task WS; phát hiện mạng có lại bằng reconnect theo backoff, không poll OS network API.
 - AR-40 Tham số vận hành: chunk max attempts 4; max wait 180 s/chunk; quota cooldown 60 s; timeout transcribe chunk 120 s, memo 90 s; timeout không fan-out; sanitizer redaction cho close reason.
@@ -2747,7 +2742,7 @@ NFR-12 An toàn đường dẫn: Không dùng chuỗi do người dùng hoặc s
 
 **Câu hỏi mở ảnh hưởng story (PRD §13)**
 
-- AR-52 OQ1 Opus trong webm/mkv (chốt sau S1) · OQ2 model transcribe inline vs Files API (chốt sau S2, ảnh hưởng FR-14) · OQ3 FLAC seek trong WebView (chốt sau S8, ảnh hưởng FR-32) · OQ4 ai sở hữu/xoay key demo cho reviewer · OQ5 tên "trans-kun" còn trống trên App Store Connect/Partner Center (reserve sớm) · OQ6 nơi host Privacy Policy & endpoint · OQ7 máy test Windows Arm64 · OQ8 nội dung Template memo mặc định 3 ngôn ngữ (lấy từ v2 hay viết lại).
+- AR-52 OQ1 Opus trong webm/mkv (chốt sau S1) · OQ2 inline FLAC/JSON schema cho model generateContent đã chọn (chốt sau S2, ảnh hưởng FR-14) · OQ3 FLAC seek trong WebView (chốt sau S8, ảnh hưởng FR-32) · OQ4 ai sở hữu/xoay key demo cho reviewer · OQ5 tên "trans-kun" còn trống trên App Store Connect/Partner Center (reserve sớm) · OQ6 nơi host Privacy Policy & endpoint · OQ7 máy test Windows Arm64 · OQ8 nội dung Template memo mặc định 3 ngôn ngữ (lấy từ v2 hay viết lại).
 
 **Quyết định bổ sung về TTS (chủ sản phẩm, 2026-09-22)**
 

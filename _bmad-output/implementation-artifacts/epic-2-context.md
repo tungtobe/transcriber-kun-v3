@@ -31,7 +31,7 @@ Cho phép người dùng nhập file ghi âm/video và nhận transcript có tim
 
 ## Technical Decisions
 
-- Media decode, resample, chunk, hash và proxy chạy bằng Rust trong một tiến trình, không phụ thuộc ffmpeg/binary ngoài. Adapter chọn giao thức theo họ model nhưng chuẩn hoá về cùng dạng Segment; parser phải giữ phần Segment hợp lệ từ response hỏng mà không coi phần không xác định là thành công.
+- Media decode, resample, chunk, hash và proxy chạy bằng Rust trong một tiến trình, không phụ thuộc ffmpeg/binary ngoài. Transcribe file dùng generateContent với model tổng quát được chọn và JSON Segment; parser phải giữ phần Segment hợp lệ từ response hỏng mà không coi phần không xác định là thành công. Live Translate đi qua WebSocket riêng của Epic 4.
 - `JobRegistry` là actor duy nhất có một hàng đợi tuần tự cho transcribe/chạy lại; state Job ở bộ nhớ, không khôi phục Job sau restart. Gemini đi qua cổng chung có Consent, quota priority, retry/timeout và phân loại lỗi tập trung.
 - `db/` là chủ ghi SQLite duy nhất. Dùng UUIDv7 cho ID và tên file; staging theo Job, rồi commit dữ liệu Phiên/Transcript cùng publish proxy theo quy trình phục hồi sau crash. Partial tương ứng với gap `chunk_failed`; chạy lại dựng bản mới rồi swap nguyên tử.
 - WebView chỉ đọc media qua asset protocol giới hạn ở `$APPDATA/media/**`. Đồng bộ Job bằng snapshot + event có `seq`; log không chứa transcript hoặc bí mật.
@@ -47,4 +47,4 @@ Cho phép người dùng nhập file ghi âm/video và nhận transcript có tim
 
 Epic cần nền tảng Epic 1: DB, settings, Consent/key, Gemini gateway và IPC bindings. Luồng chính: 2.1 cung cấp media cho 2.2/2.3; 2.2 + 2.3 mở đường cho 2.4; 2.5 xây trên Job để chạy lại; 2.7 dùng Job/Transcript/proxy; 2.8 phụ thuộc Transcript detail; 2.9 phụ thuộc nhận file; 2.10 phụ thuộc Transcript detail. Story 2.6 có thể triển khai độc lập sau Settings Epic 1.
 
-Các gate cần giữ: S1/OQ1 chốt xử lý Opus; S2/OQ2 phải chứng minh model `*-transcribe` nhận audio inline, nếu không phải chờ quyết định thay đổi phạm vi; S8/OQ3 xác minh FLAC playback/seek trên WKWebView và WebView2 trước khi chốt player. Epic 4 về sau tái sử dụng hàng đợi Job và proxy cho Transcribe lại từ Recording.
+Các gate cần giữ: S1/OQ1 chốt xử lý Opus; S2/OQ2 kiểm chứng inline FLAC và JSON schema với model generateContent được chọn; không dùng Files API; S8/OQ3 xác minh FLAC playback/seek trên WKWebView và WebView2 trước khi chốt player. Epic 4 về sau tái sử dụng hàng đợi Job và proxy cho Transcribe lại từ Recording.

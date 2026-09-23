@@ -201,12 +201,11 @@ Audio được cắt thành Chunk `chunkMinutes` (mặc định 5, tối thiểu
 - Segment không bao giờ lùi thời gian so với Segment trước.
 - Chunk quá lớn để gửi inline → app tự chia nhỏ hơn (ví dụ 3 phút) và ghi log.
 
-#### FR-14: Hai họ model transcribe
-App hỗ trợ cả model tổng quát (trả JSON Segment) và model chuyên transcribe (trả word timestamps + speaker); kết quả hợp nhất về cùng dạng Segment.
+#### FR-14: Model Gemini cho transcribe file và Live
+Transcribe file dùng model Gemini thông thường qua `generateContent`, trả JSON Segment 5–15 s. Prompt yêu cầu tự nhận diện tiếng Việt và tiếng Nhật xen kẽ, giữ nguyên lời nói và không dịch. Model trong Settings có thể là tên version, alias hoặc tên người dùng nhập; app không tự đổi model hay đoán version từ alias. Model `*-transcribe`/Interactions không dùng cho file ở v3.
 **Hệ quả:**
-- Với model tổng quát: prompt yêu cầu Segment 5–15 s.
-- Với model chuyên transcribe: word gộp thành Segment ≈ 8 s (tối đa 15 s), cắt khi đổi speaker; speaker lưu trong Segment và export `.json`, **không hiển thị trên UI v3**.
-- Người dùng không cần biết họ model; app tự chọn cách gọi theo tên.
+- Live dùng model Live Translate riêng để nhận transcript đầu vào, transcript bản dịch và âm thanh bản dịch.
+- Segment file có timestamp tuyệt đối sau khi cộng offset Chunk; speaker của bản file không có dữ liệu thì để NULL.
 
 #### FR-15: Chịu lỗi từng Chunk, không giấu Khoảng thiếu
 Mỗi Chunk thử tối đa 4 lần với chính sách Key pool (FR-6); Chunk thất bại hẳn thành Khoảng thiếu; Transcript Partial được hiển thị với cảnh báo mốc thời gian thiếu và **không** được lưu như hoàn chỉnh.
@@ -513,7 +512,7 @@ Onboarding (ngôn ngữ → Consent → key) → **Home** (drop-zone, nút Live,
 ## 11. Phạm vi MVP
 
 ### 11.1 Trong phạm vi (bản submit store đầu tiên)
-Toàn bộ §4 (FR-1–48), §5, §6, §7. Cụ thể: Onboarding + Consent; key pool + keychain; Transcribe file (hai họ model, Khoảng thiếu, Proxy trong Container); Live (system/mic/mixed, dịch, đổi Target, Nhận diện lại, TTS + Ducking, reconnect trong suốt, Recording bền, phục hồi mồ côi, Transcribe lại); Home (tìm, Tag, rename, delete, tải Recording, Job đang chạy); Transcript detail (player, seek, tìm, side-by-side, export); Ghi chú + Memo + Template; Settings tinh giản + chẩn đoán + đồng bộ cấu hình; Ad slot house ads; i18n vi/en/ja; theme sáng/tối; build store-mac + store-win.
+Toàn bộ §4 (FR-1–48), §5, §6, §7. Cụ thể: Onboarding + Consent; key pool + keychain; Transcribe file (model generateContent, Khoảng thiếu, Proxy trong Container); Live (system/mic/mixed, dịch, đổi Target, Nhận diện lại, TTS + Ducking, reconnect trong suốt, Recording bền, phục hồi mồ côi, Transcribe lại); Home (tìm, Tag, rename, delete, tải Recording, Job đang chạy); Transcript detail (player, seek, tìm, side-by-side, export); Ghi chú + Memo + Template; Settings tinh giản + chẩn đoán + đồng bộ cấu hình; Ad slot house ads; i18n vi/en/ja; theme sáng/tối; build store-mac + store-win.
 
 ### 11.2 Ngoài phạm vi MVP
 - Premium, đăng nhập Google, IAP — phiên bản sau (xem §9). `[NOTE FOR PM: nếu review Apple phản đối BYOK, phương án key do Relipa cấp (addendum §K) phải được kéo lên sớm]`
@@ -539,7 +538,7 @@ Chủ sản phẩm chọn không đặt chỉ số định lượng cho v3. Thà
 ## 13. Câu hỏi mở
 
 1. **Opus** trong webm/mkv: hỗ trợ (thêm decoder) hay từ chối rõ? Chốt sau spike S1.
-2. **Model chuyên transcribe** có nhận audio inline không, hay cần Files API? Chốt sau spike S2; ảnh hưởng FR-14.
+2. **Model generateContent được chọn** có nhận FLAC inline kèm JSON schema trong giới hạn payload không? Kiểm chứng S2; không dùng Files API cho luồng file.
 3. **Phát FLAC trong WebView** (WKWebView/WebView2) có seek mượt không? Chốt sau spike S8; nếu không, FR-32 chuyển sang AAC native hoặc player trong Rust.
 4. **Key demo cho reviewer**: ai sở hữu, quota bao nhiêu, xoay thế nào khi hết hạn?
 5. **Tên "trans-kun" trên App Store Connect / Partner Center** còn trống không? Reserve sớm.
