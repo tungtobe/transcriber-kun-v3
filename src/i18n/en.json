@@ -26,7 +26,7 @@
   "home.file.title": "Drop a file here",
   "home.file.description": "Or choose a file to create a transcript. Supports mp4, m4a, and mp3.",
   "home.file.action": "Choose file",
-  "home.file.unavailable": "File selection will be added in the file transcription story",
+  "home.file.unavailable": "Add a Gemini key first to choose a file",
   "home.live.title": "Start Live",
   "home.live.description": "Realtime recording and translation will be added in the Live story.",
   "home.live.action": "Start Live",
@@ -275,5 +275,13 @@
   "closeConfirm.dialog.body": "Closing the app will cancel every transcribe task that is running or queued.",
   "closeConfirm.dialog.stay": "Stay",
   "closeConfirm.dialog.confirm": "Cancel and quit",
-  "closeConfirm.dialog.closing": "Quitting…"
+  "closeConfirm.dialog.closing": "Quitting…",
+  "dropzone.overlay.message": "Drop the file here to start transcribing",
+  "intake.notice.existingSession": "Reopened the existing session — no tokens used.",
+  "intake.notice.existingJob": "Opening the transcribe job already running for this file.",
+  "intake.notice.queued": "Added to the transcribe queue.",
+  "intake.notice.dismissLabel": "Dismiss notice",
+  "intake.error.wrongFormat": "Unsupported format. Convert to mp4, m4a, or mp3.",
+  "intake.error.noAudio": "The file has no playable audio.",
+  "session.job.queuedCount": "{count} files waiting"
 }

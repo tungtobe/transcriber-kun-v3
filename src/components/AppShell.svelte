@@ -12,14 +12,22 @@
   } from './icons';
   import { appStore } from '../lib/stores/app.svelte';
   import { settingsStore } from '../lib/stores/settings.svelte';
+  import { intakeStore } from '../lib/stores/intake.svelte';
+  import { onDragDropEvent, type DragDropEvent } from '../lib/dragdrop';
   import { i18n } from '../i18n/index.svelte';
   import type { Theme } from '../lib/bindings';
   import CloseConfirm from './CloseConfirm.svelte';
+  import DropOverlay from './DropOverlay.svelte';
 
   let { children }: { children?: Snippet } = $props();
 
   const currentPath = $derived(location());
   const consentRestricted = $derived(settingsStore.consentStatus === 'declined');
+  // Kéo thả (và overlay của nó) chỉ nhận ở Home và Transcript detail (spec
+  // Never: "Không nhận file khi đang ở Onboarding/Settings").
+  const dropEnabled = $derived(
+    currentPath === '/home' || currentPath === '/' || currentPath.startsWith('/session/'),
+  );
   const pageTitle = $derived(
     currentPath.startsWith('/settings')
       ? i18n.t('app.shell.settings')
@@ -28,10 +36,47 @@
         : i18n.t('app.shell.home'),
   );
 
+  let dragging = $state(false);
+
   $effect(() => {
     if (consentRestricted && currentPath !== '/onboarding' && currentPath !== '/settings/about') {
       void replace('/settings/about');
     }
+  });
+
+  // Đăng ký đúng một lần cho toàn app (spec Code Map: sự kiện drag-drop
+  // native của webview, không phải HTML5 `drop`) — `dropEnabled` được đọc
+  // lại bên trong handler mỗi lần sự kiện tới nên luôn phản ánh route hiện
+  // tại, không phải route lúc đăng ký.
+  $effect(() => {
+    let active = true;
+    let unlisten: (() => void) | null = null;
+    void onDragDropEvent((event: DragDropEvent) => {
+      const { payload } = event;
+      if (payload.type === 'enter' || payload.type === 'over') {
+        if (dropEnabled) dragging = true;
+        return;
+      }
+      if (payload.type === 'leave') {
+        dragging = false;
+        return;
+      }
+      // 'drop'
+      dragging = false;
+      if (dropEnabled && payload.paths.length > 0) {
+        void intakeStore.submit(payload.paths);
+      }
+    }).then((fn) => {
+      if (!active) {
+        fn();
+        return;
+      }
+      unlisten = fn;
+    });
+    return () => {
+      active = false;
+      unlisten?.();
+    };
   });
 
   function changeTheme(event: Event): void {
@@ -164,6 +209,7 @@
   </div>
 </div>
 
+<DropOverlay active={dragging && dropEnabled} />
 <CloseConfirm />
 
 <style>

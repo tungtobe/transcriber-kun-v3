@@ -26,7 +26,7 @@
   "home.file.title": "ここにファイルをドロップ",
   "home.file.description": "ファイルを選んで文字起こしを作成できます。mp4、m4a、mp3 に対応します。",
   "home.file.action": "ファイルを選択",
-  "home.file.unavailable": "ファイル選択はファイル文字起こしのストーリーで追加されます",
+  "home.file.unavailable": "ファイルを選択する前に Gemini キーを追加してください",
   "home.live.title": "ライブを開始",
   "home.live.description": "リアルタイム録音と翻訳は Live ストーリーで追加されます。",
   "home.live.action": "ライブを開始",
@@ -275,5 +275,13 @@
   "closeConfirm.dialog.body": "アプリを閉じると、実行中または待機中の文字起こしタスクはすべてキャンセルされます。",
   "closeConfirm.dialog.stay": "とどまる",
   "closeConfirm.dialog.confirm": "キャンセルして終了",
-  "closeConfirm.dialog.closing": "終了しています…"
+  "closeConfirm.dialog.closing": "終了しています…",
+  "dropzone.overlay.message": "ここにファイルをドロップして文字起こしを開始",
+  "intake.notice.existingSession": "既存のセッションを再度開きました — トークンは消費されません。",
+  "intake.notice.existingJob": "このファイルの実行中のジョブを開いています。",
+  "intake.notice.queued": "文字起こしキューに追加しました。",
+  "intake.notice.dismissLabel": "通知を閉じる",
+  "intake.error.wrongFormat": "非対応の形式です。mp4、m4a、mp3 のいずれかに変換してください。",
+  "intake.error.noAudio": "再生可能な音声がないファイルです。",
+  "session.job.queuedCount": "{count} 件のファイルが待機中"
 }

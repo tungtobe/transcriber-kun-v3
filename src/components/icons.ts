@@ -23,3 +23,4 @@ export { default as ChevronDownIcon } from '@lucide/svelte/icons/chevron-down';
 export { default as RotateCcwIcon } from '@lucide/svelte/icons/rotate-ccw';
 export { default as RefreshCwIcon } from '@lucide/svelte/icons/refresh-cw';
 export { default as FolderOpenIcon } from '@lucide/svelte/icons/folder-open';
+export { default as XIcon } from '@lucide/svelte/icons/x';

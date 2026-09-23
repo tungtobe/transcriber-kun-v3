@@ -74,10 +74,15 @@ export const commands = {
 	/**
 	 *  Bắt đầu transcribe một file (spec Always: thứ tự gate đầy đủ nằm ở
 	 *  [`transcribe_start_inner`]). `path` là đường dẫn tuyệt đối do caller cung
-	 *  cấp — story này không mở dialog/nhận kéo thả (2.8/2.9 sẽ gọi lệnh này với
-	 *  đường dẫn đã chọn).
+	 *  cấp — frontend tự dồn mọi đường vào (dialog `transcribe_pick_files`, kéo
+	 *  thả) về một hàng xử lý tuần tự gọi lệnh này từng file (spec 2.8 Approach).
 	 */
 	transcribeStart: (path: string) => typedError<TranscribeStartOutcome, AppError>(__TAURI_INVOKE("transcribe_start", { path })),
+	/**
+	 *  Command IPC cho [`pick_source_files`] — trả `Vec<String>` rỗng khi huỷ
+	 *  dialog (spec I/O Matrix "Chọn file": "Huỷ dialog → không làm gì").
+	 */
+	transcribePickFiles: () => typedError<string[], AppError>(__TAURI_INVOKE("transcribe_pick_files")),
 	/**
 	 *  Chạy lại: vá vùng thiếu, một gap cụ thể, hoặc toàn bộ transcript
 	 *  `primary` của một Phiên (spec Approach). `session_id`/`transcript_id` là
@@ -170,7 +175,14 @@ export type CloseRequested = null;
  *  `code → category` chỉ định nghĩa ở [`Code::category`], không lặp lại nơi
  *  khác trong codebase.
  */
-export type Code = "quota" | "auth" | "model" | "request" | "shape" | "timeout" | "network" | "tls" | "blocked" | "format" | "permission" | "storage";
+export type Code = "quota" | "auth" | "model" | "request" | "shape" | "timeout" | "network" | "tls" | "blocked" | "format" | "permission" | "storage" | 
+/**
+ *  File không có track audio phát được, không có frame, hoặc rỗng —
+ *  category vẫn `Format` (spec Code Map: "thêm `Code::NoAudio` (→
+ *  `Format`)") nhưng `code` khác `Format` để UI nói đúng câu ("File
+ *  không có audio phát được." thay vì "Định dạng không hỗ trợ").
+ */
+"noaudio";
 
 /**
  *  Rust-owned metadata needed to render the consent step. The accepted
@@ -463,10 +475,17 @@ export type TranscribeLanguage = "auto" | "ja" | "vi" | "en";
 export type TranscribeRerunOutcome = { kind: "started"; jobId: string } | { kind: "existing"; jobId: string } | { kind: "nothingToRerun" };
 
 /**
- *  Kết quả `transcribe_start` (spec Always: thứ tự gate "Consent → hash + tra
- *  `source_hash` → có key dùng được → tạo Job").
+ *  Kết quả `transcribe_start` (spec Always: thứ tự gate "Consent → đuôi file
+ *  thuộc allow-list → hash + tra `source_hash` trong DB → tra reservation
+ *  JobRegistry → probe → có key dùng được → tạo Job").
  */
-export type TranscribeStartOutcome = { kind: "job"; jobId: string; sessionId: string } | { kind: "existing"; sessionId: string };
+export type TranscribeStartOutcome = { kind: "job"; jobId: string; sessionId: string } | { kind: "existing"; sessionId: string } | 
+/**
+ *  Cùng nội dung (`source_hash`) đã có một Job Transcribe đang chờ/chạy,
+ *  chưa commit thành Phiên — mở view Job đó thay vì tạo Job thứ hai
+ *  (spec Always: "tra reservation JobRegistry (trùng → `ExistingJob`)").
+ */
+{ kind: "existingJob"; jobId: string; sessionId: string };
 
 /**
  *  Transcript `primary` (hoặc `retranscribe`, giữ tổng quát) của một Phiên

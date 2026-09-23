@@ -29,6 +29,15 @@
 
   const log = $derived(jobsStore.logFor(job.jobId));
 
+  // "N file đang chờ" (story 2.8 Always) — đếm mọi Job Transcribe `queued`
+  // trong registry, không chỉ Job đang xem, nên vẫn hiện khi Job đang xem là
+  // Job đang chạy và có file khác xếp hàng phía sau nó.
+  const queuedTranscribeCount = $derived(
+    Array.from(jobsStore.jobs.values()).filter(
+      (snapshot) => snapshot.kind === 'transcribe' && snapshot.state === 'queued',
+    ).length,
+  );
+
   function logLineLabel(entry: (typeof log)[number]): string {
     if (entry.kind === 'result') return i18n.t('session.job.logResult');
     if (entry.kind === 'cancelled') return i18n.t('session.job.logCancelled');
@@ -72,6 +81,11 @@
   {/if}
   {#if job.waitingQuota}
     <p class="job-waiting" role="status">{i18n.t('session.job.waitingQuota')}</p>
+  {/if}
+  {#if queuedTranscribeCount > 0}
+    <p class="job-detail" role="status">
+      {i18n.t('session.job.queuedCount', { count: queuedTranscribeCount })}
+    </p>
   {/if}
   <button
     type="button"

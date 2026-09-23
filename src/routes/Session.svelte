@@ -9,6 +9,7 @@
   import SegmentList from './session/SegmentList.svelte';
   import Player from './session/Player.svelte';
   import JobProgress from './session/JobProgress.svelte';
+  import IntakeNotices from '../components/IntakeNotices.svelte';
 
   type RouteParams = { id?: string };
   let { routeParams = {} }: { routeParams?: RouteParams } = $props();
@@ -184,6 +185,10 @@
   <title>{i18n.t('session.meta.title')}</title>
 </svelte:head>
 
+<div class="session-intake-notices">
+  <IntakeNotices />
+</div>
+
 {#if view.kind === 'saved'}
   {@const sessionId = view.sessionId}
   {@const detail = view.detail}
@@ -273,6 +278,10 @@
 {/if}
 
 <style>
+  .session-intake-notices:not(:empty) {
+    padding: var(--space-4) var(--space-6) 0;
+  }
+
   .route-screen {
     max-width: 720px;
     margin: 0 auto;

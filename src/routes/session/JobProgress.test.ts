@@ -4,10 +4,18 @@ import { cleanup, fireEvent, render, screen } from '@testing-library/svelte';
 import { i18n } from '../../i18n/index.svelte';
 import type { JobSnapshot } from '../../lib/bindings';
 
-const mocks = vi.hoisted(() => ({ logFor: vi.fn(() => [] as unknown[]) }));
+const mocks = vi.hoisted(() => ({
+  logFor: vi.fn(() => [] as unknown[]),
+  jobs: new Map<string, JobSnapshot>(),
+}));
 
 vi.mock('../../lib/stores/jobs.svelte', () => ({
-  jobsStore: { logFor: mocks.logFor },
+  jobsStore: {
+    logFor: mocks.logFor,
+    get jobs() {
+      return mocks.jobs;
+    },
+  },
 }));
 
 afterEach(() => cleanup());
@@ -15,6 +23,7 @@ afterEach(() => cleanup());
 beforeEach(() => {
   i18n.applyPreference('vi');
   mocks.logFor.mockReset().mockReturnValue([]);
+  mocks.jobs.clear();
 });
 
 function job(overrides: Partial<JobSnapshot> = {}): JobSnapshot {
@@ -73,5 +82,32 @@ describe('JobProgress', () => {
     render(JobProgress, { job: job(), cancelling: false, onCancel: vi.fn() });
 
     expect(screen.getByText('Chưa có diễn biến nào')).toBeTruthy();
+  });
+
+  it('shows "N file đang chờ" when another Transcribe Job is queued in the registry', async () => {
+    mocks.jobs.set('job-1', job());
+    mocks.jobs.set('job-2', job({ jobId: 'job-2', state: 'queued' }));
+    mocks.jobs.set('job-3', job({ jobId: 'job-3', state: 'queued' }));
+    const { default: JobProgress } = await import('./JobProgress.svelte');
+    render(JobProgress, { job: job(), cancelling: false, onCancel: vi.fn() });
+
+    expect(screen.getByText('2 file đang chờ')).toBeTruthy();
+  });
+
+  it('does not show the queued count when no Transcribe Job is queued', async () => {
+    mocks.jobs.set('job-1', job());
+    const { default: JobProgress } = await import('./JobProgress.svelte');
+    render(JobProgress, { job: job(), cancelling: false, onCancel: vi.fn() });
+
+    expect(screen.queryByText(/file đang chờ/)).toBeNull();
+  });
+
+  it('ignores queued Chạy lại Jobs when counting "N file đang chờ"', async () => {
+    mocks.jobs.set('job-1', job());
+    mocks.jobs.set('job-2', job({ jobId: 'job-2', kind: 'rerun', state: 'queued' }));
+    const { default: JobProgress } = await import('./JobProgress.svelte');
+    render(JobProgress, { job: job(), cancelling: false, onCancel: vi.fn() });
+
+    expect(screen.queryByText(/file đang chờ/)).toBeNull();
   });
 });

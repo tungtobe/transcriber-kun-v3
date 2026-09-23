@@ -26,7 +26,7 @@
   "home.file.title": "Kéo file vào đây",
   "home.file.description": "Hoặc chọn file để tạo transcript. Hỗ trợ mp4, m4a và mp3.",
   "home.file.action": "Chọn file",
-  "home.file.unavailable": "Chọn file sẽ có ở story transcribe file",
+  "home.file.unavailable": "Thêm key Gemini trước khi chọn file",
   "home.live.title": "Bắt đầu Live",
   "home.live.description": "Ghi âm và dịch realtime sẽ được thêm ở story Live.",
   "home.live.action": "Bắt đầu Live",
@@ -275,5 +275,13 @@
   "closeConfirm.dialog.body": "Đóng ứng dụng sẽ huỷ mọi tác vụ transcribe đang chạy hoặc đang chờ.",
   "closeConfirm.dialog.stay": "Ở lại",
   "closeConfirm.dialog.confirm": "Huỷ và thoát",
-  "closeConfirm.dialog.closing": "Đang thoát…"
+  "closeConfirm.dialog.closing": "Đang thoát…",
+  "dropzone.overlay.message": "Thả file vào đây để bắt đầu transcribe",
+  "intake.notice.existingSession": "Mở lại phiên có sẵn — không tốn token",
+  "intake.notice.existingJob": "Đang mở tác vụ transcribe đang chạy cho file này.",
+  "intake.notice.queued": "Đã thêm vào hàng đợi transcribe.",
+  "intake.notice.dismissLabel": "Đóng thông báo",
+  "intake.error.wrongFormat": "Định dạng không hỗ trợ. Hãy chuyển sang mp4, m4a hoặc mp3.",
+  "intake.error.noAudio": "File không có audio phát được.",
+  "session.job.queuedCount": "{count} file đang chờ"
 }
