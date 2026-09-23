@@ -27,7 +27,8 @@ use crate::db::repo::segments::{SegmentDraft, SegmentRow};
 use crate::db::Db;
 use crate::gemini::{CancellationToken, ConsentSnapshot, GeminiGateway, JobObserver};
 use crate::library::store::{self, FileSessionDraft, SessionDraft, TranscriptDraft};
-use crate::media::{self, Chunk, ChunkOptions, Chunker};
+use crate::media::{self, Chunk, ChunkBudget, ChunkOptions, Chunker};
+use crate::settings::TranscribeLanguage;
 use crate::transcribe::adapter::{transcribe_chunk_observed, TranscribeFailure};
 use crate::transcribe::merge::{splice_rerun, MergeBuilder};
 use crate::transcribe::parser::ChunkTranscript;
@@ -37,7 +38,19 @@ use super::job::{CancelOutcome, JobEvent, JobKind, JobSnapshot, JobState};
 
 const CHUNK_CHANNEL_CAPACITY: usize = 2;
 const COMMAND_CHANNEL_CAPACITY: usize = 256;
-const DEFAULT_CHUNK_SECONDS: u64 = 300;
+
+/// Build the `ChunkOptions` a Job pipeline decodes with, from the
+/// `chunkMinutes` captured on its params at start (spec Approach: "Job
+/// transcribe file và Chạy lại chụp `chunkMinutes` ... lúc nhận Job"). The
+/// byte/serialized-size budget itself is never configurable — only the
+/// duration bound (spec Never: "Không đổi ngân sách inline/tự chia Chunk quá
+/// lớn của `media::chunk`").
+fn chunk_options_for(chunk_minutes: u32) -> ChunkOptions {
+    ChunkOptions {
+        max_duration_seconds: u64::from(chunk_minutes) * 60,
+        budget: ChunkBudget::default(),
+    }
+}
 
 fn actor_error() -> AppError {
     AppError::new(Code::Storage, "job registry actor unavailable")
@@ -56,6 +69,13 @@ pub struct StartParams {
     pub source_hash: String,
     pub source_name: Option<String>,
     pub model: String,
+    /// Chụp từ `settings::load` lúc nhận Job (spec Approach: "Job transcribe
+    /// file và Chạy lại chụp `model` + ngôn ngữ ... lúc nhận Job"); đổi
+    /// Settings giữa chừng không ảnh hưởng Job đang chạy/chờ.
+    pub language: TranscribeLanguage,
+    /// Chụp từ `settings.chunkMinutes` cùng lúc, cùng cách bất biến với
+    /// `language` phía trên.
+    pub chunk_minutes: u32,
     pub consent: ConsentSnapshot,
 }
 
@@ -79,6 +99,10 @@ pub struct RerunParams {
     pub discard_old: bool,
     pub proxy_path: PathBuf,
     pub model: String,
+    /// Cùng ngữ nghĩa chụp-lúc-nhận-Job với [`StartParams::language`].
+    pub language: TranscribeLanguage,
+    /// Cùng ngữ nghĩa chụp-lúc-nhận-Job với [`StartParams::chunk_minutes`].
+    pub chunk_minutes: u32,
     pub consent: ConsentSnapshot,
 }
 
@@ -101,6 +125,7 @@ pub trait ChunkTranscriber: Send + Sync + 'static {
         &self,
         model: String,
         chunk: Chunk,
+        language: TranscribeLanguage,
         consent: ConsentSnapshot,
         cancellation: CancellationToken,
         observer: Arc<dyn JobObserver>,
@@ -124,6 +149,7 @@ impl ChunkTranscriber for GatewayTranscriber {
         &self,
         model: String,
         chunk: Chunk,
+        language: TranscribeLanguage,
         consent: ConsentSnapshot,
         cancellation: CancellationToken,
         observer: Arc<dyn JobObserver>,
@@ -134,6 +160,7 @@ impl ChunkTranscriber for GatewayTranscriber {
                 &gateway,
                 &model,
                 &chunk,
+                language,
                 consent,
                 cancellation,
                 Some(observer),
@@ -716,13 +743,13 @@ impl JobObserver for RegistryObserver {
     }
 }
 
-/// Estimate the number of 5-minute chunks a file of `total_ms` will produce.
-/// Only used for progress display — the real Chunker may emit more (rare
-/// oversized-payload splitting), in which case the actor simply raises this
-/// estimate to match (`Internal::Progress` handling).
-fn estimate_chunk_count(total_ms: u64) -> u32 {
-    let chunk_ms = DEFAULT_CHUNK_SECONDS * 1000;
-    (total_ms.div_ceil(chunk_ms)).max(1) as u32
+/// Estimate the number of `chunk_minutes`-long chunks a file of `total_ms`
+/// will produce. Only used for progress display — the real Chunker may emit
+/// more (rare oversized-payload splitting), in which case the actor simply
+/// raises this estimate to match (`Internal::Progress` handling).
+fn estimate_chunk_count(total_ms: u64, chunk_minutes: u32) -> u32 {
+    let chunk_ms = u64::from(chunk_minutes) * 60 * 1000;
+    (total_ms.div_ceil(chunk_ms.max(1))).max(1) as u32
 }
 
 /// Run one Job's full pipeline. Never panics: every fallible step is turned
@@ -786,7 +813,7 @@ async fn run_job_inner(
         Err(_) => return JobOutcome::Error(actor_error()),
     };
     let total_ms = (probe.duration_seconds * 1000.0).round().max(0.0) as u64;
-    let chunk_count = estimate_chunk_count(total_ms);
+    let chunk_count = estimate_chunk_count(total_ms, params.chunk_minutes);
     handle
         .send_internal(Internal::Progress {
             job_id,
@@ -848,7 +875,7 @@ async fn run_job_inner(
         },
         transcript: TranscriptDraft {
             model: params.model.clone(),
-            language: None,
+            language: params.language.as_code().map(str::to_string),
             segments,
         },
     };
@@ -891,9 +918,10 @@ async fn decode_and_transcribe(
     let (chunk_tx, mut chunk_rx) = mpsc::channel::<Result<Chunk, AppError>>(CHUNK_CHANNEL_CAPACITY);
     let cancel_for_decode = cancel.clone();
     let decode_path = params.source_path.clone();
+    let chunk_options = chunk_options_for(params.chunk_minutes);
     let decode_handle = tokio::task::spawn_blocking(move || {
         let decode_result: Result<(), AppError> = (|| {
-            let mut chunker = Chunker::new(ChunkOptions::default())?;
+            let mut chunker = Chunker::new(chunk_options)?;
             let mut push_chunk = |chunk: Chunk| -> Result<(), AppError> {
                 if cancel_for_decode.is_cancelled() {
                     return Err(cancelled_pipeline_error());
@@ -958,6 +986,7 @@ async fn decode_and_transcribe(
             .transcribe(
                 params.model.clone(),
                 chunk.clone(),
+                params.language,
                 params.consent,
                 cancel.clone(),
                 observer,
@@ -1049,7 +1078,7 @@ async fn run_rerun_job_inner(
     }
 
     let total_ms: u64 = params.ranges.iter().map(RerunRange::duration_ms).sum();
-    let chunk_count = estimate_chunk_count(total_ms.max(1));
+    let chunk_count = estimate_chunk_count(total_ms.max(1), params.chunk_minutes);
     handle
         .send_internal(Internal::Progress {
             job_id,
@@ -1067,6 +1096,8 @@ async fn run_rerun_job_inner(
     let (per_range_segments, decode_outcome) = decode_and_transcribe_ranges(
         job_id,
         &params.model,
+        params.language,
+        params.chunk_minutes,
         params.consent,
         &params.proxy_path,
         &params.ranges,
@@ -1112,6 +1143,7 @@ async fn run_rerun_job_inner(
 
     let db = db.clone();
     let model = params.model.clone();
+    let language = params.language.as_code().map(str::to_string);
     let commit = tokio::task::spawn_blocking(move || {
         store::swap_transcript(
             &db,
@@ -1119,7 +1151,7 @@ async fn run_rerun_job_inner(
             expected_transcript_id,
             TranscriptDraft {
                 model,
-                language: None,
+                language,
                 segments: merged,
             },
         )
@@ -1145,6 +1177,8 @@ async fn run_rerun_job_inner(
 async fn decode_and_transcribe_ranges(
     job_id: JobId,
     model: &str,
+    language: TranscribeLanguage,
+    chunk_minutes: u32,
     consent: ConsentSnapshot,
     proxy_path: &Path,
     ranges: &[RerunRange],
@@ -1161,11 +1195,12 @@ async fn decode_and_transcribe_ranges(
     let cancel_for_decode = cancel.clone();
     let decode_path = proxy_path.to_path_buf();
     let decode_ranges = ranges.to_vec();
+    let chunk_options = chunk_options_for(chunk_minutes);
     let decode_handle = tokio::task::spawn_blocking(move || {
         let decode_result = decode_ranges_and_chunk(
             &decode_path,
             &decode_ranges,
-            ChunkOptions::default(),
+            chunk_options,
             &cancel_for_decode,
             |range_index, chunk| {
                 if cancel_for_decode.is_cancelled() {
@@ -1195,7 +1230,7 @@ async fn decode_and_transcribe_ranges(
 
     let mut builders: Vec<MergeBuilder> = ranges.iter().map(|_| MergeBuilder::new()).collect();
     let mut chunk_index: u32 = 0;
-    let mut chunk_count = estimate_chunk_count(total_ms.max(1));
+    let mut chunk_count = estimate_chunk_count(total_ms.max(1), chunk_minutes);
     let mut outcome: Option<JobOutcome> = None;
 
     while let Some(item) = chunk_rx.recv().await {
@@ -1242,6 +1277,7 @@ async fn decode_and_transcribe_ranges(
             .transcribe(
                 model.to_string(),
                 chunk.clone(),
+                language,
                 consent,
                 cancel.clone(),
                 observer,
@@ -1308,6 +1344,9 @@ mod tests {
         /// shifted absolute before reaching the transcriber (spec Acceptance
         /// Criteria: "chỉ đúng hai vùng được gửi (start_ms tuyệt đối)").
         chunks: Mutex<Vec<Chunk>>,
+        /// Every `language` this fake was called with, in call order — story
+        /// 2.6 test: "ngôn ngữ chụp được truyền tới transcriber".
+        languages: Mutex<Vec<TranscribeLanguage>>,
     }
 
     impl FakeTranscriber {
@@ -1316,11 +1355,16 @@ mod tests {
                 behaviors: Mutex::new(behaviors.into()),
                 calls: Mutex::new(0),
                 chunks: Mutex::new(Vec::new()),
+                languages: Mutex::new(Vec::new()),
             })
         }
 
         fn call_count(&self) -> u32 {
             *self.calls.lock().unwrap()
+        }
+
+        fn languages_seen(&self) -> Vec<TranscribeLanguage> {
+            self.languages.lock().unwrap().clone()
         }
 
         fn chunk_start_ms(&self) -> Vec<u64> {
@@ -1338,12 +1382,14 @@ mod tests {
             &self,
             _model: String,
             chunk: Chunk,
+            language: TranscribeLanguage,
             _consent: ConsentSnapshot,
             cancellation: CancellationToken,
             observer: Arc<dyn JobObserver>,
         ) -> TranscribeChunkFuture {
             *self.calls.lock().unwrap() += 1;
             self.chunks.lock().unwrap().push(chunk.clone());
+            self.languages.lock().unwrap().push(language);
             let behavior = self
                 .behaviors
                 .lock()
@@ -1417,6 +1463,8 @@ mod tests {
             source_hash: hash.to_string(),
             source_name: Some("fixture.wav".to_string()),
             model: "gemini-flash-lite-latest".to_string(),
+            language: TranscribeLanguage::Auto,
+            chunk_minutes: 5,
             consent: ConsentSnapshot::new(1, false),
         }
     }
@@ -1771,11 +1819,147 @@ mod tests {
 
     #[test]
     fn estimate_chunk_count_rounds_up_and_never_zero() {
-        assert_eq!(estimate_chunk_count(0), 1);
-        assert_eq!(estimate_chunk_count(1), 1);
-        assert_eq!(estimate_chunk_count(300_000), 1);
-        assert_eq!(estimate_chunk_count(300_001), 2);
-        assert_eq!(estimate_chunk_count(600_000), 2);
+        assert_eq!(estimate_chunk_count(0, 5), 1);
+        assert_eq!(estimate_chunk_count(1, 5), 1);
+        assert_eq!(estimate_chunk_count(300_000, 5), 1);
+        assert_eq!(estimate_chunk_count(300_001, 5), 2);
+        assert_eq!(estimate_chunk_count(600_000, 5), 2);
+    }
+
+    #[test]
+    fn estimate_chunk_count_uses_the_captured_chunk_minutes() {
+        // Story 2.6 Acceptance Criteria: "chunkMinutes = 1 và file 150 s ->
+        // transcriber nhận 3 Chunk" -- the estimate must match a 1-minute
+        // chunk size, not the 5-minute default.
+        assert_eq!(estimate_chunk_count(150_000, 1), 3);
+        assert_eq!(estimate_chunk_count(60_000, 1), 1);
+        assert_eq!(estimate_chunk_count(60_001, 1), 2);
+    }
+
+    // ---------------------------------------------------------------------
+    // Story 2.6: `chunkMinutes`/`language` captured on `StartParams` actually
+    // drive the pipeline (decode chunking + what reaches `ChunkTranscriber` +
+    // `transcripts.language`), and a Job already running/queued keeps its own
+    // captured values independent of whatever a later `start` call captures.
+    // ---------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn chunk_minutes_of_one_splits_a_150_second_file_into_three_chunks_at_expected_starts() {
+        // Acceptance Criteria: "Given Settings có `chunkMinutes = 1` và file
+        // 150 s, when transcribe, then transcriber nhận 3 Chunk với
+        // `start_ms` 0/60000/120000."
+        let root = tempdir().unwrap();
+        let source = wav_fixture_seconds(root.path(), "a.wav", 150);
+        let transcriber = FakeTranscriber::new(vec![
+            Behavior::Success("một".to_string()),
+            Behavior::Success("hai".to_string()),
+            Behavior::Success("ba".to_string()),
+        ]);
+        let handle = registry_for_test(root.path(), transcriber.clone());
+
+        let params = StartParams {
+            chunk_minutes: 1,
+            ..start_params(source, "hash-chunk-minutes-one")
+        };
+        handle.start(params).await.unwrap();
+        wait_until_empty(&handle, Duration::from_secs(10)).await;
+
+        assert_eq!(transcriber.call_count(), 3);
+        assert_eq!(transcriber.chunk_start_ms(), vec![0, 60_000, 120_000]);
+    }
+
+    #[tokio::test]
+    async fn captured_language_reaches_the_transcriber_and_is_saved_on_the_transcript() {
+        let root = tempdir().unwrap();
+        let db = Arc::new(Db::open(root.path()).unwrap());
+        let source = wav_fixture(root.path(), "a.wav");
+        let transcriber = FakeTranscriber::new(vec![Behavior::Success("こんにちは".to_string())]);
+        let (handle, actor) = channel(db.clone(), root.path().to_path_buf(), transcriber.clone());
+        tokio::spawn(actor.run());
+
+        let params = StartParams {
+            language: TranscribeLanguage::Ja,
+            ..start_params(source, "hash-lang-ja")
+        };
+        let (_job_id, session_id) = handle.start(params).await.unwrap();
+        wait_until_empty(&handle, Duration::from_secs(5)).await;
+
+        assert_eq!(transcriber.languages_seen(), vec![TranscribeLanguage::Ja]);
+
+        let transcript_id = db
+            .with_connection(|conn| Ok(repo::transcripts::primary_for_session(conn, session_id)?))
+            .unwrap()
+            .unwrap();
+        let transcript = db
+            .with_connection(|conn| Ok(repo::transcripts::get(conn, transcript_id)?))
+            .unwrap()
+            .unwrap();
+        assert_eq!(transcript.language.as_deref(), Some("ja"));
+    }
+
+    #[tokio::test]
+    async fn auto_language_leaves_the_transcript_language_null() {
+        let root = tempdir().unwrap();
+        let db = Arc::new(Db::open(root.path()).unwrap());
+        let source = wav_fixture(root.path(), "a.wav");
+        let transcriber = FakeTranscriber::new(vec![Behavior::Success("hello".to_string())]);
+        let (handle, actor) = channel(db.clone(), root.path().to_path_buf(), transcriber);
+        tokio::spawn(actor.run());
+
+        let (_job_id, session_id) = handle
+            .start(start_params(source, "hash-lang-auto"))
+            .await
+            .unwrap();
+        wait_until_empty(&handle, Duration::from_secs(5)).await;
+
+        let transcript_id = db
+            .with_connection(|conn| Ok(repo::transcripts::primary_for_session(conn, session_id)?))
+            .unwrap()
+            .unwrap();
+        let transcript = db
+            .with_connection(|conn| Ok(repo::transcripts::get(conn, transcript_id)?))
+            .unwrap()
+            .unwrap();
+        assert_eq!(transcript.language, None);
+    }
+
+    #[tokio::test]
+    async fn a_queued_job_keeps_its_own_captured_config_independent_of_a_later_started_job() {
+        // Acceptance Criteria: "Job đang chạy với cấu hình cũ ... Job đó
+        // hoàn tất với cấu hình cũ và Job start sau đó dùng cấu hình mới."
+        // The registry never re-reads Settings mid-pipeline — each Job only
+        // ever sees the `StartParams` it was handed at `start()` — so two
+        // Jobs queued back to back with different captured values must reach
+        // the transcriber with exactly those values, in order.
+        let root = tempdir().unwrap();
+        let source_a = wav_fixture(root.path(), "a.wav");
+        let source_b = wav_fixture(root.path(), "b.wav");
+        let transcriber = FakeTranscriber::new(vec![
+            Behavior::Success("a".to_string()),
+            Behavior::Success("b".to_string()),
+        ]);
+        let handle = registry_for_test(root.path(), transcriber.clone());
+
+        let params_a = StartParams {
+            language: TranscribeLanguage::Auto,
+            chunk_minutes: 5,
+            ..start_params(source_a, "hash-cfg-a")
+        };
+        let params_b = StartParams {
+            language: TranscribeLanguage::Vi,
+            chunk_minutes: 2,
+            ..start_params(source_b, "hash-cfg-b")
+        };
+
+        handle.start(params_a).await.unwrap();
+        handle.start(params_b).await.unwrap();
+        wait_until_empty(&handle, Duration::from_secs(5)).await;
+
+        assert_eq!(
+            transcriber.languages_seen(),
+            vec![TranscribeLanguage::Auto, TranscribeLanguage::Vi],
+            "Job đầu giữ cấu hình captured lúc start của chính nó, không bị Job sau ghi đè"
+        );
     }
 
     // ---------------------------------------------------------------------
@@ -1934,6 +2118,8 @@ mod tests {
                 discard_old: false,
                 proxy_path,
                 model: "gemini-flash-lite-latest".to_string(),
+                language: TranscribeLanguage::Auto,
+                chunk_minutes: 5,
                 consent: ConsentSnapshot::new(1, false),
             })
             .await
@@ -2028,6 +2214,8 @@ mod tests {
                 discard_old: false,
                 proxy_path,
                 model: "gemini-flash-lite-latest".to_string(),
+                language: TranscribeLanguage::Auto,
+                chunk_minutes: 5,
                 consent: ConsentSnapshot::new(1, false),
             })
             .await
@@ -2120,6 +2308,8 @@ mod tests {
                 discard_old: false,
                 proxy_path,
                 model: "gemini-flash-lite-latest".to_string(),
+                language: TranscribeLanguage::Auto,
+                chunk_minutes: 5,
                 consent: ConsentSnapshot::new(1, false),
             })
             .await
@@ -2186,6 +2376,8 @@ mod tests {
                 discard_old: false,
                 proxy_path,
                 model: "gemini-flash-lite-latest".to_string(),
+                language: TranscribeLanguage::Auto,
+                chunk_minutes: 5,
                 consent: ConsentSnapshot::new(1, false),
             })
             .await
@@ -2239,6 +2431,8 @@ mod tests {
             discard_old: false,
             proxy_path,
             model: "gemini-flash-lite-latest".to_string(),
+            language: TranscribeLanguage::Auto,
+            chunk_minutes: 5,
             consent: ConsentSnapshot::new(1, false),
         };
         let first = handle.start_rerun(params.clone()).await.unwrap();
@@ -2262,6 +2456,61 @@ mod tests {
 
         handle.cancel(job_id).await.unwrap();
         wait_until_empty(&handle, Duration::from_secs(2)).await;
+    }
+
+    #[tokio::test]
+    async fn rerun_captures_its_own_language_independent_of_the_original_transcribe() {
+        // Acceptance table "Ngôn ngữ `ja`": "Transcribe file / Chạy lại ->
+        // Prompt thêm câu chỉ định tiếng Nhật; `transcripts.language = 'ja'`."
+        let root = tempdir().unwrap();
+        let db = Arc::new(Db::open(root.path()).unwrap());
+        let session_id = SessionId::new();
+        let old_transcript_id = TranscriptId::new();
+        let proxy_path = seed_partial_session(
+            root.path(),
+            &db,
+            session_id,
+            old_transcript_id,
+            2.0,
+            &[
+                rerun_text_draft(0.0, 1.0, "hello"),
+                rerun_gap_draft(1.0, 2.0),
+            ],
+        );
+        let ranges = resolved_missing_ranges(&db, old_transcript_id, 2_000);
+
+        let transcriber = FakeTranscriber::new(vec![Behavior::Success("vá".to_string())]);
+        let (handle, actor) = channel(db.clone(), root.path().to_path_buf(), transcriber.clone());
+        tokio::spawn(actor.run());
+
+        let outcome = handle
+            .start_rerun(RerunParams {
+                session_id,
+                transcript_id: old_transcript_id,
+                ranges,
+                discard_old: false,
+                proxy_path,
+                model: "gemini-flash-lite-latest".to_string(),
+                language: TranscribeLanguage::Ja,
+                chunk_minutes: 5,
+                consent: ConsentSnapshot::new(1, false),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(outcome, RerunOutcome::Started { .. }));
+        wait_until_empty(&handle, Duration::from_secs(5)).await;
+
+        assert_eq!(transcriber.languages_seen(), vec![TranscribeLanguage::Ja]);
+
+        let new_transcript_id = db
+            .with_connection(|conn| Ok(repo::transcripts::primary_for_session(conn, session_id)?))
+            .unwrap()
+            .unwrap();
+        let new_transcript = db
+            .with_connection(|conn| Ok(repo::transcripts::get(conn, new_transcript_id)?))
+            .unwrap()
+            .unwrap();
+        assert_eq!(new_transcript.language.as_deref(), Some("ja"));
     }
 
     #[tokio::test]
@@ -2314,6 +2563,8 @@ mod tests {
                 discard_old: false,
                 proxy_path,
                 model: "gemini-flash-lite-latest".to_string(),
+                language: TranscribeLanguage::Auto,
+                chunk_minutes: 5,
                 consent: ConsentSnapshot::new(1, false),
             })
             .await

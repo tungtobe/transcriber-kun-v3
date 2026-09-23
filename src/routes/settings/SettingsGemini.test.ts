@@ -10,7 +10,9 @@ const mocks = vi.hoisted(() => ({
     transcribeModel: 'gemini-flash-lite-latest',
     liveModel: 'gemini-3.5-live-translate-preview',
     memoModel: 'gemini-flash-lite-latest',
+    transcribeLanguage: 'auto' as 'auto' | 'ja' | 'vi' | 'en',
     setModel: vi.fn(),
+    setTranscribeLanguage: vi.fn(),
   },
   keysList: vi.fn(),
   keysSet: vi.fn(),
@@ -56,7 +58,9 @@ beforeEach(() => {
   mocks.settingsStore.transcribeModel = 'gemini-flash-lite-latest';
   mocks.settingsStore.liveModel = 'gemini-3.5-live-translate-preview';
   mocks.settingsStore.memoModel = 'gemini-flash-lite-latest';
+  mocks.settingsStore.transcribeLanguage = 'auto';
   mocks.settingsStore.setModel.mockReset();
+  mocks.settingsStore.setTranscribeLanguage.mockReset();
   mocks.keysList.mockReset().mockResolvedValue({ status: 'ok', data: [] });
   mocks.keysSet.mockReset();
   mocks.keysTest.mockReset();
@@ -225,5 +229,30 @@ describe('SettingsGemini model fields', () => {
     await screen.findByText('Lỗi kết nối');
     expect(input.value).toBe('configured-memo-model');
     expect(mocks.settingsStore.setModel).not.toHaveBeenCalled();
+  });
+});
+
+describe('SettingsGemini transcribe language field', () => {
+  it('renders the four language options with the current value selected', () => {
+    mocks.settingsStore.transcribeLanguage = 'ja';
+    render(SettingsGemini);
+
+    const select = screen.getByLabelText('Ngôn ngữ transcribe') as HTMLSelectElement;
+    expect(select.value).toBe('ja');
+    expect(Array.from(select.options).map((option) => option.value)).toEqual([
+      'auto',
+      'ja',
+      'vi',
+      'en',
+    ]);
+  });
+
+  it('calls setTranscribeLanguage on change', async () => {
+    render(SettingsGemini);
+
+    const select = screen.getByLabelText('Ngôn ngữ transcribe') as HTMLSelectElement;
+    await fireEvent.change(select, { target: { value: 'vi' } });
+
+    expect(mocks.settingsStore.setTranscribeLanguage).toHaveBeenCalledWith('vi');
   });
 });

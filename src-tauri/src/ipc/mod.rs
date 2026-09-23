@@ -563,6 +563,8 @@ async fn transcribe_start_inner(
     let secrets = state.secrets.clone();
     let jobs = state.jobs.clone();
     let model = settings.transcribe_model.clone();
+    let language = settings.transcribe_language;
+    let chunk_minutes = settings.chunk_minutes;
 
     decide_transcribe_start(
         consent.is_current(),
@@ -584,6 +586,8 @@ async fn transcribe_start_inner(
                 source_hash: hash,
                 source_name,
                 model,
+                language,
+                chunk_minutes,
                 consent,
             })
             .await
@@ -700,6 +704,8 @@ async fn transcribe_rerun_inner(
     let consent =
         ConsentSnapshot::new(settings.consent_accepted_version, settings.consent_declined);
     let model = settings.transcribe_model.clone();
+    let language = settings.transcribe_language;
+    let chunk_minutes = settings.chunk_minutes;
     let secrets = state.secrets.clone();
     let jobs = state.jobs.clone();
 
@@ -764,6 +770,8 @@ async fn transcribe_rerun_inner(
                 discard_old: matches!(scope, RerunScope::All),
                 proxy_path,
                 model,
+                language,
+                chunk_minutes,
                 consent,
             })
             .await

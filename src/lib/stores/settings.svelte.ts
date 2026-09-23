@@ -10,6 +10,7 @@ import {
   type ModelKind,
   type Settings,
   type Theme,
+  type TranscribeLanguage,
   type UiLanguage,
 } from '../bindings';
 
@@ -29,6 +30,12 @@ const THEME_CACHE_KEY = 'trans-kun.theme';
 const DEFAULT_TRANSCRIBE_MODEL = 'gemini-flash-lite-latest';
 const DEFAULT_LIVE_MODEL = 'gemini-3.5-live-translate-preview';
 const DEFAULT_MEMO_MODEL = 'gemini-flash-lite-latest';
+// Mirrors `settings::DEFAULT_CHUNK_MINUTES`/`TranscribeLanguage::default()`
+// (Rust) as an offline-first fallback, same reasoning as the model defaults
+// above.
+const DEFAULT_CHUNK_MINUTES = 5;
+const DEFAULT_TIMESTAMP_OFFSET_SEC = 0;
+const DEFAULT_TRANSCRIBE_LANGUAGE: TranscribeLanguage = 'auto';
 const DEFAULT_SETTINGS: Settings = {
   theme: 'system',
   uiLanguage: 'system',
@@ -38,10 +45,27 @@ const DEFAULT_SETTINGS: Settings = {
   transcribeModel: DEFAULT_TRANSCRIBE_MODEL,
   liveModel: DEFAULT_LIVE_MODEL,
   memoModel: DEFAULT_MEMO_MODEL,
+  chunkMinutes: DEFAULT_CHUNK_MINUTES,
+  timestampOffsetSec: DEFAULT_TIMESTAMP_OFFSET_SEC,
+  transcribeLanguage: DEFAULT_TRANSCRIBE_LANGUAGE,
 };
 
 function isTheme(value: unknown): value is Theme {
   return value === 'system' || value === 'light' || value === 'dark';
+}
+
+function isTranscribeLanguage(value: unknown): value is TranscribeLanguage {
+  return value === 'auto' || value === 'ja' || value === 'vi' || value === 'en';
+}
+
+/** A non-negative integer, e.g. a hand-edited/legacy row's `0.5` or `-1`. */
+function isNonNegativeInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0;
+}
+
+/** Same, plus the `>= 1` floor `chunkMinutes` itself requires. */
+function isPositiveInteger(value: unknown): value is number {
+  return isNonNegativeInteger(value) && value >= 1;
 }
 
 function systemTheme(): ResolvedTheme {
@@ -97,6 +121,15 @@ function normalizeSettings(value: Partial<Settings> | null | undefined): Setting
       : DEFAULT_TRANSCRIBE_MODEL,
     liveModel: isNonEmptyModelName(value?.liveModel) ? value.liveModel : DEFAULT_LIVE_MODEL,
     memoModel: isNonEmptyModelName(value?.memoModel) ? value.memoModel : DEFAULT_MEMO_MODEL,
+    chunkMinutes: isPositiveInteger(value?.chunkMinutes)
+      ? value.chunkMinutes
+      : DEFAULT_CHUNK_MINUTES,
+    timestampOffsetSec: isNonNegativeInteger(value?.timestampOffsetSec)
+      ? value.timestampOffsetSec
+      : DEFAULT_TIMESTAMP_OFFSET_SEC,
+    transcribeLanguage: isTranscribeLanguage(value?.transcribeLanguage)
+      ? value.transcribeLanguage
+      : DEFAULT_TRANSCRIBE_LANGUAGE,
   };
 }
 
@@ -130,6 +163,9 @@ export function createSettingsStore() {
   let transcribeModel = $state(DEFAULT_TRANSCRIBE_MODEL);
   let liveModel = $state(DEFAULT_LIVE_MODEL);
   let memoModel = $state(DEFAULT_MEMO_MODEL);
+  let chunkMinutes = $state(DEFAULT_CHUNK_MINUTES);
+  let timestampOffsetSec = $state(DEFAULT_TIMESTAMP_OFFSET_SEC);
+  let transcribeLanguage = $state<TranscribeLanguage>(DEFAULT_TRANSCRIBE_LANGUAGE);
   let consentPolicy = $state<ConsentPolicy | null>(null);
   let status = $state<SettingsStatus>('idle');
   let error = $state<AppError | null>(null);
@@ -162,6 +198,9 @@ export function createSettingsStore() {
       transcribeModel,
       liveModel,
       memoModel,
+      chunkMinutes,
+      timestampOffsetSec,
+      transcribeLanguage,
     } as Settings;
     // Keep compatibility with pre-consent test doubles/older WebViews while
     // the real Rust snapshot always includes these fields after load.
@@ -181,6 +220,9 @@ export function createSettingsStore() {
     transcribeModel = next.transcribeModel;
     liveModel = next.liveModel;
     memoModel = next.memoModel;
+    chunkMinutes = next.chunkMinutes;
+    timestampOffsetSec = next.timestampOffsetSec;
+    transcribeLanguage = next.transcribeLanguage;
     cacheTheme(theme);
     resolvedTheme = applyTheme(theme);
     i18n.applyPreference(uiLanguage);
@@ -246,6 +288,9 @@ export function createSettingsStore() {
       transcribeModel: DEFAULT_TRANSCRIBE_MODEL,
       liveModel: DEFAULT_LIVE_MODEL,
       memoModel: DEFAULT_MEMO_MODEL,
+      chunkMinutes: DEFAULT_CHUNK_MINUTES,
+      timestampOffsetSec: DEFAULT_TIMESTAMP_OFFSET_SEC,
+      transcribeLanguage: DEFAULT_TRANSCRIBE_LANGUAGE,
     };
     persistedSettings = cached;
     applySettings(cached);
@@ -400,6 +445,44 @@ export function createSettingsStore() {
     return persist(withModel(snapshot(), kind, trimmed));
   }
 
+  /**
+   * Persist `chunkMinutes`, following the same optimistic/persist/rollback
+   * shape as `setTheme`. Invalid input (not a positive integer) is blocked
+   * here too, in defense in depth alongside the primary inline block in
+   * Settings → Chunking (spec Always: "UI chặn tại chỗ giá trị không hợp lệ
+   * ... và không lưu").
+   */
+  async function setChunkMinutes(next: number): Promise<void> {
+    if (!isPositiveInteger(next)) return;
+    const waiting = ensureReady();
+    applySettings({ ...snapshot(), chunkMinutes: next });
+    error = null;
+    status = 'ready';
+    if (waiting) await waiting;
+    return persist({ ...snapshot(), chunkMinutes: next });
+  }
+
+  /** Same shape as `setChunkMinutes`, for `timestampOffsetSec` (>= 0). */
+  async function setTimestampOffsetSec(next: number): Promise<void> {
+    if (!isNonNegativeInteger(next)) return;
+    const waiting = ensureReady();
+    applySettings({ ...snapshot(), timestampOffsetSec: next });
+    error = null;
+    status = 'ready';
+    if (waiting) await waiting;
+    return persist({ ...snapshot(), timestampOffsetSec: next });
+  }
+
+  async function setTranscribeLanguage(next: TranscribeLanguage): Promise<void> {
+    if (!isTranscribeLanguage(next)) return;
+    const waiting = ensureReady();
+    applySettings({ ...snapshot(), transcribeLanguage: next });
+    error = null;
+    status = 'ready';
+    if (waiting) await waiting;
+    return persist({ ...snapshot(), transcribeLanguage: next });
+  }
+
   async function setOnboardingCompleted(next: boolean): Promise<void> {
     const waiting = ensureReady();
     applySettings({ ...snapshot(), onboardingCompleted: next });
@@ -448,6 +531,9 @@ export function createSettingsStore() {
     get transcribeModel() { return transcribeModel; },
     get liveModel() { return liveModel; },
     get memoModel() { return memoModel; },
+    get chunkMinutes() { return chunkMinutes; },
+    get timestampOffsetSec() { return timestampOffsetSec; },
+    get transcribeLanguage() { return transcribeLanguage; },
     get consentPolicy() { return consentPolicy; },
     get consentStatus(): ConsentStatus { return consentPolicy?.status ?? 'pending'; },
     get status() { return status; },
@@ -460,6 +546,9 @@ export function createSettingsStore() {
     setTheme,
     setUiLanguage,
     setModel,
+    setChunkMinutes,
+    setTimestampOffsetSec,
+    setTranscribeLanguage,
     setOnboardingCompleted,
     acceptConsent,
     declineConsent,

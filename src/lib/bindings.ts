@@ -334,6 +334,25 @@ export type Settings = {
 	liveModel: string,
 	/**  Free-text model name used by Memo. */
 	memoModel: string,
+	/**
+	 *  Độ dài Chunk khi transcribe file (phút), số nguyên >= 1 (spec
+	 *  Boundaries Always). Job chụp giá trị này lúc nhận Job
+	 *  (`transcribe_start`/`transcribe_rerun`) -- đổi Settings giữa chừng
+	 *  không ảnh hưởng Job đang chạy/chờ.
+	 */
+	chunkMinutes: number,
+	/**
+	 *  Offset cộng vào timestamp hiển thị/export (giây), số nguyên >= 0 --
+	 *  không có offset âm (spec quyết định). Thuần hiển thị: không bao giờ
+	 *  ghi vào Segment/DB (spec Always) -- chỉ đọc qua `src/lib/time.ts` ở
+	 *  frontend.
+	 */
+	timestampOffsetSec: number,
+	/**
+	 *  Ngôn ngữ transcribe file/Live (không phải ngôn ngữ UI). Job chụp cùng
+	 *  lúc với `chunk_minutes`/`model`.
+	 */
+	transcribeLanguage: TranscribeLanguage,
 };
 
 /**
@@ -344,6 +363,14 @@ export type SettingsChanged = Settings;
 
 /**  `theme: 'system' | 'light' | 'dark'`, mặc định `system` (spec Decisions). */
 export type Theme = "system" | "light" | "dark";
+
+/**
+ *  Ngôn ngữ transcribe (story 2.6, không phải ngôn ngữ UI): `Auto` giữ
+ *  nguyên hành vi tự phát hiện hiện có (prompt/request JSON byte-for-byte
+ *  không đổi — spec Always); `Ja|Vi|En` thêm một câu chỉ định ngôn ngữ chính
+ *  vào prompt (spec `transcribe::adapter::build_general_request`).
+ */
+export type TranscribeLanguage = "auto" | "ja" | "vi" | "en";
 
 /**
  *  Kết quả `transcribe_rerun` (spec I/O Matrix "Chạy lại `missing`/`gap(id)`/

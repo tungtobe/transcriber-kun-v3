@@ -14,8 +14,21 @@ function settings(
   transcribeModel = 'gemini-flash-lite-latest',
   liveModel = 'gemini-3.5-live-translate-preview',
   memoModel = 'gemini-flash-lite-latest',
+  chunkMinutes = 5,
+  timestampOffsetSec = 0,
+  transcribeLanguage: 'auto' | 'ja' | 'vi' | 'en' = 'auto',
 ) {
-  return { theme, uiLanguage, onboardingCompleted, transcribeModel, liveModel, memoModel };
+  return {
+    theme,
+    uiLanguage,
+    onboardingCompleted,
+    transcribeModel,
+    liveModel,
+    memoModel,
+    chunkMinutes,
+    timestampOffsetSec,
+    transcribeLanguage,
+  };
 }
 
 vi.mock('../../lib/bindings', () => ({
@@ -478,5 +491,115 @@ describe('settingsStore.setModel', () => {
     expect(store.transcribeModel).toBe('gemini-flash-lite-latest');
     expect(store.liveModel).toBe('gemini-3.5-live-translate-preview');
     expect(store.memoModel).toBe('gemini-flash-lite-latest');
+  });
+});
+
+describe('settingsStore chunking/offset/language setters', () => {
+  beforeEach(() => {
+    vi.resetModules();
+    mocks.settingsGet.mockReset();
+    mocks.settingsSave.mockReset();
+    mocks.listen.mockReset().mockResolvedValue(() => undefined);
+    localStorage.clear();
+    document.documentElement.removeAttribute('data-theme');
+    document.documentElement.removeAttribute('data-theme-preference');
+    installMatchMedia(false);
+  });
+
+  it('optimistically persists a valid chunkMinutes and never calls settingsSave for an invalid one', async () => {
+    mocks.settingsGet.mockResolvedValue({ status: 'ok', data: settings() });
+    mocks.settingsSave.mockResolvedValue({ status: 'ok', data: null });
+    const { createSettingsStore } = await import('./settings.svelte');
+    const store = createSettingsStore();
+    await store.load();
+
+    await store.setChunkMinutes(3);
+    expect(store.chunkMinutes).toBe(3);
+    expect(mocks.settingsSave).toHaveBeenCalledWith(settings('system', 'system', false, undefined, undefined, undefined, 3));
+
+    mocks.settingsSave.mockClear();
+    for (const invalid of [0, -2, 1.5, Number.NaN]) {
+      await store.setChunkMinutes(invalid);
+    }
+    expect(mocks.settingsSave).not.toHaveBeenCalled();
+    expect(store.chunkMinutes).toBe(3);
+  });
+
+  it('optimistically persists a valid timestampOffsetSec and never calls settingsSave for an invalid one', async () => {
+    mocks.settingsGet.mockResolvedValue({ status: 'ok', data: settings() });
+    mocks.settingsSave.mockResolvedValue({ status: 'ok', data: null });
+    const { createSettingsStore } = await import('./settings.svelte');
+    const store = createSettingsStore();
+    await store.load();
+
+    await store.setTimestampOffsetSec(3_600);
+    expect(store.timestampOffsetSec).toBe(3_600);
+    expect(mocks.settingsSave).toHaveBeenCalledWith(
+      settings('system', 'system', false, undefined, undefined, undefined, undefined, 3_600),
+    );
+
+    mocks.settingsSave.mockClear();
+    for (const invalid of [-1, 2.5, Number.NaN]) {
+      await store.setTimestampOffsetSec(invalid);
+    }
+    expect(mocks.settingsSave).not.toHaveBeenCalled();
+    expect(store.timestampOffsetSec).toBe(3_600);
+  });
+
+  it('persists transcribeLanguage and rejects an unknown value', async () => {
+    mocks.settingsGet.mockResolvedValue({ status: 'ok', data: settings() });
+    mocks.settingsSave.mockResolvedValue({ status: 'ok', data: null });
+    const { createSettingsStore } = await import('./settings.svelte');
+    const store = createSettingsStore();
+    await store.load();
+
+    await store.setTranscribeLanguage('ja');
+    expect(store.transcribeLanguage).toBe('ja');
+    expect(mocks.settingsSave).toHaveBeenLastCalledWith(
+      settings('system', 'system', false, undefined, undefined, undefined, undefined, undefined, 'ja'),
+    );
+
+    mocks.settingsSave.mockClear();
+    // @ts-expect-error deliberately invalid at the runtime boundary
+    await store.setTranscribeLanguage('ko');
+    expect(mocks.settingsSave).not.toHaveBeenCalled();
+    expect(store.transcribeLanguage).toBe('ja');
+  });
+
+  it('rolls back chunkMinutes to the last persisted value on a typed save failure', async () => {
+    mocks.settingsGet.mockResolvedValue({
+      status: 'ok',
+      data: settings('system', 'system', false, undefined, undefined, undefined, 5),
+    });
+    mocks.settingsSave.mockResolvedValue({
+      status: 'error',
+      error: { category: 'format', code: 'format', detailRedacted: 'rejected' },
+    });
+    const { createSettingsStore } = await import('./settings.svelte');
+    const store = createSettingsStore();
+    await store.load();
+
+    const pending = store.setChunkMinutes(2);
+    expect(store.chunkMinutes).toBe(2);
+    await pending;
+
+    expect(store.chunkMinutes).toBe(5);
+    expect(store.status).toBe('error');
+    expect(store.error?.category).toBe('format');
+  });
+
+  it('falls back missing chunking/offset/language fields to defaults on load', async () => {
+    mocks.settingsGet.mockResolvedValue({
+      status: 'ok',
+      data: { theme: 'system', uiLanguage: 'system', onboardingCompleted: false },
+    });
+    const { createSettingsStore } = await import('./settings.svelte');
+    const store = createSettingsStore();
+
+    await store.load();
+
+    expect(store.chunkMinutes).toBe(5);
+    expect(store.timestampOffsetSec).toBe(0);
+    expect(store.transcribeLanguage).toBe('auto');
   });
 });

@@ -12,7 +12,7 @@
   import { settingsStore } from '../../lib/stores/settings.svelte';
   import { errorHint, errorTitle, modelErrorBanner } from '../../lib/errors';
   import { AlertCircleIcon, CircleCheckIcon, EyeIcon, EyeOffIcon } from '../../components/icons';
-  import type { KeyId, ModelKind } from '../../lib/bindings';
+  import type { KeyId, ModelKind, TranscribeLanguage } from '../../lib/bindings';
 
   onMount(() => {
     void keysStore.load();
@@ -108,6 +108,11 @@
     }
     inlineErrors = { ...inlineErrors, [kind]: false };
     void settingsStore.setModel(kind, trimmed);
+  }
+
+  function changeTranscribeLanguage(event: Event): void {
+    const value = (event.currentTarget as HTMLSelectElement).value as TranscribeLanguage;
+    void settingsStore.setTranscribeLanguage(value);
   }
 </script>
 
@@ -257,6 +262,24 @@
       {/if}
     </SettingsRow>
   {/each}
+
+  <SettingsRow
+    label={i18n.t('settings.gemini.languageLabel')}
+    help={i18n.t('settings.gemini.languageHelp')}
+    helperText={i18n.t('settings.gemini.languageHelper')}
+    fieldId="settings-gemini-transcribe-language"
+  >
+    <select
+      id="settings-gemini-transcribe-language"
+      value={settingsStore.transcribeLanguage}
+      onchange={changeTranscribeLanguage}
+    >
+      <option value="auto">{i18n.t('settings.gemini.languageAuto')}</option>
+      <option value="ja">{i18n.t('settings.gemini.languageJa')}</option>
+      <option value="vi">{i18n.t('settings.gemini.languageVi')}</option>
+      <option value="en">{i18n.t('settings.gemini.languageEn')}</option>
+    </select>
+  </SettingsRow>
 </div>
 
 <style>
@@ -269,6 +292,17 @@
     display: flex;
     align-items: stretch;
     gap: var(--space-2);
+  }
+
+  .settings-fields select {
+    min-height: 36px;
+    max-width: 280px;
+    padding: 0 var(--space-3);
+    border: 1px solid var(--color-border-strong);
+    border-radius: var(--radius-md);
+    background: var(--color-surface);
+    color: var(--color-text);
+    cursor: pointer;
   }
 
   .key-input-row input,
