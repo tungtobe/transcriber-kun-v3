@@ -14,6 +14,12 @@ pub const CURRENT_VERSION: u32 = 1;
 /// hosting is finalized (OQ6).
 pub const PRIVACY_URL: &str = "https://transkun.app/privacy";
 
+/// Support contact URL shown in Settings → Giới thiệu (story 1.10). Same
+/// domain/scope as [`PRIVACY_URL`] — already covered by the existing
+/// `opener:allow-open-url` capability wildcard (`https://transkun.app/*`),
+/// so no capability change is needed to open it (spec Boundaries).
+pub const SUPPORT_URL: &str = "https://transkun.app/support";
+
 /// The state used by both routing and the Gemini transport gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "lowercase")]
@@ -32,6 +38,12 @@ pub enum ConsentStatus {
 pub struct ConsentPolicy {
     pub current_version: u32,
     pub privacy_url: String,
+    /// Support contact URL for Settings → Giới thiệu (spec Always). Carried
+    /// here (rather than a separate command) so it is already loaded
+    /// whenever `settingsStore` fetches the consent policy — including when
+    /// Consent was declined, when About must still show it (spec Always:
+    /// "Hoạt động cả khi Consent bị từ chối").
+    pub support_url: String,
     pub accepted_version: u32,
     pub declined: bool,
     pub status: ConsentStatus,
@@ -65,6 +77,7 @@ pub fn policy(accepted_version: u32, declined: bool) -> ConsentPolicy {
     ConsentPolicy {
         current_version: CURRENT_VERSION,
         privacy_url: PRIVACY_URL.to_string(),
+        support_url: SUPPORT_URL.to_string(),
         accepted_version,
         declined,
         status: status_for(CURRENT_VERSION, accepted_version, declined),
@@ -101,6 +114,8 @@ mod tests {
         assert_eq!(value.current_version, CURRENT_VERSION);
         assert_eq!(value.privacy_url, PRIVACY_URL);
         assert!(value.privacy_url.starts_with("https://"));
+        assert_eq!(value.support_url, SUPPORT_URL);
+        assert!(value.support_url.starts_with("https://"));
         assert_eq!(value.status, ConsentStatus::Pending);
     }
 

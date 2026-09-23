@@ -59,6 +59,13 @@ pub fn boot<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
 
     if let Err(err) = &db {
         tracing::error!(error = %err, "DB không mở được, app vẫn khởi động");
+    } else if let Ok(db) = &db {
+        // Chỉ một chỗ duy nhất gọi `note_boot` mỗi lần khởi động (spec
+        // Always "Crash"): DB lỗi ở đây không được phép chặn boot, chỉ log
+        // cảnh báo (spec I/O Matrix "Crash": "DB lỗi → boot vẫn tiếp tục").
+        if let Err(err) = crate::diagnostics::note_boot(db) {
+            tracing::warn!(error = %err, "không ghi được marker crash lúc boot");
+        }
     }
 
     let secrets = Arc::new(SecretService::new(NativeCredentialStore));

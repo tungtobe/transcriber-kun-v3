@@ -5,6 +5,8 @@
   import { settingsStore } from '../lib/stores/settings.svelte';
   import SettingsGeneral from './settings/SettingsGeneral.svelte';
   import SettingsGemini from './settings/SettingsGemini.svelte';
+  import SettingsDiagnostics from './settings/SettingsDiagnostics.svelte';
+  import SettingsAbout from './settings/SettingsAbout.svelte';
 
   type RouteParams = { group?: string };
   let { routeParams = {} }: { routeParams?: RouteParams } = $props();
@@ -51,6 +53,10 @@
         <SettingsGeneral />
       {:else if group === 'gemini'}
         <SettingsGemini />
+      {:else if group === 'diagnostics'}
+        <SettingsDiagnostics />
+      {:else if group === 'about'}
+        <SettingsAbout />
       {:else}
         <p>{i18n.t('settings.placeholder.description')}</p>
         <div class="settings-row">

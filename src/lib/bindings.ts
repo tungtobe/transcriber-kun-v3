@@ -54,6 +54,23 @@ export const commands = {
 	 *  deliberately cannot fall back to another key after a 401/403 or quota.
 	 */
 	keysTest: (id: KeyId) => typedError<KeyTestResult, AppError>(__TAURI_INVOKE("keys_test", { id })),
+	/**
+	 *  Đọc bộ đếm cục bộ (phiên, lỗi theo category, crash) cho Settings → Chẩn
+	 *  đoán — xem [`diagnostics::summary`] cho logic thật.
+	 */
+	diagnosticsSummary: () => typedError<DiagnosticsSummary, AppError>(__TAURI_INVOKE("diagnostics_summary")),
+	/**
+	 *  Xoá nhật ký allow-list: file cũ bị xoá, file hôm nay bị truncate (spec
+	 *  Boundaries "Xoá nhật ký") — xem [`diagnostics::clear_logs`].
+	 */
+	diagnosticsClearLogs: () => typedError<null, AppError>(__TAURI_INVOKE("diagnostics_clear_logs")),
+	/**
+	 *  Xuất gói chẩn đoán: build bundle (log allow-list + bộ đếm) rồi mở dialog
+	 *  lưu hệ thống trong `spawn_blocking` — bản thân dialog chạy trên main
+	 *  thread qua [`save_diagnostics_bundle`], `spawn_blocking` ở đây chỉ giữ
+	 *  việc chờ kết quả tránh chặn runtime async.
+	 */
+	diagnosticsExport: () => typedError<boolean, AppError>(__TAURI_INVOKE("diagnostics_export")),
 };
 
 /** Events */
@@ -90,6 +107,14 @@ export type Code = "quota" | "auth" | "model" | "request" | "shape" | "timeout" 
 export type ConsentPolicy = {
 	currentVersion: number,
 	privacyUrl: string,
+	/**
+	 *  Support contact URL for Settings → Giới thiệu (spec Always). Carried
+	 *  here (rather than a separate command) so it is already loaded
+	 *  whenever `settingsStore` fetches the consent policy — including when
+	 *  Consent was declined, when About must still show it (spec Always:
+	 *  "Hoạt động cả khi Consent bị từ chối").
+	 */
+	supportUrl: string,
 	acceptedVersion: number,
 	declined: boolean,
 	status: ConsentStatus,
@@ -97,6 +122,21 @@ export type ConsentPolicy = {
 
 /**  The state used by both routing and the Gemini transport gate. */
 export type ConsentStatus = "pending" | "declined" | "stale" | "current";
+
+/**
+ *  Snapshot chỉ-số hiển thị ở Settings → Chẩn đoán. Không có trường nào mang
+ *  nội dung — chỉ số nguyên (spec Boundaries: "Riêng tư của bộ đếm").
+ */
+export type DiagnosticsSummary = {
+	sessions: number,
+	crashes: number,
+	errorsByCategory: ErrorCategoryCount[],
+};
+
+export type ErrorCategoryCount = {
+	category: Category,
+	count: number,
+};
 
 /**
  *  An opaque identifier for one stored API key. The secret is never part of

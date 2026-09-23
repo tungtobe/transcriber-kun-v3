@@ -5,7 +5,7 @@
   import { keysStore, type ApiKeyCheckOutcome } from '../lib/stores/keys.svelte';
   import { errorHint, errorTitle } from '../lib/errors';
   import DisabledHint from '../components/DisabledHint.svelte';
-  import { openUrl } from '@tauri-apps/plugin-opener';
+  import ConsentText from '../components/ConsentText.svelte';
   import {
     AlertCircleIcon,
     CircleCheckIcon,
@@ -119,10 +119,8 @@
     }
   }
 
-  async function openPrivacyPolicy(): Promise<void> {
-    const url = settingsStore.consentPolicy?.privacyUrl;
-    if (!url) return;
-    try { await openUrl(url); } catch { consentError = true; }
+  function onConsentPrivacyError(): void {
+    consentError = true;
   }
 </script>
 
@@ -176,20 +174,11 @@
       </button>
     </div>
     {:else if stage === 'consent'}
-      <div class="flow" aria-label={i18n.t('onboarding.consent.title')}>
-        <div class="flow-node">{i18n.t('onboarding.consent.flowLocal')}</div>
-        <div class="flow-arrow" aria-hidden="true">→</div>
-        <div class="flow-node">{i18n.t('onboarding.consent.flowKey')}</div>
-        <div class="flow-arrow" aria-hidden="true">→</div>
-        <div class="flow-node">{i18n.t('onboarding.consent.flowGoogle')}</div>
-      </div>
-      <ul class="consent-points">
-        <li>{i18n.t('onboarding.consent.bulletLocal')}</li>
-        <li>{i18n.t('onboarding.consent.bulletKey')}</li>
-        <li>{i18n.t('onboarding.consent.bulletGoogle')}</li>
-      </ul>
-      <button class="privacy-link" type="button" onclick={() => void openPrivacyPolicy()}>{i18n.t('onboarding.consent.privacy')}</button>
-      <p class="consent-version">{i18n.t('onboarding.consent.version', { version: settingsStore.consentPolicy?.currentVersion ?? 1 })}</p>
+      <ConsentText
+        version={settingsStore.consentPolicy?.currentVersion ?? 1}
+        privacyUrl={settingsStore.consentPolicy?.privacyUrl}
+        onPrivacyError={onConsentPrivacyError}
+      />
       {#if consentError}<p class="consent-error" role="alert">{i18n.t('onboarding.consent.error')}</p>{/if}
       <div class="actions consent-actions">
         <button class="ghost" type="button" disabled={saving} onclick={() => void declineConsent()}>{i18n.t('onboarding.consent.decline')}</button>
@@ -443,12 +432,6 @@
     font-weight: 500;
   }
 
-  .flow { display: grid; grid-template-columns: 1fr auto 1fr auto 1fr; gap: var(--space-2); align-items: center; margin: var(--space-6) 0; }
-  .flow-node { min-height: 56px; display: grid; place-items: center; padding: var(--space-3); border: 1px solid var(--color-accent-border); border-radius: var(--radius-lg); background: var(--color-accent-soft); text-align: center; font-size: var(--text-help-size); }
-  .flow-arrow { color: var(--color-text-muted); font-size: 20px; }
-  .consent-points { display: grid; gap: var(--space-3); padding-left: var(--space-5); color: var(--color-text-secondary); }
-  .privacy-link { padding: 0; border: 0; background: transparent; color: var(--color-accent); text-decoration: underline; cursor: pointer; }
-  .consent-version { margin: var(--space-4) 0 0; color: var(--color-text-muted); font-size: var(--text-help-size); }
   .consent-error { color: var(--color-danger, #b42318); font-size: var(--text-help-size); }
   .consent-actions { justify-content: space-between; }
   .consent-actions .ghost,

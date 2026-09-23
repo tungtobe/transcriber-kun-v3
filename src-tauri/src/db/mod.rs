@@ -74,7 +74,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn open_creates_db_file_with_wal_and_user_version_one() {
+    fn open_creates_db_file_with_wal_and_latest_user_version() {
         let dir = tempdir().unwrap();
         let db = Db::open(dir.path()).expect("phải mở được DB trên thư mục ghi được");
 
@@ -91,7 +91,7 @@ mod tests {
             let version: i64 = conn
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 1);
+            assert_eq!(version, 2);
             Ok(())
         })
         .unwrap();

@@ -12,6 +12,14 @@ const mocks = vi.hoisted(() => ({
     uiLanguage: 'system' as 'system' | 'vi' | 'en' | 'ja',
     theme: 'system' as 'system' | 'light' | 'dark',
     consentStatus: 'current' as 'pending' | 'declined' | 'stale' | 'current',
+    consentPolicy: {
+      currentVersion: 1,
+      privacyUrl: 'https://transkun.app/privacy',
+      supportUrl: 'https://transkun.app/support',
+      acceptedVersion: 1,
+      declined: false,
+      status: 'current' as const,
+    },
     setUiLanguage: vi.fn(),
     setTheme: vi.fn(),
   },
@@ -31,10 +39,21 @@ const mocks = vi.hoisted(() => ({
     deleteKey: vi.fn(),
     loadModelList: vi.fn(),
   },
+  diagnosticsSummary: vi.fn(),
 }));
 
 vi.mock('../lib/stores/settings.svelte', () => ({ settingsStore: mocks.settingsStore }));
 vi.mock('../lib/stores/keys.svelte', () => ({ keysStore: mocks.keysStore }));
+vi.mock('../lib/bindings', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../lib/bindings')>();
+  return {
+    ...actual,
+    commands: {
+      ...actual.commands,
+      diagnosticsSummary: (...args: unknown[]) => mocks.diagnosticsSummary(...args),
+    },
+  };
+});
 
 afterEach(() => cleanup());
 
@@ -43,6 +62,23 @@ beforeEach(() => {
   mocks.settingsStore.consentStatus = 'current';
   mocks.settingsStore.uiLanguage = 'system';
   mocks.settingsStore.theme = 'system';
+  mocks.diagnosticsSummary.mockReset().mockResolvedValue({
+    status: 'ok',
+    data: {
+      sessions: 3,
+      crashes: 1,
+      errorsByCategory: [
+        { category: 'quota', count: 0 },
+        { category: 'auth', count: 2 },
+        { category: 'model', count: 0 },
+        { category: 'network', count: 0 },
+        { category: 'format', count: 0 },
+        { category: 'permission', count: 0 },
+        { category: 'storage', count: 0 },
+        { category: 'blocked', count: 0 },
+      ],
+    },
+  });
 });
 
 describe('Settings group routing', () => {
@@ -60,16 +96,25 @@ describe('Settings group routing', () => {
     expect(mocks.keysStore.load).toHaveBeenCalled();
   });
 
-  it('keeps the diagnostics placeholder unchanged (no regression)', () => {
+  it('renders real SettingsDiagnostics counters for the diagnostics group', async () => {
     render(Settings, { props: { routeParams: { group: 'diagnostics' } } });
 
-    expect(screen.getByText('/settings/diagnostics')).toBeTruthy();
+    expect(screen.getByText('Số phiên')).toBeTruthy();
+    expect(screen.getByText('Số lần thoát không sạch')).toBeTruthy();
+    expect(await screen.findByText('3')).toBeTruthy();
+    expect(screen.getByText('1')).toBeTruthy();
+    expect(screen.getByText('Key không hợp lệ')).toBeTruthy();
+    expect(screen.getByText('2')).toBeTruthy();
+    expect(screen.queryByRole('checkbox')).toBeNull();
   });
 
-  it('keeps the about placeholder unchanged (no regression)', () => {
+  it('renders real SettingsAbout content for the about group', () => {
     render(Settings, { props: { routeParams: { group: 'about' } } });
 
-    expect(screen.getByText('/settings/about')).toBeTruthy();
+    expect(screen.getByText('Relipa')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Liên hệ hỗ trợ' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Đọc Chính sách quyền riêng tư' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Xem lại văn bản đồng ý' })).toBeTruthy();
   });
 
   it('shows only the About group when Consent has been declined', () => {

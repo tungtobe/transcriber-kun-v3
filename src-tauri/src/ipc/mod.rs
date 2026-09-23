@@ -10,11 +10,13 @@ mod spike_channel;
 
 use std::sync::Arc;
 
+use tauri::Manager;
 use tauri_specta::{collect_commands, collect_events, Builder, Event};
 
 use crate::consent::{self, ConsentPolicy};
 use crate::core::error::{AppError, Code};
 use crate::db::Db;
+use crate::diagnostics::{self, DiagnosticsSummary};
 use crate::gemini::{CancellationToken, ConsentSnapshot, KeyTestResult, ModelInfo, ModelKind};
 use crate::secrets::{KeyId, KeyMetadata};
 use crate::settings::{self, Settings, SettingsChanged};
@@ -82,14 +84,50 @@ fn decline_consent_snapshot(mut settings: Settings) -> Settings {
     settings
 }
 
+/// Logic đếm lỗi thuần (không async, không `tauri::State`) — tách riêng để
+/// test trực tiếp bằng một `Db` tạm, không cần dựng runtime async (spec
+/// Always: "Lỗi: tăng theo category khi một IPC command trả `Err`, qua một
+/// helper duy nhất ở `ipc/`"). Lỗi ghi đếm chỉ log cảnh báo, không bao giờ
+/// thay thế hay làm mất lỗi gốc của command (spec I/O Matrix "Lỗi IPC").
+fn note_command_result<T>(db: &Db, result: &Result<T, AppError>) {
+    if let Err(err) = result {
+        if let Err(record_err) = diagnostics::record_error(db, err.category) {
+            tracing::warn!(error = %record_err, "không ghi được bộ đếm lỗi IPC");
+        }
+    }
+}
+
+/// Helper duy nhất bọc quanh kết quả của mọi command trả `Result` (Code Map
+/// `ipc/mod.rs`): khi `result` là `Err`, tăng bộ đếm lỗi theo category của nó
+/// rồi trả lại đúng `result` ban đầu không đổi. `db` là `Err` (DB không mở
+/// được lúc boot) thì bỏ qua việc đếm — không có nơi nào để ghi.
+async fn track_ipc_error<T: Send + 'static>(
+    db: &Result<Arc<Db>, AppError>,
+    result: Result<T, AppError>,
+) -> Result<T, AppError> {
+    if result.is_err() {
+        if let Ok(db) = db.clone() {
+            return tauri::async_runtime::spawn_blocking(move || {
+                note_command_result(&db, &result);
+                result
+            })
+            .await
+            .unwrap_or_else(|join_err| Err(AppError::new(Code::Storage, join_err.to_string())));
+        }
+    }
+    result
+}
+
 /// Đọc toàn bộ settings hiện tại — xem [`get_settings`] cho logic thật.
 #[tauri::command]
 #[specta::specta]
 async fn settings_get(state: tauri::State<'_, AppState>) -> Result<Settings, AppError> {
     let db = state.db.clone();
-    tauri::async_runtime::spawn_blocking(move || get_settings(&db))
+    let result = tauri::async_runtime::spawn_blocking(move || get_settings(&db))
         .await
-        .map_err(|err| AppError::new(Code::Storage, err.to_string()))?
+        .map_err(|err| AppError::new(Code::Storage, err.to_string()))
+        .and_then(|inner| inner);
+    track_ipc_error(&state.db, result).await
 }
 
 /// Return the Rust-owned consent policy and the durable decision in one
@@ -99,9 +137,11 @@ async fn settings_get(state: tauri::State<'_, AppState>) -> Result<Settings, App
 #[specta::specta]
 async fn consent_policy(state: tauri::State<'_, AppState>) -> Result<ConsentPolicy, AppError> {
     let db = state.db.clone();
-    tauri::async_runtime::spawn_blocking(move || get_consent_policy(&db))
+    let result = tauri::async_runtime::spawn_blocking(move || get_consent_policy(&db))
         .await
-        .map_err(|err| AppError::new(Code::Storage, err.to_string()))?
+        .map_err(|err| AppError::new(Code::Storage, err.to_string()))
+        .and_then(|inner| inner);
+    track_ipc_error(&state.db, result).await
 }
 
 /// Ghi toàn bộ settings và phát `settingsChanged` — xem
@@ -116,7 +156,7 @@ async fn settings_save(
     settings: Settings,
 ) -> Result<(), AppError> {
     let db = state.db.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    let result = tauri::async_runtime::spawn_blocking(move || {
         save_settings_and_notify(&db, settings, |saved| {
             if let Err(err) = SettingsChanged(saved.clone()).emit(&app) {
                 tracing::warn!(error = %err, "phát event settingsChanged thất bại");
@@ -124,7 +164,9 @@ async fn settings_save(
         })
     })
     .await
-    .map_err(|err| AppError::new(Code::Storage, err.to_string()))?
+    .map_err(|err| AppError::new(Code::Storage, err.to_string()))
+    .and_then(|inner| inner);
+    track_ipc_error(&state.db, result).await
 }
 
 /// Persist acceptance at the current Rust-owned version and emit the full
@@ -137,7 +179,7 @@ async fn consent_accept(
     settings: Settings,
 ) -> Result<Settings, AppError> {
     let db = state.db.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    let result = tauri::async_runtime::spawn_blocking(move || {
         let next = accept_consent_snapshot(settings);
         save_settings_and_notify(&db, next.clone(), |saved| {
             if let Err(err) = SettingsChanged(saved.clone()).emit(&app) {
@@ -147,7 +189,9 @@ async fn consent_accept(
         Ok(next)
     })
     .await
-    .map_err(|err| AppError::new(Code::Storage, err.to_string()))?
+    .map_err(|err| AppError::new(Code::Storage, err.to_string()))
+    .and_then(|inner| inner);
+    track_ipc_error(&state.db, result).await
 }
 
 /// Persist a deliberate decline independently from the accepted-version
@@ -160,7 +204,7 @@ async fn consent_decline(
     settings: Settings,
 ) -> Result<Settings, AppError> {
     let db = state.db.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    let result = tauri::async_runtime::spawn_blocking(move || {
         let next = decline_consent_snapshot(settings);
         save_settings_and_notify(&db, next.clone(), |saved| {
             if let Err(err) = SettingsChanged(saved.clone()).emit(&app) {
@@ -170,7 +214,9 @@ async fn consent_decline(
         Ok(next)
     })
     .await
-    .map_err(|err| AppError::new(Code::Storage, err.to_string()))?
+    .map_err(|err| AppError::new(Code::Storage, err.to_string()))
+    .and_then(|inner| inner);
+    track_ipc_error(&state.db, result).await
 }
 
 /// Return only opaque IDs and masked labels; key material never crosses IPC.
@@ -178,9 +224,11 @@ async fn consent_decline(
 #[specta::specta]
 async fn keys_list(state: tauri::State<'_, AppState>) -> Result<Vec<KeyMetadata>, AppError> {
     let secrets = state.secrets.clone();
-    tauri::async_runtime::spawn_blocking(move || secrets.list())
+    let result = tauri::async_runtime::spawn_blocking(move || secrets.list())
         .await
-        .map_err(|err| AppError::new(Code::Storage, err.to_string()))?
+        .map_err(|err| AppError::new(Code::Storage, err.to_string()))
+        .and_then(|inner| inner);
+    track_ipc_error(&state.db, result).await
 }
 
 /// Replace the complete native-store key list, then refresh the actor before
@@ -192,11 +240,18 @@ async fn keys_set(
     keys: String,
 ) -> Result<Vec<KeyMetadata>, AppError> {
     let secrets = state.secrets.clone();
-    let metadata = tauri::async_runtime::spawn_blocking(move || secrets.set(&keys))
+    let set_result = tauri::async_runtime::spawn_blocking(move || secrets.set(&keys))
         .await
-        .map_err(|err| AppError::new(Code::Storage, err.to_string()))??;
-    state.key_pool.refresh().await?;
-    Ok(metadata)
+        .map_err(|err| AppError::new(Code::Storage, err.to_string()))
+        .and_then(|inner| inner);
+    let result = match set_result {
+        Ok(metadata) => match state.key_pool.refresh().await {
+            Ok(()) => Ok(metadata),
+            Err(err) => Err(err),
+        },
+        Err(err) => Err(err),
+    };
+    track_ipc_error(&state.db, result).await
 }
 
 /// Delete one native credential entry by opaque ID and invalidate old leases.
@@ -207,11 +262,18 @@ async fn keys_delete(
     id: KeyId,
 ) -> Result<Vec<KeyMetadata>, AppError> {
     let secrets = state.secrets.clone();
-    let metadata = tauri::async_runtime::spawn_blocking(move || secrets.delete(&id))
+    let delete_result = tauri::async_runtime::spawn_blocking(move || secrets.delete(&id))
         .await
-        .map_err(|err| AppError::new(Code::Storage, err.to_string()))??;
-    state.key_pool.refresh().await?;
-    Ok(metadata)
+        .map_err(|err| AppError::new(Code::Storage, err.to_string()))
+        .and_then(|inner| inner);
+    let result = match delete_result {
+        Ok(metadata) => match state.key_pool.refresh().await {
+            Ok(()) => Ok(metadata),
+            Err(err) => Err(err),
+        },
+        Err(err) => Err(err),
+    };
+    track_ipc_error(&state.db, result).await
 }
 
 /// List models through the one Gemini gateway. Consent is read server-side
@@ -223,13 +285,18 @@ async fn models_list(
     kind: ModelKind,
 ) -> Result<Vec<ModelInfo>, AppError> {
     let db = state.db.clone();
-    let consent = tauri::async_runtime::spawn_blocking(move || get_gemini_consent(&db))
+    let consent_result = tauri::async_runtime::spawn_blocking(move || get_gemini_consent(&db))
         .await
-        .map_err(|err| AppError::new(Code::Storage, err.to_string()))??;
-    let gateway = state.gateway.clone()?;
-    gateway
-        .models_list(kind, consent, CancellationToken::new())
-        .await
+        .map_err(|err| AppError::new(Code::Storage, err.to_string()))
+        .and_then(|inner| inner);
+    let result = match consent_result {
+        Ok(consent) => match state.gateway.clone() {
+            Ok(gateway) => gateway.models_list(kind, consent, CancellationToken::new()).await,
+            Err(err) => Err(err),
+        },
+        Err(err) => Err(err),
+    };
+    track_ipc_error(&state.db, result).await
 }
 
 /// Validate one opaque key ID through a target-key lease. The actor path
@@ -241,13 +308,136 @@ async fn keys_test(
     id: KeyId,
 ) -> Result<KeyTestResult, AppError> {
     let db = state.db.clone();
-    let consent = tauri::async_runtime::spawn_blocking(move || get_gemini_consent(&db))
+    let consent_result = tauri::async_runtime::spawn_blocking(move || get_gemini_consent(&db))
         .await
-        .map_err(|err| AppError::new(Code::Storage, err.to_string()))??;
-    let gateway = state.gateway.clone()?;
-    gateway
-        .keys_test(id, consent, CancellationToken::new())
-        .await
+        .map_err(|err| AppError::new(Code::Storage, err.to_string()))
+        .and_then(|inner| inner);
+    let result = match consent_result {
+        Ok(consent) => match state.gateway.clone() {
+            Ok(gateway) => gateway.keys_test(id, consent, CancellationToken::new()).await,
+            Err(err) => Err(err),
+        },
+        Err(err) => Err(err),
+    };
+    track_ipc_error(&state.db, result).await
+}
+
+/// Đọc bộ đếm cục bộ (phiên, lỗi theo category, crash) cho Settings → Chẩn
+/// đoán — xem [`diagnostics::summary`] cho logic thật.
+#[tauri::command]
+#[specta::specta]
+async fn diagnostics_summary(
+    state: tauri::State<'_, AppState>,
+) -> Result<DiagnosticsSummary, AppError> {
+    let db = state.db.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let db = db?;
+        diagnostics::summary(&db)
+    })
+    .await
+    .map_err(|err| AppError::new(Code::Storage, err.to_string()))
+    .and_then(|inner| inner);
+    track_ipc_error(&state.db, result).await
+}
+
+/// Xoá nhật ký allow-list: file cũ bị xoá, file hôm nay bị truncate (spec
+/// Boundaries "Xoá nhật ký") — xem [`diagnostics::clear_logs`].
+#[tauri::command]
+#[specta::specta]
+async fn diagnostics_clear_logs(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), AppError> {
+    let log_dir = app
+        .path()
+        .app_log_dir()
+        .map_err(|err| AppError::new(Code::Storage, err.to_string()));
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let log_dir = log_dir?;
+        diagnostics::clear_logs(&log_dir).map_err(AppError::from)
+    })
+    .await
+    .map_err(|err| AppError::new(Code::Storage, err.to_string()))
+    .and_then(|inner| inner);
+    track_ipc_error(&state.db, result).await
+}
+
+/// Mở dialog lưu file hệ thống bằng `rfd` (chỉ phía Rust — spec Boundaries:
+/// "Frontend không nhận hay gửi đường dẫn") rồi ghi gói chẩn đoán đã build.
+/// Huỷ dialog trả `Ok(false)`, không phải lỗi (spec Always).
+///
+/// macOS bắt buộc dialog file gốc hệ điều hành phải mở trên main thread —
+/// gọi thẳng `rfd::FileDialog` từ một worker thread (`spawn_blocking`) không
+/// an toàn. Hàm này lên lịch phần gọi dialog thật qua
+/// [`tauri::AppHandle::run_on_main_thread`] rồi chặn (blocking `recv`) chờ
+/// kết quả về qua một kênh `std::sync::mpsc` — bản thân việc chờ này vẫn
+/// chạy trong `spawn_blocking` ở [`diagnostics_export`] nên không chặn
+/// runtime async, chỉ dialog thật mới chạy đúng trên main thread.
+fn save_diagnostics_bundle(app: &tauri::AppHandle, bundle: &str) -> Result<bool, AppError> {
+    let file_name = diagnostics::default_export_file_name(std::time::SystemTime::now());
+    let (tx, rx) = std::sync::mpsc::channel::<Option<std::path::PathBuf>>();
+
+    app.run_on_main_thread(move || {
+        let picked = rfd::FileDialog::new()
+            .set_file_name(&file_name)
+            .add_filter("Text", &["txt"])
+            .save_file();
+        // Người nhận (`rx.recv()` dưới đây) có thể đã bỏ cuộc nếu closure
+        // này panic trước khi gửi được — `send` lỗi khi đó chỉ nghĩa là
+        // không còn ai chờ, không phải lỗi cần xử lý ở đây.
+        let _ = tx.send(picked);
+    })
+    .map_err(|err| AppError::new(Code::Storage, err.to_string()))?;
+
+    let picked = rx
+        .recv()
+        .map_err(|err| AppError::new(Code::Storage, err.to_string()))?;
+
+    let Some(path) = picked else {
+        return Ok(false);
+    };
+    std::fs::write(&path, bundle.as_bytes())?;
+    Ok(true)
+}
+
+/// Xuất gói chẩn đoán: build bundle (log allow-list + bộ đếm) rồi mở dialog
+/// lưu hệ thống trong `spawn_blocking` — bản thân dialog chạy trên main
+/// thread qua [`save_diagnostics_bundle`], `spawn_blocking` ở đây chỉ giữ
+/// việc chờ kết quả tránh chặn runtime async.
+#[tauri::command]
+#[specta::specta]
+async fn diagnostics_export(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<bool, AppError> {
+    let db = state.db.clone();
+    let log_dir = app
+        .path()
+        .app_log_dir()
+        .map_err(|err| AppError::new(Code::Storage, err.to_string()));
+    let bundle_result = tauri::async_runtime::spawn_blocking(move || {
+        let log_dir = log_dir?;
+        let db = db?;
+        let summary = diagnostics::summary(&db)?;
+        Ok(diagnostics::build_bundle(&log_dir, &summary))
+    })
+    .await
+    .map_err(|err| AppError::new(Code::Storage, err.to_string()))
+    .and_then(|inner| inner);
+
+    let result = match bundle_result {
+        Ok(bundle) => {
+            let app_for_dialog = app.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                save_diagnostics_bundle(&app_for_dialog, &bundle)
+            })
+            .await
+            .map_err(|err| AppError::new(Code::Storage, err.to_string()))
+            .and_then(|inner| inner)
+        }
+        Err(err) => Err(err),
+    };
+    track_ipc_error(&state.db, result).await
 }
 
 /// Danh sách command/event production — nguồn duy nhất, dùng chung cho
@@ -267,7 +457,10 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             keys_set,
             keys_delete,
             models_list,
-            keys_test
+            keys_test,
+            diagnostics_summary,
+            diagnostics_clear_logs,
+            diagnostics_export
         ])
         .events(collect_events![SettingsChanged])
 }
@@ -377,5 +570,42 @@ mod tests {
 
         assert_eq!(err.category, Category::Storage);
         assert_eq!(calls, 0, "không được gọi callback khi ghi lỗi");
+    }
+
+    // I/O Matrix "Lỗi IPC": command trả Err(auth) -> bộ đếm auth +1; ghi đếm
+    // lỗi không làm đổi lỗi gốc. Test trực tiếp `note_command_result` (logic
+    // thuần dùng bởi `track_ipc_error`) với một `Db` tạm, không cần runtime
+    // async/tauri::State.
+
+    #[test]
+    fn note_command_result_increments_the_erroring_category_and_keeps_the_error_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path()).unwrap();
+        let original: Result<u8, AppError> = Err(AppError::new(Code::Auth, "key rejected"));
+
+        note_command_result(&db, &original);
+
+        let summary = crate::diagnostics::summary(&db).unwrap();
+        let auth_count = summary
+            .errors_by_category
+            .iter()
+            .find(|row| row.category == Category::Auth)
+            .unwrap()
+            .count;
+        assert_eq!(auth_count, 1);
+        // `original` vẫn còn nguyên vẹn sau khi đếm — không bị đổi/tiêu thụ.
+        assert_eq!(original.unwrap_err().category, Category::Auth);
+    }
+
+    #[test]
+    fn note_command_result_does_nothing_on_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path()).unwrap();
+        let ok: Result<u8, AppError> = Ok(1);
+
+        note_command_result(&db, &ok);
+
+        let summary = crate::diagnostics::summary(&db).unwrap();
+        assert!(summary.errors_by_category.iter().all(|row| row.count == 0));
     }
 }

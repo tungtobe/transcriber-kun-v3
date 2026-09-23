@@ -14,7 +14,10 @@ use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
 use tracing_appender::rolling::{Builder as RollingBuilder, Rotation};
 
 const MAX_LOG_FILES: usize = 7;
-const LOG_FILE_PREFIX: &str = "trans-kun";
+/// Prefix chung cho tên file log — `diagnostics::` dùng lại hằng này để xây
+/// allow-list xuất/xoá log (spec Boundaries: "tên khớp `trans-kun` + hậu tố
+/// rotation của `core::log`"), không định nghĩa lại một chuỗi thứ hai.
+pub const LOG_FILE_PREFIX: &str = "trans-kun";
 
 /// Các pattern bí mật cần thay bằng `[redacted]`, áp theo thứ tự. URL/khoá là
 /// một khối duy nhất bị thay nguyên vẹn; header `authorization` giữ lại tên

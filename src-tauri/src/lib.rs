@@ -7,6 +7,7 @@ pub mod audio;
 pub mod consent;
 pub mod core;
 pub mod db;
+pub mod diagnostics;
 pub mod gemini;
 pub mod ipc;
 pub mod library;
@@ -33,6 +34,20 @@ pub fn run() {
             app.manage(state);
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            // Marker "thoát sạch" (spec Always: "Crash"): chỉ đặt `true` khi
+            // tiến trình thực sự đang thoát — `note_boot` (chạy lúc khởi
+            // động lần sau) coi mọi trường hợp khác (kill -9, mất điện,
+            // panic không unwind) là thoát không sạch và tăng bộ đếm crash.
+            if let tauri::RunEvent::Exit = event {
+                let state = app_handle.state::<ipc::boot::AppState>();
+                if let Ok(db) = &state.db {
+                    if let Err(err) = crate::diagnostics::mark_clean_shutdown(db) {
+                        tracing::warn!(error = %err, "không ghi được marker thoát sạch");
+                    }
+                }
+            }
+        });
 }

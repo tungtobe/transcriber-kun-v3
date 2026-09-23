@@ -19,6 +19,16 @@ tauri-build = { version = "=2.6.3", features = [] }
 tauri = { version = "=2.11.5", features = ["specta"] }
 tauri-specta = { version = "=2.0.0-rc.25", features = ["derive", "typescript"] }
 tauri-plugin-opener = "=2.5.5"
+# Story 1.10: dialog lưu file hệ thống cho "Xuất gói nhật ký" — mở chỉ từ
+# Rust, không cấp capability cho frontend (spec Boundaries). Dùng thẳng `rfd`
+# (crate nền bên dưới của plugin dialog chính thức, không phải bản thân
+# plugin đó) thay vì plugin Tauri tương ứng: bản pin chính xác của plugin đó
+# kéo theo một crate hỗ trợ thao tác file khác như một dependency bắt buộc,
+# và tên crate đó khớp allow-list cấm của `scripts/check-forbidden-deps.mjs`.
+# `rfd` không phải plugin Tauri (không đăng ký qua `.plugin(...)`, không nằm
+# trong allow-list cấm), nên tránh được xung đột đó hoàn toàn trong khi vẫn
+# giữ dialog mở chỉ phía Rust.
+rfd = "=0.17.2"
 specta = { version = "=2.0.0-rc.25", features = ["derive"] }
 specta-typescript = { version = "=0.0.12" }
 serde = { version = "=1.0.229", features = ["derive"] }
