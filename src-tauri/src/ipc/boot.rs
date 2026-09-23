@@ -66,6 +66,15 @@ pub fn boot<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
         if let Err(err) = crate::diagnostics::note_boot(db) {
             tracing::warn!(error = %err, "không ghi được marker crash lúc boot");
         }
+
+        // Story 2.3 AD-18: dọn mọi thứ một crash giữa publish và commit có
+        // thể để lại (`library::store::reconcile`) — non-fatal, root là
+        // `app_data_dir` giống `Db::open` ở trên (cùng gốc chứa `media/`).
+        if let Ok(data_dir) = app.path().app_data_dir() {
+            if let Err(err) = crate::library::store::reconcile(db, &data_dir) {
+                tracing::warn!(error = %err, "không reconcile được thư viện lúc boot");
+            }
+        }
     }
 
     let secrets = Arc::new(SecretService::new(NativeCredentialStore));
