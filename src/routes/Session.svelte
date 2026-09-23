@@ -2,8 +2,13 @@
   import { onDestroy } from 'svelte';
   import { link } from '@keenmate/svelte-spa-router';
   import { i18n } from '../i18n/index.svelte';
-  import { commands, type SessionLookup } from '../lib/bindings';
+  import { commands, type RerunScope, type SessionDetail, type SessionLookup } from '../lib/bindings';
   import { jobsStore } from '../lib/stores/jobs.svelte';
+  import SessionHeader from './session/SessionHeader.svelte';
+  import PartialBanner from './session/PartialBanner.svelte';
+  import SegmentList from './session/SegmentList.svelte';
+  import Player from './session/Player.svelte';
+  import JobProgress from './session/JobProgress.svelte';
 
   type RouteParams = { id?: string };
   let { routeParams = {} }: { routeParams?: RouteParams } = $props();
@@ -11,15 +16,7 @@
   type ViewState =
     | { kind: 'loading' }
     | { kind: 'job'; jobId: string; sessionId: string }
-    | {
-        kind: 'saved';
-        sessionId: string;
-        title: string;
-        durationSec: number | null;
-        sessionStatus: string;
-        partial: boolean;
-        transcriptId: string | null;
-      }
+    | { kind: 'saved'; sessionId: string; detail: SessionDetail }
     | { kind: 'notFound' }
     | { kind: 'error' };
 
@@ -28,20 +25,42 @@
   let cancelling = $state(false);
   let rerunStarting = $state(false);
   let rerunError = $state<string | null>(null);
+  let relinking = $state(false);
+  let relinkMessage = $state<string | null>(null);
+
+  // Trình phát: state sống ở đây (không phải trong `Player.svelte`) vì
+  // `SegmentList` (highlight/click-to-seek/Space toggle) cần đọc/điều khiển
+  // nó — `playerRef` gọi thẳng các hàm `Player` export qua `bind:this`.
+  let playerRef = $state<{ seek: (sec: number) => void; toggle: () => void } | null>(null);
+  let currentTime = $state(0);
+  let duration = $state(0);
+  let playing = $state(false);
+
+  async function loadDetail(sessionId: string): Promise<void> {
+    try {
+      const result = await commands.librarySessionDetail(sessionId);
+      if (result.status !== 'ok') {
+        view = { kind: 'error' };
+        return;
+      }
+      if (result.data === null) {
+        view = { kind: 'notFound' };
+        return;
+      }
+      view = { kind: 'saved', sessionId, detail: result.data };
+    } catch {
+      view = { kind: 'error' };
+    }
+  }
 
   function applyLookup(lookup: SessionLookup): void {
     if (lookup.kind === 'job') {
       view = { kind: 'job', jobId: lookup.jobId, sessionId: lookup.sessionId };
     } else if (lookup.kind === 'session') {
-      view = {
-        kind: 'saved',
-        sessionId: lookup.sessionId,
-        title: lookup.title,
-        durationSec: lookup.durationSec,
-        sessionStatus: lookup.status,
-        partial: lookup.partial,
-        transcriptId: lookup.transcriptId,
-      };
+      // `SessionLookup::Session` chỉ đủ để phân biệt Job/Phiên/không-còn
+      // (spec Design Notes: "detail tải sau khi biết là Phiên") — chi tiết
+      // đầy đủ (segments, proxy, transcript) tới từ `librarySessionDetail`.
+      void loadDetail(lookup.sessionId);
     } else {
       view = { kind: 'notFound' };
     }
@@ -95,11 +114,6 @@
     return Math.floor(ms / 60_000);
   }
 
-  function percent(processedMs: number, totalMs: number): number {
-    if (totalMs <= 0) return 0;
-    return Math.min(100, Math.round((processedMs / totalMs) * 100));
-  }
-
   async function handleCancel(jobId: string): Promise<void> {
     cancelling = true;
     try {
@@ -109,15 +123,16 @@
     }
   }
 
-  // Phiên partial -> nút "Chạy lại phần thiếu" (scope `missing`, spec Tasks).
-  // `Started`/`Existing` chuyển sang xem tiến độ Job như bình thường;
-  // `NothingToRerun`/lỗi hiện thông điệp đã dịch, ở lại trang saved.
-  async function handleRerunMissing(sessionId: string, transcriptId: string | null): Promise<void> {
+  // Chạy lại: dùng chung cho cả banner partial ("phần thiếu"/"toàn bộ") lẫn
+  // nút "Chạy lại khoảng này" trên một dòng gap (spec Tasks Acceptance:
+  // "bấm 'Chạy lại khoảng này' trên dòng gap idx 3 -> `transcribe_rerun`
+  // được gọi với `{ kind: 'gap', gapId: 3 }`").
+  async function handleRerun(sessionId: string, transcriptId: string | undefined, scope: RerunScope): Promise<void> {
     if (!transcriptId || rerunStarting) return;
     rerunStarting = true;
     rerunError = null;
     try {
-      const outcome = await jobsStore.rerun(sessionId, transcriptId, { kind: 'missing' });
+      const outcome = await jobsStore.rerun(sessionId, transcriptId, scope);
       if ('error' in outcome) {
         rerunError = i18n.t('session.rerun.error');
         return;
@@ -131,88 +146,131 @@
       rerunStarting = false;
     }
   }
+
+  async function handleRelinkRequest(): Promise<void> {
+    if (view.kind !== 'saved' || relinking) return;
+    const sessionId = view.sessionId;
+    relinking = true;
+    relinkMessage = null;
+    try {
+      const result = await commands.libraryProxyRelink(sessionId);
+      if (result.status !== 'ok') {
+        relinkMessage = i18n.t('session.player.relinkError');
+        return;
+      }
+      switch (result.data) {
+        case 'relinked':
+          await loadDetail(sessionId);
+          break;
+        case 'hashMismatch':
+          relinkMessage = i18n.t('session.player.relinkHashMismatch');
+          break;
+        case 'liveUnsupported':
+          relinkMessage = i18n.t('session.player.relinkLiveUnsupported');
+          break;
+        case 'cancelled':
+          // Huỷ dialog -> im lặng, không đổi gì (spec I/O Matrix "Chọn lại sai").
+          break;
+      }
+    } catch {
+      relinkMessage = i18n.t('session.player.relinkError');
+    } finally {
+      relinking = false;
+    }
+  }
 </script>
 
 <svelte:head>
   <title>{i18n.t('session.meta.title')}</title>
 </svelte:head>
 
-<section class="route-screen" aria-labelledby="session-title">
-  <p class="route-kicker">{i18n.t('session.header.kicker')}</p>
+{#if view.kind === 'saved'}
+  {@const sessionId = view.sessionId}
+  {@const detail = view.detail}
+  {@const transcript = detail.transcript}
+  {@const gapRanges = (transcript?.segments ?? [])
+    .filter((s) => s.kind === 'gap' && s.gapReason === 'chunk_failed')
+    .map((s) => ({ startSec: s.startSec ?? 0, endSec: s.endSec ?? 0 }))}
+  {@const segmentTextCount = (transcript?.segments ?? []).filter((s) => s.kind === 'text').length}
+  <section class="session-shell" aria-labelledby="session-title">
+    <SessionHeader
+      title={detail.title}
+      kind={detail.kind}
+      createdAtMs={detail.createdAt}
+      durationSec={detail.durationSec}
+      segmentTextCount={segmentTextCount}
+      recovered={detail.recovered}
+      partial={transcript?.status === 'partial'}
+    />
 
-  {#if view.kind === 'loading'}
-    <h1 id="session-title">{i18n.t('session.state.loading')}</h1>
-  {:else if view.kind === 'job'}
-    <h1 id="session-title">
-      {job?.kind === 'rerun' ? i18n.t('session.job.kindRerun') : (job?.sourceName ?? i18n.t('session.header.titleJob'))}
-    </h1>
-    {#if job}
-      <div class="job-card">
-        <p class="job-state">
-          {job.state === 'queued' ? i18n.t('session.job.stateQueued') : i18n.t('session.job.stateRunning')}
-        </p>
-        <p class="job-progress">
-          {i18n.t('session.job.progressLabel', {
-            processed: minutes(job.processedMs),
-            total: Math.max(1, minutes(job.totalMs)),
-            percent: percent(job.processedMs, job.totalMs),
-          })}
-        </p>
-        <p class="job-detail">
-          {i18n.t('session.job.chunkLabel', { index: job.chunkIndex, total: job.chunkCount })}
-        </p>
-        {#if job.keyOrdinal !== null}
-          <p class="job-detail">{i18n.t('session.job.keyLabel', { ordinal: job.keyOrdinal })}</p>
+    <div class="session-body">
+      <div class="session-main">
+        {#if transcript?.status === 'partial'}
+          <div class="session-partial-banner">
+            <PartialBanner
+              {gapRanges}
+              starting={rerunStarting}
+              errorMessage={rerunError}
+              onRerun={(scope) => handleRerun(sessionId, transcript?.id, scope)}
+            />
+          </div>
         {/if}
-        {#if job.attempt !== null}
-          <p class="job-detail">{i18n.t('session.job.attemptLabel', { attempt: job.attempt })}</p>
-        {/if}
-        {#if job.waitingQuota}
-          <p class="job-waiting" role="status">{i18n.t('session.job.waitingQuota')}</p>
-        {/if}
-        <button
-          type="button"
-          class="button button-secondary"
-          disabled={cancelling}
-          onclick={() => handleCancel(job.jobId)}
-        >
-          {cancelling ? i18n.t('session.job.cancelling') : i18n.t('session.job.cancelAction')}
-        </button>
+        <SegmentList
+          segments={transcript?.segments ?? []}
+          {currentTime}
+          {playing}
+          rerunStarting={rerunStarting}
+          onSeek={(sec) => playerRef?.seek(sec)}
+          onTogglePlay={() => playerRef?.toggle()}
+          onRerun={(scope) => handleRerun(sessionId, transcript?.id, scope)}
+        />
       </div>
-    {/if}
-  {:else if view.kind === 'saved'}
-    {@const saved = view}
-    <h1 id="session-title">{saved.title}</h1>
-    <div class="job-card">
-      <p class="job-detail">{i18n.t('session.saved.statusLabel', { status: saved.sessionStatus })}</p>
-      {#if saved.durationSec !== null}
-        <p class="job-detail">
-          {i18n.t('session.saved.durationLabel', { minutes: Math.round(saved.durationSec / 60) })}
-        </p>
-      {/if}
-      {#if saved.partial}
-        <p class="job-waiting" role="status">{i18n.t('session.saved.partialWarning')}</p>
-        <button
-          type="button"
-          class="button button-secondary"
-          disabled={rerunStarting}
-          onclick={() => handleRerunMissing(saved.sessionId, saved.transcriptId)}
-        >
-          {rerunStarting ? i18n.t('session.saved.rerunStarting') : i18n.t('session.saved.rerunMissingAction')}
-        </button>
-        {#if rerunError}
-          <p class="job-error" role="alert">{rerunError}</p>
-        {/if}
-      {/if}
+      <aside class="session-aside">
+        <h2>{i18n.t('session.aside.title')}</h2>
+        <dl>
+          <dt>{i18n.t('session.aside.source')}</dt>
+          <dd>{detail.sourceName ?? i18n.t('session.aside.unknown')}</dd>
+          <dt>{i18n.t('session.aside.model')}</dt>
+          <dd>{transcript?.model ?? i18n.t('session.aside.unknown')}</dd>
+          <dt>{i18n.t('session.aside.language')}</dt>
+          <dd>{transcript?.language ?? i18n.t('session.aside.languageAuto')}</dd>
+        </dl>
+      </aside>
     </div>
-  {:else}
-    <h1 id="session-title">{i18n.t('session.header.titleNotFound')}</h1>
-    <p class="job-detail">
-      {view.kind === 'error' ? i18n.t('session.state.errorBody') : i18n.t('session.state.notFoundBody')}
-    </p>
-    <a class="button button-secondary" href="/home" use:link>{i18n.t('session.state.backHome')}</a>
-  {/if}
-</section>
+
+    <Player
+      bind:this={playerRef}
+      bind:currentTime
+      bind:duration
+      bind:playing
+      proxyPath={detail.proxyPath}
+      onRelinkRequest={handleRelinkRequest}
+      {relinking}
+      {relinkMessage}
+    />
+  </section>
+{:else}
+  <section class="route-screen" aria-labelledby="session-title">
+    <p class="route-kicker">{i18n.t('session.header.kicker')}</p>
+
+    {#if view.kind === 'loading'}
+      <h1 id="session-title">{i18n.t('session.state.loading')}</h1>
+    {:else if view.kind === 'job'}
+      <h1 id="session-title">
+        {job?.kind === 'rerun' ? i18n.t('session.job.kindRerun') : (job?.sourceName ?? i18n.t('session.header.titleJob'))}
+      </h1>
+      {#if job}
+        <JobProgress {job} {cancelling} onCancel={handleCancel} />
+      {/if}
+    {:else}
+      <h1 id="session-title">{i18n.t('session.header.titleNotFound')}</h1>
+      <p class="job-detail">
+        {view.kind === 'error' ? i18n.t('session.state.errorBody') : i18n.t('session.state.notFoundBody')}
+      </p>
+      <a class="button button-secondary" href="/home" use:link>{i18n.t('session.state.backHome')}</a>
+    {/if}
+  </section>
+{/if}
 
 <style>
   .route-screen {
@@ -236,47 +294,10 @@
     line-height: 1.35;
   }
 
-  .job-card {
-    display: grid;
-    gap: var(--space-2);
-    padding: var(--space-6);
-    border: 1px solid var(--color-border);
-    border-radius: var(--radius-xl);
-    background: var(--color-surface);
-  }
-
-  .job-state {
-    margin: 0;
-    color: var(--color-text-secondary);
-    font-size: var(--text-label-size);
-    font-weight: 600;
-  }
-
-  .job-progress {
-    margin: 0;
-    font-family: var(--font-mono);
-    font-size: var(--text-h2-size);
-    font-variant-numeric: tabular-nums;
-  }
-
   .job-detail {
     margin: 0;
     color: var(--color-text-secondary);
     font-size: var(--text-help-size);
-  }
-
-  .job-waiting {
-    margin: 0;
-    color: var(--color-warning);
-    font-size: var(--text-help-size);
-    font-weight: 600;
-  }
-
-  .job-error {
-    margin: 0;
-    color: var(--color-danger);
-    font-size: var(--text-help-size);
-    font-weight: 600;
   }
 
   .button {
@@ -297,8 +318,67 @@
     cursor: pointer;
   }
 
-  .button:disabled {
-    cursor: not-allowed;
-    opacity: 0.6;
+  .session-shell {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    min-height: 0;
+  }
+
+  .session-body {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) var(--panel-detail-width);
+    flex: 1;
+    min-height: 0;
+  }
+
+  .session-main {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+
+  .session-partial-banner {
+    padding: var(--space-4) var(--space-4) 0;
+  }
+
+  .session-aside {
+    overflow-y: auto;
+    padding: var(--space-4);
+    border-left: 1px solid var(--color-border);
+    background: var(--color-surface);
+  }
+
+  .session-aside h2 {
+    margin: 0 0 var(--space-3);
+    font-size: var(--text-label-size);
+    color: var(--color-text-secondary);
+  }
+
+  .session-aside dl {
+    display: grid;
+    gap: var(--space-1);
+    margin: 0;
+  }
+
+  .session-aside dt {
+    color: var(--color-text-muted);
+    font-size: var(--text-help-size);
+  }
+
+  .session-aside dd {
+    margin: 0 0 var(--space-3);
+    color: var(--color-text);
+    font-size: var(--text-body-size);
+  }
+
+  @media (max-width: 1279px) {
+    .session-body {
+      grid-template-columns: 1fr;
+    }
+
+    .session-aside {
+      display: none;
+    }
   }
 </style>

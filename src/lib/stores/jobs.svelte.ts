@@ -22,8 +22,26 @@ import {
 
 export type JobsStatus = 'idle' | 'subscribed' | 'error';
 
+/** Một dòng "diễn biến" ngắn cho panel log của `JobProgress.svelte` (story
+ * 2.7, spec Tasks: "lưu log diễn biến ngắn theo `jobId`"). Chỉ giữ dữ liệu có
+ * cấu trúc — không bao giờ một chuỗi đã định dạng sẵn — để `JobProgress`
+ * dịch qua i18n lúc hiển thị, và để không thể vô tình nhét path/transcript
+ * vào một chuỗi tự do (spec Always: "log không chứa path đầy đủ hay
+ * transcript"). `snapshot`/`error` chỉ mang field đã có sẵn ở kiểu tương ứng
+ * (không có `path` hay nội dung transcript ở đó).
+ */
+export type JobLogEntry =
+  | { seq: number; kind: 'updated'; snapshot: JobSnapshot }
+  | { seq: number; kind: 'result' }
+  | { seq: number; kind: 'error'; error: AppError }
+  | { seq: number; kind: 'cancelled' };
+
+/** Giữ tối đa ~200 dòng mỗi Job (spec Tasks) — cắt bớt dòng cũ nhất trước. */
+const MAX_LOG_LINES_PER_JOB = 200;
+
 export function createJobsStore() {
   let jobs = $state<Map<string, JobSnapshot>>(new Map());
+  let logs = $state<Map<string, JobLogEntry[]>>(new Map());
   let status = $state<JobsStatus>('idle');
   let error = $state<AppError | null>(null);
   // `true` once the current subscription's first event (always a Snapshot)
@@ -35,6 +53,18 @@ export function createJobsStore() {
   let lastSeq: number | null = null;
   let generation = 0;
 
+  function appendLog(jobId: string, entry: JobLogEntry): void {
+    const nextLogs = new Map(logs);
+    const existing = nextLogs.get(jobId) ?? [];
+    const appended = [...existing, entry];
+    const trimmed =
+      appended.length > MAX_LOG_LINES_PER_JOB
+        ? appended.slice(appended.length - MAX_LOG_LINES_PER_JOB)
+        : appended;
+    nextLogs.set(jobId, trimmed);
+    logs = nextLogs;
+  }
+
   function applyEvent(event: JobEvent, forGeneration: number): void {
     // A message from a Channel created by an earlier subscribe() call that
     // has since been superseded (unsubscribe/resubscribe) — ignore it.
@@ -42,8 +72,13 @@ export function createJobsStore() {
 
     if (event.kind === 'snapshot') {
       const next = new Map<string, JobSnapshot>();
-      for (const job of event.jobs) next.set(job.jobId, job);
+      const nextLogs = new Map<string, JobLogEntry[]>();
+      for (const job of event.jobs) {
+        next.set(job.jobId, job);
+        nextLogs.set(job.jobId, [{ seq: event.seq, kind: 'updated', snapshot: job }]);
+      }
       jobs = next;
+      logs = nextLogs;
       lastSeq = event.seq;
       synced = true;
       return;
@@ -59,9 +94,17 @@ export function createJobsStore() {
       const next = new Map(jobs);
       next.set(event.job.jobId, event.job);
       jobs = next;
+      appendLog(event.job.jobId, { seq: event.seq, kind: 'updated', snapshot: event.job });
       return;
     }
     // 'result' | 'error' | 'cancelled': the Job left the registry.
+    if (event.kind === 'result') {
+      appendLog(event.jobId, { seq: event.seq, kind: 'result' });
+    } else if (event.kind === 'error') {
+      appendLog(event.jobId, { seq: event.seq, kind: 'error', error: event.error });
+    } else {
+      appendLog(event.jobId, { seq: event.seq, kind: 'cancelled' });
+    }
     const next = new Map(jobs);
     next.delete(event.jobId);
     jobs = next;
@@ -102,6 +145,7 @@ export function createJobsStore() {
   function unsubscribe(): void {
     generation += 1;
     jobs = new Map();
+    logs = new Map();
     lastSeq = null;
     synced = false;
     status = 'idle';
@@ -149,6 +193,7 @@ export function createJobsStore() {
   function reset(): void {
     generation += 1;
     jobs = new Map();
+    logs = new Map();
     status = 'idle';
     error = null;
     synced = false;
@@ -158,6 +203,11 @@ export function createJobsStore() {
   return {
     get jobs() {
       return jobs;
+    },
+    /** Log diễn biến ngắn của một Job (`JobProgress.svelte`'s panel log) —
+     * `[]` khi Job chưa có dòng nào (ví dụ trước khi snapshot đầu tiên tới). */
+    logFor(jobId: string): JobLogEntry[] {
+      return logs.get(jobId) ?? [];
     },
     get status() {
       return status;

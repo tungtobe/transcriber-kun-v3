@@ -77,6 +77,59 @@ describe('jobsStore', () => {
     expect(store.jobs.has('a')).toBe(false);
   });
 
+  it('accumulates a short structured log per jobId and drops it on unsubscribe', async () => {
+    const { createJobsStore } = await import('./jobs.svelte');
+    const store = createJobsStore();
+
+    await store.subscribe();
+    capturedChannel!.onmessage({ kind: 'snapshot', seq: 1, jobs: [job('a')] });
+    expect(store.logFor('a')).toEqual([
+      { seq: 1, kind: 'updated', snapshot: job('a') },
+    ]);
+
+    capturedChannel!.onmessage({ kind: 'updated', seq: 2, job: job('a', { processedMs: 30_000 }) });
+    expect(store.logFor('a')).toEqual([
+      { seq: 1, kind: 'updated', snapshot: job('a') },
+      { seq: 2, kind: 'updated', snapshot: job('a', { processedMs: 30_000 }) },
+    ]);
+
+    capturedChannel!.onmessage({
+      kind: 'error',
+      seq: 3,
+      jobId: 'a',
+      error: { category: 'network', code: 'network', detailRedacted: 'timed out' },
+    });
+    expect(store.logFor('a').at(-1)).toEqual({
+      seq: 3,
+      kind: 'error',
+      error: { category: 'network', code: 'network', detailRedacted: 'timed out' },
+    });
+    expect(store.jobs.has('a')).toBe(false);
+
+    store.unsubscribe();
+    expect(store.logFor('a')).toEqual([]);
+  });
+
+  it('caps the log at 200 entries per job, dropping the oldest first', async () => {
+    const { createJobsStore } = await import('./jobs.svelte');
+    const store = createJobsStore();
+
+    await store.subscribe();
+    capturedChannel!.onmessage({ kind: 'snapshot', seq: 1, jobs: [job('a')] });
+    for (let i = 0; i < 250; i += 1) {
+      capturedChannel!.onmessage({
+        kind: 'updated',
+        seq: i + 2,
+        job: job('a', { processedMs: i }),
+      });
+    }
+
+    const log = store.logFor('a');
+    expect(log.length).toBe(200);
+    expect(log[0]).toEqual({ seq: 52, kind: 'updated', snapshot: job('a', { processedMs: 50 }) });
+    expect(log.at(-1)).toEqual({ seq: 251, kind: 'updated', snapshot: job('a', { processedMs: 249 }) });
+  });
+
   it('re-subscribes automatically when seq skips (a missed event)', async () => {
     const { createJobsStore } = await import('./jobs.svelte');
     const store = createJobsStore();

@@ -10,6 +10,8 @@ const mocks = vi.hoisted(() => {
   }
   return {
     librarySessionGet: vi.fn(),
+    librarySessionDetail: vi.fn(),
+    libraryProxyRelink: vi.fn(),
     jobsSubscribe: vi.fn(),
     jobsCancel: vi.fn(),
     transcribeRerun: vi.fn(),
@@ -17,15 +19,27 @@ const mocks = vi.hoisted(() => {
   };
 });
 
-vi.mock('@tauri-apps/api/core', () => ({ Channel: mocks.FakeChannel }));
+vi.mock('@tauri-apps/api/core', () => ({
+  Channel: mocks.FakeChannel,
+  convertFileSrc: (path: string) => `asset://localhost/${path}`,
+}));
 
 vi.mock('../lib/bindings', () => ({
   commands: {
     librarySessionGet: (...args: unknown[]) => mocks.librarySessionGet(...args),
+    librarySessionDetail: (...args: unknown[]) => mocks.librarySessionDetail(...args),
+    libraryProxyRelink: (...args: unknown[]) => mocks.libraryProxyRelink(...args),
     jobsSubscribe: (...args: unknown[]) => mocks.jobsSubscribe(...args),
     jobsCancel: (...args: unknown[]) => mocks.jobsCancel(...args),
     transcribeRerun: (...args: unknown[]) => mocks.transcribeRerun(...args),
   },
+}));
+
+// `Player.svelte` reads `displayTimestamp` -> `settingsStore.timestampOffsetSec`;
+// keep it a plain fake so this suite never boots the real store (which needs
+// its own `events`/`commands.settingsGet` wiring — out of scope here).
+vi.mock('../lib/stores/settings.svelte', () => ({
+  settingsStore: { timestampOffsetSec: 0 },
 }));
 
 type CapturedChannel = { onmessage: (event: unknown) => void };
@@ -36,6 +50,8 @@ afterEach(() => cleanup());
 beforeEach(async () => {
   i18n.applyPreference('vi');
   mocks.librarySessionGet.mockReset();
+  mocks.librarySessionDetail.mockReset();
+  mocks.libraryProxyRelink.mockReset();
   mocks.jobsSubscribe.mockReset();
   mocks.jobsCancel.mockReset();
   mocks.transcribeRerun.mockReset();
@@ -44,6 +60,7 @@ beforeEach(async () => {
     capturedChannel = channel;
     return Promise.resolve({ status: 'ok', data: null });
   });
+  Element.prototype.scrollIntoView = vi.fn();
   const { jobsStore } = await import('../lib/stores/jobs.svelte');
   jobsStore.reset();
 });
@@ -66,40 +83,111 @@ function job(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function textSegment(idx: number, startSec: number, endSec: number, text: string) {
+  return { idx, startSec, endSec, kind: 'text', gapReason: null, text };
+}
+
+function gapSegment(idx: number, startSec: number, endSec: number, gapReason: string) {
+  return { idx, startSec, endSec, kind: 'gap', gapReason, text: '' };
+}
+
+function detail(overrides: Record<string, unknown> = {}) {
+  return {
+    sessionId: 's1',
+    kind: 'file',
+    title: 'cuộc họp',
+    createdAt: Date.UTC(2026, 0, 15),
+    durationSec: 120,
+    recovered: false,
+    sourceName: 'meeting.wav',
+    proxyPath: '/data/media/s1/proxy.flac',
+    transcript: {
+      id: 't1',
+      variant: 'primary',
+      status: 'complete',
+      model: 'gemini-flash-lite-latest',
+      language: null,
+      segments: [textSegment(0, 0, 10, 'xin chào'), textSegment(1, 10, 20, 'các bạn')],
+    },
+    ...overrides,
+  };
+}
+
 describe('Session route', () => {
-  it('shows the saved Phiên summary when the id matches a committed session', async () => {
+  it('shows the saved Phiên header and Segment list when the id matches a committed session', async () => {
     mocks.librarySessionGet.mockResolvedValue({
       status: 'ok',
-      data: { kind: 'session', sessionId: 's1', title: 'cuộc họp', durationSec: 120, status: 'complete' },
+      data: { kind: 'session', sessionId: 's1', title: 'cuộc họp', durationSec: 120, status: 'complete', partial: false, transcriptId: 't1' },
     });
+    mocks.librarySessionDetail.mockResolvedValue({ status: 'ok', data: detail() });
     render(Session, { routeParams: { id: 's1' } });
 
     expect(await screen.findByRole('heading', { name: 'cuộc họp' })).toBeTruthy();
+    expect(screen.getByText('xin chào')).toBeTruthy();
+    expect(screen.getByText('các bạn')).toBeTruthy();
     expect(mocks.jobsSubscribe).not.toHaveBeenCalled();
   });
 
-  it('shows a partial warning with a rerun button, and starts a rerun Job on click', async () => {
+  it('shows a partial banner listing the chunk_failed ranges, with two rerun buttons', async () => {
     mocks.librarySessionGet.mockResolvedValue({
       status: 'ok',
-      data: {
-        kind: 'session',
-        sessionId: 's1',
+      data: { kind: 'session', sessionId: 's1', title: 'cuộc họp dở', durationSec: 120, status: 'partial', partial: true, transcriptId: 't1' },
+    });
+    mocks.librarySessionDetail.mockResolvedValue({
+      status: 'ok',
+      data: detail({
         title: 'cuộc họp dở',
-        durationSec: 120,
-        status: 'partial',
-        partial: true,
-        transcriptId: 't1',
-      },
+        transcript: {
+          id: 't1',
+          variant: 'primary',
+          status: 'partial',
+          model: 'gemini-flash-lite-latest',
+          language: null,
+          segments: [
+            textSegment(0, 0, 10, 'xin chào'),
+            gapSegment(1, 10, 20, 'chunk_failed'),
+          ],
+        },
+      }),
+    });
+    render(Session, { routeParams: { id: 's1' } });
+
+    expect(await screen.findByText('Bản ghi còn thiếu một số đoạn do lỗi khi transcribe.')).toBeTruthy();
+    expect(screen.getByText('00:10–00:20')).toBeTruthy();
+    expect(screen.getByRole('button', { name: /Chạy lại phần thiếu/ })).toBeTruthy();
+    expect(screen.getByRole('button', { name: /Chạy lại toàn bộ/ })).toBeTruthy();
+  });
+
+  it('starts a gap rerun with the exact scope and switches to the Job view (acceptance criterion)', async () => {
+    mocks.librarySessionGet.mockResolvedValue({
+      status: 'ok',
+      data: { kind: 'session', sessionId: 's1', title: 'cuộc họp dở', durationSec: 120, status: 'partial', partial: true, transcriptId: 't1' },
+    });
+    mocks.librarySessionDetail.mockResolvedValue({
+      status: 'ok',
+      data: detail({
+        transcript: {
+          id: 't1',
+          variant: 'primary',
+          status: 'partial',
+          model: 'm',
+          language: null,
+          segments: [
+            textSegment(0, 0, 10, 'xin chào'),
+            textSegment(1, 10, 20, 'các bạn'),
+            textSegment(2, 20, 30, 'khoẻ không'),
+            gapSegment(3, 30, 40, 'chunk_failed'),
+          ],
+        },
+      }),
     });
     mocks.transcribeRerun.mockResolvedValue({ status: 'ok', data: { kind: 'started', jobId: 'job-rerun' } });
     render(Session, { routeParams: { id: 's1' } });
 
-    expect(await screen.findByText('Bản ghi còn thiếu một số đoạn do lỗi khi transcribe.')).toBeTruthy();
-    const button = screen.getByRole('button', { name: 'Chạy lại phần thiếu' });
+    const rerunButton = await screen.findByRole('button', { name: /Chạy lại khoảng này/ });
+    await fireEvent.click(rerunButton);
 
-    await fireEvent.click(button);
-
-    expect(mocks.transcribeRerun).toHaveBeenCalledWith('s1', 't1', { kind: 'missing' });
+    expect(mocks.transcribeRerun).toHaveBeenCalledWith('s1', 't1', { kind: 'gap', gapId: 3 });
     await waitFor(() => expect(mocks.jobsSubscribe).toHaveBeenCalledTimes(1));
     capturedChannel!.onmessage({
       kind: 'snapshot',
@@ -109,69 +197,78 @@ describe('Session route', () => {
     expect(await screen.findByRole('heading', { name: 'Đang chạy lại' })).toBeTruthy();
   });
 
-  it('shows the nothingToRerun message without leaving the saved view', async () => {
+  it('rerun missing / all buttons call transcribeRerun with the matching scope', async () => {
     mocks.librarySessionGet.mockResolvedValue({
       status: 'ok',
-      data: {
-        kind: 'session',
-        sessionId: 's1',
-        title: 'cuộc họp dở',
-        durationSec: 120,
-        status: 'partial',
-        partial: true,
-        transcriptId: 't1',
-      },
+      data: { kind: 'session', sessionId: 's1', title: 'cuộc họp dở', durationSec: 120, status: 'partial', partial: true, transcriptId: 't1' },
+    });
+    mocks.librarySessionDetail.mockResolvedValue({
+      status: 'ok',
+      data: detail({
+        transcript: {
+          id: 't1',
+          variant: 'primary',
+          status: 'partial',
+          model: 'm',
+          language: null,
+          segments: [gapSegment(0, 0, 10, 'chunk_failed')],
+        },
+      }),
     });
     mocks.transcribeRerun.mockResolvedValue({ status: 'ok', data: { kind: 'nothingToRerun' } });
     render(Session, { routeParams: { id: 's1' } });
 
-    const button = await screen.findByRole('button', { name: 'Chạy lại phần thiếu' });
-    await fireEvent.click(button);
-
+    const allButton = await screen.findByRole('button', { name: /Chạy lại toàn bộ/ });
+    await fireEvent.click(allButton);
+    expect(mocks.transcribeRerun).toHaveBeenCalledWith('s1', 't1', { kind: 'all' });
     expect(await screen.findByText('Không còn đoạn nào thiếu để chạy lại.')).toBeTruthy();
-    expect(mocks.jobsSubscribe).not.toHaveBeenCalled();
   });
 
-  it('shows a translated error when the rerun IPC call fails', async () => {
+  it('shows "no audio" and relinks the proxy on request, then reloads the detail', async () => {
     mocks.librarySessionGet.mockResolvedValue({
       status: 'ok',
-      data: {
-        kind: 'session',
-        sessionId: 's1',
-        title: 'cuộc họp dở',
-        durationSec: 120,
-        status: 'partial',
-        partial: true,
-        transcriptId: 't1',
-      },
+      data: { kind: 'session', sessionId: 's1', title: 'cuộc họp', durationSec: 120, status: 'complete', partial: false, transcriptId: 't1' },
     });
-    mocks.transcribeRerun.mockRejectedValue(new Error('bridge down'));
+    mocks.librarySessionDetail
+      .mockResolvedValueOnce({ status: 'ok', data: detail({ proxyPath: null }) })
+      .mockResolvedValueOnce({ status: 'ok', data: detail({ proxyPath: '/data/media/s1/proxy.flac' }) });
+    mocks.libraryProxyRelink.mockResolvedValue({ status: 'ok', data: 'relinked' });
     render(Session, { routeParams: { id: 's1' } });
 
-    const button = await screen.findByRole('button', { name: 'Chạy lại phần thiếu' });
-    await fireEvent.click(button);
+    expect(await screen.findByText('Không có audio · Chọn lại file nguồn')).toBeTruthy();
+    const relinkButton = screen.getByRole('button', { name: 'Chọn lại file nguồn' });
+    await fireEvent.click(relinkButton);
 
-    expect(await screen.findByText('Không chạy lại được. Thử lại sau.')).toBeTruthy();
+    expect(mocks.libraryProxyRelink).toHaveBeenCalledWith('s1');
+    await waitFor(() => expect(mocks.librarySessionDetail).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.queryByText('Không có audio · Chọn lại file nguồn')).toBeNull());
   });
 
-  it('does not show a partial warning for a complete saved Phiên', async () => {
+  it('shows a hash-mismatch message and keeps the Transcript unchanged', async () => {
     mocks.librarySessionGet.mockResolvedValue({
       status: 'ok',
-      data: {
-        kind: 'session',
-        sessionId: 's1',
-        title: 'cuộc họp',
-        durationSec: 120,
-        status: 'complete',
-        partial: false,
-        transcriptId: 't1',
-      },
+      data: { kind: 'session', sessionId: 's1', title: 'cuộc họp', durationSec: 120, status: 'complete', partial: false, transcriptId: 't1' },
     });
+    mocks.librarySessionDetail.mockResolvedValue({ status: 'ok', data: detail({ proxyPath: null }) });
+    mocks.libraryProxyRelink.mockResolvedValue({ status: 'ok', data: 'hashMismatch' });
     render(Session, { routeParams: { id: 's1' } });
 
-    await screen.findByRole('heading', { name: 'cuộc họp' });
-    expect(screen.queryByText('Bản ghi còn thiếu một số đoạn do lỗi khi transcribe.')).toBeNull();
-    expect(screen.queryByRole('button', { name: 'Chạy lại phần thiếu' })).toBeNull();
+    const relinkButton = await screen.findByRole('button', { name: 'Chọn lại file nguồn' });
+    await fireEvent.click(relinkButton);
+
+    expect(await screen.findByText('File này không khớp với bản ghi gốc.')).toBeTruthy();
+    expect(mocks.librarySessionDetail).toHaveBeenCalledTimes(1);
+  });
+
+  it('shows "not found" when the detail lookup returns null after a session lookup', async () => {
+    mocks.librarySessionGet.mockResolvedValue({
+      status: 'ok',
+      data: { kind: 'session', sessionId: 'gone', title: 'x', durationSec: 1, status: 'complete', partial: false, transcriptId: null },
+    });
+    mocks.librarySessionDetail.mockResolvedValue({ status: 'ok', data: null });
+    render(Session, { routeParams: { id: 'gone' } });
+
+    expect(await screen.findByText('Tác vụ không còn')).toBeTruthy();
   });
 
   it('shows "not found" with a link home when the id matches nothing', async () => {
@@ -203,6 +300,22 @@ describe('Session route', () => {
     expect(mocks.jobsCancel).toHaveBeenCalledWith('job-1');
   });
 
+  it('shows the job event log panel and appends a line per update', async () => {
+    mocks.librarySessionGet.mockResolvedValue({
+      status: 'ok',
+      data: { kind: 'job', jobId: 'job-1', sessionId: 'session-1' },
+    });
+    render(Session, { routeParams: { id: 'session-1' } });
+
+    await waitFor(() => expect(mocks.jobsSubscribe).toHaveBeenCalledTimes(1));
+    capturedChannel!.onmessage({ kind: 'snapshot', seq: 1, jobs: [job()] });
+    await screen.findByText('meeting.wav');
+
+    const summary = screen.getByText('Nhật ký diễn biến');
+    await fireEvent.click(summary);
+    expect(screen.getAllByText(/Đoạn 6 \/ 18/).length).toBeGreaterThan(0);
+  });
+
   it('re-resolves to the saved Phiên once the Job leaves the registry', async () => {
     mocks.librarySessionGet
       .mockResolvedValueOnce({
@@ -211,8 +324,12 @@ describe('Session route', () => {
       })
       .mockResolvedValueOnce({
         status: 'ok',
-        data: { kind: 'session', sessionId: 'session-1', title: 'cuộc họp xong', durationSec: 60, status: 'complete' },
+        data: { kind: 'session', sessionId: 'session-1', title: 'cuộc họp xong', durationSec: 60, status: 'complete', partial: false, transcriptId: 't1' },
       });
+    mocks.librarySessionDetail.mockResolvedValue({
+      status: 'ok',
+      data: detail({ sessionId: 'session-1', title: 'cuộc họp xong' }),
+    });
     render(Session, { routeParams: { id: 'session-1' } });
 
     await waitFor(() => expect(mocks.jobsSubscribe).toHaveBeenCalledTimes(1));

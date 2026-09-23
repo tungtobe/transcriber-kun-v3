@@ -16,7 +16,7 @@ pub enum SegmentKind {
 }
 
 impl SegmentKind {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             SegmentKind::Text => "text",
             SegmentKind::Gap => "gap",
@@ -40,7 +40,7 @@ pub enum GapReason {
 }
 
 impl GapReason {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             GapReason::ChunkFailed => "chunk_failed",
             GapReason::Disconnected => "disconnected",
