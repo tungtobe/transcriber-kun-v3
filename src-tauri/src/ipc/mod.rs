@@ -1478,7 +1478,7 @@ mod tests {
             .count;
         assert_eq!(auth_count, 1);
         // `original` vẫn còn nguyên vẹn sau khi đếm — không bị đổi/tiêu thụ.
-        assert_eq!(original.unwrap_err().category, Category::Auth);
+        assert!(matches!(&original, Err(error) if error.category == Category::Auth));
     }
 
     #[test]
@@ -1555,11 +1555,12 @@ mod tests {
         }
     }
 
+    type ReservationFuture = std::future::Ready<Result<Option<(JobId, SessionId)>, AppError>>;
+
     fn counting_reservation(
         count: std::sync::Arc<std::sync::atomic::AtomicU32>,
         existing: Option<(JobId, SessionId)>,
-    ) -> impl FnOnce(String) -> std::future::Ready<Result<Option<(JobId, SessionId)>, AppError>>
-    {
+    ) -> impl FnOnce(String) -> ReservationFuture {
         move |_hash: String| {
             count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             std::future::ready(Ok(existing))

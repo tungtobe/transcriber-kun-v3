@@ -883,6 +883,7 @@ fn estimate_chunk_count(total_ms: u64, chunk_minutes: u32) -> u32 {
 /// into a [`JobOutcome`] instead of propagating a `Result` up, since this
 /// function's only caller is the `tokio::spawn`ed task in
 /// `JobRegistryActor::start_pipeline_for`, which has nothing to `?` into.
+#[allow(clippy::too_many_arguments)]
 async fn run_job(
     job_id: JobId,
     session_id: SessionId,
@@ -916,6 +917,7 @@ async fn run_job(
     outcome
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_job_inner(
     job_id: JobId,
     session_id: SessionId,

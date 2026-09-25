@@ -361,6 +361,6 @@ mod tests {
     #[test]
     fn timestamps_round_to_milliseconds_and_clamp_negative_seconds() {
         assert_eq!(srt_timestamp(display_seconds(-0.4, 0.0)), "00:00:00,000");
-        assert_eq!(srt_timestamp(3_661.2346), "01:01:01,235");
+        assert_eq!(srt_timestamp(3661.2346), "01:01:01,235");
     }
 }
