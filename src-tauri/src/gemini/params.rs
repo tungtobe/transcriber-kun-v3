@@ -25,3 +25,9 @@ pub const QUOTA_COOLDOWN: Duration = Duration::from_secs(60);
 pub const JOB_MAX_WAIT: Duration = Duration::from_secs(180);
 pub const MEMO_DEADLINE: Duration = Duration::from_secs(90);
 pub const MAX_ATTEMPTS: u8 = 4;
+/// Backoff applied to a key after a `RequestOutcome::Server` (5xx / transport
+/// network) failure, before that key is eligible for the retry: `1s ×
+/// attempts so far`, capped at [`SERVER_BACKOFF_MAX`]. Reuses the same
+/// `cooldown_until` mechanism as [`QUOTA_COOLDOWN`].
+pub const SERVER_BACKOFF: Duration = Duration::from_secs(1);
+pub const SERVER_BACKOFF_MAX: Duration = Duration::from_secs(5);

@@ -14,6 +14,7 @@ const mocks = vi.hoisted(() => {
     libraryProxyRelink: vi.fn(),
     libraryTranscriptExport: vi.fn(),
     jobsSubscribe: vi.fn(),
+    jobsUnsubscribe: vi.fn().mockResolvedValue({ status: 'ok', data: null }),
     jobsCancel: vi.fn(),
     transcribeRerun: vi.fn(),
     clipboardWriteText: vi.fn(),
@@ -43,6 +44,7 @@ vi.mock('../lib/bindings', () => ({
     libraryProxyRelink: (...args: unknown[]) => mocks.libraryProxyRelink(...args),
     libraryTranscriptExport: (...args: unknown[]) => mocks.libraryTranscriptExport(...args),
     jobsSubscribe: (...args: unknown[]) => mocks.jobsSubscribe(...args),
+    jobsUnsubscribe: (...args: unknown[]) => mocks.jobsUnsubscribe(...args),
     jobsCancel: (...args: unknown[]) => mocks.jobsCancel(...args),
     transcribeRerun: (...args: unknown[]) => mocks.transcribeRerun(...args),
   },
@@ -78,6 +80,7 @@ beforeEach(async () => {
     value: { writeText: (...args: unknown[]) => mocks.clipboardWriteText(...args) },
   });
   mocks.jobsSubscribe.mockReset();
+  mocks.jobsUnsubscribe.mockReset().mockResolvedValue({ status: 'ok', data: null });
   mocks.jobsCancel.mockReset();
   mocks.transcribeRerun.mockReset();
   mocks.intakeStore.notices = [];

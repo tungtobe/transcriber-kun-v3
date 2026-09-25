@@ -95,6 +95,11 @@ pub(crate) mod fault {
 
     thread_local! {
         static INJECT: Cell<Option<Point>> = const { Cell::new(None) };
+        // Separate from `INJECT`/`Point` because `relink_proxy`'s DB write
+        // needs a *count* (fail the first N calls, e.g. "fails once, retry
+        // recovers" vs. "fails twice, retry also fails") rather than an
+        // on/off toggle.
+        static SET_PROXY_EXT_FAILURES: Cell<u32> = const { Cell::new(0) };
     }
 
     pub fn set(point: Option<Point>) {
@@ -103,6 +108,24 @@ pub(crate) mod fault {
 
     pub fn should_fail(point: Point) -> bool {
         INJECT.with(|cell| cell.get() == Some(point))
+    }
+
+    pub fn set_proxy_ext_failures(count: u32) {
+        SET_PROXY_EXT_FAILURES.with(|cell| cell.set(count));
+    }
+
+    /// Consumes one remaining failure, if any -- `true` means the caller
+    /// should fail this attempt.
+    pub fn consume_set_proxy_ext_failure() -> bool {
+        SET_PROXY_EXT_FAILURES.with(|cell| {
+            let remaining = cell.get();
+            if remaining > 0 {
+                cell.set(remaining - 1);
+                true
+            } else {
+                false
+            }
+        })
     }
 }
 
@@ -161,6 +184,37 @@ fn publish_proxy(
     Ok(ext)
 }
 
+/// Best-effort cleanup for a `media/<sid>/` directory left behind by a
+/// failed [`publish_proxy`] (it creates the directory up front, before the
+/// write/fsync/rename that can fail). Only removes it when empty, so a
+/// filesystem race that left real content is never silently deleted; any
+/// failure is logged with the session id only, never a path (spec Always:
+/// "no path content beyond the session ID").
+fn remove_media_dir_if_empty(root: &Path, session_id: SessionId) {
+    let dir = paths::media_dir(root, session_id);
+    match fs::read_dir(&dir) {
+        Ok(mut entries) => {
+            if entries.next().is_none() {
+                if let Err(err) = fs::remove_dir(&dir) {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        error = %err,
+                        "không dọn được thư mục media mồ côi sau khi publish Proxy lỗi"
+                    );
+                }
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %err,
+                "không đọc được thư mục media để dọn mồ côi sau khi publish Proxy lỗi"
+            );
+        }
+    }
+}
+
 /// Commit một Phiên file mới: publish Proxy (nếu có) rồi ghi
 /// session+transcript+segments trong một transaction (spec I/O Matrix "Commit
 /// mới"). `staged_proxy` là kết quả `media::create_proxy` trong staging —
@@ -192,7 +246,18 @@ pub fn commit_file_session(
     let (proxy_ext, proxy_error) = match staged_proxy {
         Ok(staged_path) => match publish_proxy(root, session_id, &staged_path) {
             Ok(ext) => (Some(ext), None),
-            Err(err) => (None, Some(err)),
+            Err(err) => {
+                // `publish_proxy` creates `media/<sid>/` before it can fail
+                // (dest dir, then write/fsync/rename) -- a failure this side
+                // of a successful rename leaves that directory empty, and it
+                // is never reconciled otherwise: commit still proceeds with
+                // `proxy_ext = NULL`, so `reconcile` sees a *known* session
+                // with no `proxy_ext` and no reason to touch its (now
+                // nonexistent, once cleaned) media dir (spec Always: "remove
+                // that directory if it is empty, best-effort, logged").
+                remove_media_dir_if_empty(root, session_id);
+                (None, Some(err))
+            }
         },
         Err(err) => (None, Some(err)),
     };
@@ -241,7 +306,13 @@ pub fn commit_file_session(
         // thư mục đã publish, không còn dòng"; "Trùng hash -> Rollback, gỡ
         // Proxy vừa publish").
         if proxy_ext.is_some() {
-            let _ = fs::remove_dir_all(paths::media_dir(root, session_id));
+            if let Err(remove_err) = fs::remove_dir_all(paths::media_dir(root, session_id)) {
+                tracing::warn!(
+                    session_id = %session_id,
+                    error = %remove_err,
+                    "không gỡ được Proxy mồ côi sau khi DB commit lỗi"
+                );
+            }
         }
         return Err(err);
     }
@@ -531,17 +602,46 @@ pub fn relink_proxy(
         }
     };
 
-    let now = now_ms();
-    if let Err(err) = db.with_connection(|conn| {
-        Ok(repo::sessions::set_proxy_ext(
-            conn,
-            session_id,
-            Some(&ext),
-            now,
-        )?)
-    }) {
-        let _ = discard_staging(root, job_id);
-        return Err(err);
+    // The file is already renamed into place at this point -- a failure to
+    // record it is a DB write, not a publish failure, so it gets one retry
+    // before giving up (spec Always: "if `set_proxy_ext` fails after the
+    // file was published, retry the DB write once").
+    let write_proxy_ext = || {
+        #[cfg(test)]
+        if fault::consume_set_proxy_ext_failure() {
+            return Err(storage_error("injected: set_proxy_ext failure"));
+        }
+        db.with_connection(|conn| {
+            Ok(repo::sessions::set_proxy_ext(
+                conn,
+                session_id,
+                Some(&ext),
+                now_ms(),
+            )?)
+        })
+    };
+    if write_proxy_ext().is_err() {
+        if let Err(err) = write_proxy_ext() {
+            if let Err(discard_err) = discard_staging(root, job_id) {
+                tracing::warn!(
+                    session_id = %session_id,
+                    error = %discard_err,
+                    "không dọn được staging sau khi ghi proxy_ext lỗi"
+                );
+            }
+            tracing::warn!(
+                session_id = %session_id,
+                error = %err,
+                "Proxy đã publish nhưng ghi proxy_ext vào DB thất bại cả hai lần"
+            );
+            // The published file stays on disk -- the next `reconcile` sees
+            // a proxy file with no recorded `proxy_ext` and repairs it
+            // (spec Always: "reconcile must fix the mismatch").
+            return Err(AppError::new(
+                Code::Storage,
+                "Proxy đã được publish nhưng chưa ghi được vào DB",
+            ));
+        }
     }
 
     if let Err(err) = discard_staging(root, job_id) {
@@ -659,9 +759,23 @@ fn remove_path_if_exists(path: &Path) -> Result<(), AppError> {
     }
 }
 
-fn remove_path_any(path: &Path) {
-    if fs::remove_file(path).is_err() {
-        let _ = fs::remove_dir_all(path);
+/// Removes a stray reconcile entry, whether it turns out to be a file or a
+/// directory. `session_id` is `Some` only when the entry's own name parsed
+/// as one (a known-orphan or stray-inside-a-session-dir entry) — logged on
+/// failure with no path content beyond it (spec Always).
+fn remove_path_any(session_id: Option<SessionId>, path: &Path) {
+    if fs::remove_file(path).is_ok() {
+        return;
+    }
+    if let Err(err) = fs::remove_dir_all(path) {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            return;
+        }
+        tracing::warn!(
+            session_id = ?session_id,
+            error = %err,
+            "không dọn được entry mồ côi trong media lúc reconcile"
+        );
     }
 }
 
@@ -697,29 +811,69 @@ pub fn reconcile(db: &Db, root: &Path) -> Result<(), AppError> {
     let known: HashMap<SessionId, Option<String>> = db
         .with_connection(|conn| Ok(repo::sessions::list_media_refs(conn)?.into_iter().collect()))?;
 
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                // A single unreadable directory entry (permissions, a
+                // concurrent delete) must never abort the rest of reconcile
+                // (spec Always: "reconcile's `read_dir(...).flatten()` logs
+                // entry errors").
+                tracing::warn!(error = %err, "không đọc được một entry dưới media lúc reconcile");
+                continue;
+            }
+        };
         let path = entry.path();
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            remove_path_any(&path);
+            remove_path_any(None, &path);
             continue;
         };
         let Ok(session_id) = SessionId::try_from(name.as_str()) else {
             // Không parse được thành UUIDv7 -> không phải thư mục Phiên hợp
             // lệ (bao gồm cả trường hợp `.staging` lỡ tái tạo giữa hai bước
             // trên do một tiến trình khác — vẫn dọn được an toàn).
-            remove_path_any(&path);
+            remove_path_any(None, &path);
             continue;
         };
         match known.get(&session_id) {
-            None => remove_path_any(&path),
+            None => remove_path_any(Some(session_id), &path),
             Some(proxy_ext) if path.is_dir() => {
-                reconcile_session_dir(db, session_id, proxy_ext.as_deref(), &path)?;
+                // An error reconciling one session directory is logged and
+                // the loop continues -- it never aborts the other sessions
+                // (spec Always).
+                if let Err(err) = reconcile_session_dir(db, session_id, proxy_ext.as_deref(), &path)
+                {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        error = %err,
+                        "không reconcile được một thư mục Phiên, tiếp tục các Phiên khác"
+                    );
+                }
             }
-            Some(_) => remove_path_any(&path),
+            Some(_) => remove_path_any(Some(session_id), &path),
         }
     }
 
     Ok(())
+}
+
+/// Scans `dir` for a `proxy.<ext>` file and returns `<ext>` — used only to
+/// repair a session whose `proxy_ext` is `NULL` in DB but whose proxy file
+/// is actually on disk (spec Always: "relink can leave disk and DB
+/// disagreeing... reconcile sets `proxy_ext` from the file").
+fn find_proxy_file_ext(dir: &Path) -> Option<String> {
+    let entries = fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if let Some(ext) = name.strip_prefix("proxy.") {
+            if !ext.is_empty() && entry.path().is_file() {
+                return Some(ext.to_string());
+            }
+        }
+    }
+    None
 }
 
 fn reconcile_session_dir(
@@ -741,11 +895,25 @@ fn reconcile_session_dir(
         })?;
     }
 
-    let keep_name = if proxy_file_exists {
+    let mut keep_name = if proxy_file_exists {
         expected_name
     } else {
         None
     };
+
+    // `proxy_ext` is NULL (never set, or a `relink_proxy` DB write that
+    // failed even after its retry) but a proxy file exists on disk -- repair
+    // the mismatch by reading the extension back from the file (spec
+    // Always).
+    if proxy_ext.is_none() {
+        if let Some(found_ext) = find_proxy_file_ext(dir) {
+            db.with_connection(|conn| {
+                repo::sessions::set_proxy_ext(conn, session_id, Some(&found_ext), now_ms())?;
+                Ok(())
+            })?;
+            keep_name = Some(format!("proxy.{found_ext}"));
+        }
+    }
 
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -758,7 +926,7 @@ fn reconcile_session_dir(
             .map(|keep| entry.file_name().to_str() == Some(keep))
             .unwrap_or(false);
         if !is_kept {
-            remove_path_any(&entry.path());
+            remove_path_any(Some(session_id), &entry.path());
         }
     }
 
@@ -1086,6 +1254,14 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(session.proxy_ext, None);
+        // Spec I/O Matrix "Publish fails": publish write fails, commit ok ->
+        // no `media/<sid>/` left (the directory `publish_proxy` creates up
+        // front for the rename target must not survive an empty and
+        // orphaned).
+        assert!(
+            !paths::media_dir(root.path(), outcome.session_id).exists(),
+            "publish write thất bại phải dọn media/<sid>/ mồ côi"
+        );
     }
 
     #[test]
@@ -1108,6 +1284,10 @@ mod tests {
 
         let outcome = result.unwrap();
         assert!(outcome.proxy_error.is_some());
+        assert!(
+            !paths::media_dir(root.path(), outcome.session_id).exists(),
+            "publish rename thất bại phải dọn media/<sid>/ mồ côi"
+        );
     }
 
     #[test]
@@ -1638,6 +1818,67 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn reconcile_logs_and_continues_past_one_unreadable_session_directory() {
+        // Spec I/O Matrix "Reconcile one bad": "one session dir errors ->
+        // others still reconciled, warn" -- an unreadable directory (real
+        // `read_dir` failure, not the file-fault-injection points, which
+        // only cover `commit_file_session`'s own publish/commit steps) makes
+        // `reconcile_session_dir` return `Err` for exactly that one session.
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempdir().unwrap();
+        let db = open_db(root.path());
+
+        let job_bad = JobId::new();
+        let staged_bad = stage_fake_proxy(root.path(), job_bad);
+        let bad_outcome = commit_file_session(
+            &db,
+            root.path(),
+            job_bad,
+            SessionId::new(),
+            sample_draft(Some("bad")),
+            Ok(staged_bad),
+        )
+        .unwrap();
+        let bad_dir = paths::media_dir(root.path(), bad_outcome.session_id);
+        let mut denied = fs::metadata(&bad_dir).unwrap().permissions();
+        denied.set_mode(0o000);
+        fs::set_permissions(&bad_dir, denied).unwrap();
+
+        let job_good = JobId::new();
+        let staged_good = stage_fake_proxy(root.path(), job_good);
+        let good_outcome = commit_file_session(
+            &db,
+            root.path(),
+            job_good,
+            SessionId::new(),
+            sample_draft(Some("good")),
+            Ok(staged_good),
+        )
+        .unwrap();
+        let good_dir = paths::media_dir(root.path(), good_outcome.session_id);
+        fs::write(good_dir.join("stray.partial"), b"x").unwrap();
+
+        let result = reconcile(&db, root.path());
+
+        // Restore permissions so the tempdir can clean itself up regardless
+        // of the assertions below.
+        let mut restored = fs::metadata(&bad_dir).unwrap().permissions();
+        restored.set_mode(0o700);
+        fs::set_permissions(&bad_dir, restored).unwrap();
+
+        assert!(
+            result.is_ok(),
+            "một Phiên lỗi không được làm cả reconcile thất bại: {result:?}"
+        );
+        assert!(
+            !good_dir.join("stray.partial").exists(),
+            "Phiên tốt vẫn phải được reconcile dù Phiên khác lỗi"
+        );
+    }
+
+    #[test]
     fn reconcile_never_touches_a_previously_committed_session_and_is_idempotent() {
         let root = tempdir().unwrap();
         let db = open_db(root.path());
@@ -1933,5 +2174,107 @@ mod tests {
         assert!(result.is_err());
         assert!(staging_root_is_empty(root.path()));
         assert_eq!(fs::read(&proxy_file).unwrap(), bytes_before);
+    }
+
+    #[test]
+    fn relink_proxy_retries_set_proxy_ext_once_and_still_succeeds() {
+        // Spec Always: "if `set_proxy_ext` fails after the file was
+        // published, retry the DB write once" -- one failure must not fail
+        // the whole relink.
+        let root = tempdir().unwrap();
+        let db = open_db(root.path());
+        let job_id = JobId::new();
+        let staged = stage_fake_proxy(root.path(), job_id);
+
+        let source = root.path().join("source.wav");
+        write_real_wav(&source, 1);
+        let source_hash = media::sha256_file(&source).unwrap();
+        let outcome = commit_file_session(
+            &db,
+            root.path(),
+            job_id,
+            SessionId::new(),
+            sample_draft(Some(&source_hash)),
+            Ok(staged),
+        )
+        .unwrap();
+
+        fault::set_proxy_ext_failures(1);
+        let result = relink_proxy(&db, root.path(), outcome.session_id, &source);
+        fault::set_proxy_ext_failures(0);
+
+        assert_eq!(result.unwrap(), RelinkOutcome::Relinked);
+        let session = db
+            .with_connection(|conn| Ok(repo::sessions::get(conn, outcome.session_id)?))
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.proxy_ext.as_deref(), Some("flac"));
+    }
+
+    #[test]
+    fn relink_proxy_set_proxy_ext_failing_twice_reports_the_mismatch_and_reconcile_repairs_it() {
+        // Spec I/O Matrix "Relink DB fails": "publish ok, set_proxy_ext
+        // fails twice -> error; later reconcile sets `proxy_ext`" (`Code::
+        // Storage`). The published file must stay on disk -- the fix is
+        // never to roll it back, only to report and let the next
+        // `reconcile` repair the DB.
+        let root = tempdir().unwrap();
+        let db = open_db(root.path());
+        let job_id = JobId::new();
+        let staged = stage_fake_proxy(root.path(), job_id);
+
+        let source = root.path().join("source.wav");
+        write_real_wav(&source, 1);
+        let source_hash = media::sha256_file(&source).unwrap();
+
+        // Start from a session whose `proxy_ext` is already NULL (its own
+        // first publish failed) -- the same starting point a `relink_proxy`
+        // DB-write failure leaves behind: a proxy file on disk with no
+        // recorded extension.
+        fault::set(Some(fault::Point::PublishWrite));
+        let outcome = commit_file_session(
+            &db,
+            root.path(),
+            job_id,
+            SessionId::new(),
+            sample_draft(Some(&source_hash)),
+            Ok(staged),
+        )
+        .unwrap();
+        fault::set(None);
+        assert!(outcome.proxy_error.is_some());
+
+        fault::set_proxy_ext_failures(2);
+        let result = relink_proxy(&db, root.path(), outcome.session_id, &source);
+        fault::set_proxy_ext_failures(0);
+
+        let error = result.expect_err("set_proxy_ext lỗi cả hai lần phải trả Err");
+        assert_eq!(error.code, Code::Storage);
+
+        let proxy_file = paths::proxy_path(root.path(), outcome.session_id, "flac");
+        assert!(
+            proxy_file.is_file(),
+            "file Proxy mới publish rồi phải giữ nguyên trên đĩa, không rollback"
+        );
+        let session = db
+            .with_connection(|conn| Ok(repo::sessions::get(conn, outcome.session_id)?))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            session.proxy_ext, None,
+            "DB chưa ghi được -- đúng như lỗi báo, chưa tự sửa ở đây"
+        );
+
+        reconcile(&db, root.path()).unwrap();
+
+        let repaired = db
+            .with_connection(|conn| Ok(repo::sessions::get(conn, outcome.session_id)?))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            repaired.proxy_ext.as_deref(),
+            Some("flac"),
+            "reconcile phải tự sửa proxy_ext từ file thật trên đĩa"
+        );
     }
 }

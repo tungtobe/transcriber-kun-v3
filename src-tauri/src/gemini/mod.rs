@@ -684,7 +684,39 @@ impl GeminiGateway {
             {
                 Ok(response) => response,
                 Err(error) => {
-                    let _ = self.key_pool.report(lease, outcome_for_error(&error)).await;
+                    let outcome = outcome_for_error(&error);
+                    if outcome == RequestOutcome::Server {
+                        // Same retry-then-continue path as a 5xx HTTP status
+                        // below: a transport network blip stays inside the
+                        // attempt budget instead of failing the chunk on the
+                        // first try.
+                        let request_id = lease.request_id.clone();
+                        if let Some(observer) = &observer {
+                            observer.waiting_quota(true);
+                        }
+                        let report = self.key_pool.report(lease, outcome);
+                        tokio::pin!(report);
+                        let reported = tokio::select! {
+                            result = &mut report => result,
+                            _ = cancellation.cancelled() => {
+                                let _ = self.key_pool.cancel(request_id).await;
+                                return Err(cancelled_error());
+                            }
+                        };
+                        if let Some(observer) = &observer {
+                            observer.waiting_quota(false);
+                        }
+                        match reported {
+                            Ok(ReportAction::Retry(next)) => {
+                                lease = next;
+                                self.report_lease_acquired(&lease, &observer).await;
+                                continue;
+                            }
+                            Ok(ReportAction::Complete) => return Err(error),
+                            Err(report_error) => return Err(report_error),
+                        }
+                    }
+                    let _ = self.key_pool.report(lease, outcome).await;
                     return Err(error);
                 }
             };
@@ -809,6 +841,11 @@ fn cancelled_error() -> AppError {
 fn outcome_for_error(error: &AppError) -> RequestOutcome {
     match error.code {
         Code::Timeout => RequestOutcome::Timeout,
+        // Transport-level network failures (connection/DNS -- never an HTTP
+        // status) are treated the same as a 5xx response: retried inside the
+        // existing attempt budget, never resent on another key after a
+        // timeout.
+        Code::Network => RequestOutcome::Server,
         _ => RequestOutcome::Request,
     }
 }
@@ -955,6 +992,20 @@ pub(crate) mod test_support {
         }
     }
 
+    impl FakeClock {
+        /// Advances the fake clock and wakes anything blocked in
+        /// [`Clock::sleep_until`] (a cooldown/backoff wait, or a deadline).
+        /// Exposed so tests can drive a `Server`/`Quota` cooldown to
+        /// completion deterministically (see `gateway_with_clock`).
+        pub(crate) fn advance(&self, duration: Duration) {
+            {
+                let mut now = self.now.lock().unwrap();
+                *now += duration;
+            }
+            self.changed.notify_waiters();
+        }
+    }
+
     impl Clock for FakeClock {
         fn now(&self) -> Instant {
             *self.now.lock().unwrap()
@@ -973,18 +1024,40 @@ pub(crate) mod test_support {
         KeyMaterial::new(KeyId::from_opaque(id), secret.to_string())
     }
 
-    pub(crate) async fn gateway_with(
+    /// Same gateway as [`gateway_with`], plus the [`FakeClock`] handle so a
+    /// test can control exactly when a `Server`/`Quota` cooldown elapses
+    /// (story epic-2-p1 "backoff gates the 2nd dispatch").
+    pub(crate) async fn gateway_with_clock(
         keys: Vec<KeyMaterial>,
         transport: Arc<dyn GeminiTransport>,
-    ) -> GeminiGateway {
+    ) -> (GeminiGateway, Arc<FakeClock>) {
         let provider = Arc::new(FakeProvider {
             keys: Mutex::new(keys),
         });
         let clock = FakeClock::new();
-        let (pool, actor) = KeyPoolHandle::channel(provider, clock);
+        let (pool, actor) = KeyPoolHandle::channel(provider, clock.clone());
         tokio::spawn(actor.run());
         pool.refresh().await.unwrap();
-        GeminiGateway::new(transport, pool)
+        (GeminiGateway::new(transport, pool), clock)
+    }
+
+    /// Builds a gateway over a fake transport and an in-memory key pool whose
+    /// clock free-runs (auto-advanced in the background) so a `Server`/
+    /// `Quota` cooldown set by a fault-injected response always elapses on
+    /// its own -- most tests only care that a retry eventually lands, not the
+    /// exact backoff timing (for that, use `gateway_with_clock`).
+    pub(crate) async fn gateway_with(
+        keys: Vec<KeyMaterial>,
+        transport: Arc<dyn GeminiTransport>,
+    ) -> GeminiGateway {
+        let (gateway, clock) = gateway_with_clock(keys, transport).await;
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                clock.advance(Duration::from_millis(250));
+            }
+        });
+        gateway
     }
 
     #[derive(Clone)]
@@ -1017,7 +1090,7 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{gateway_with, key, FakeTransport};
+    use super::test_support::{gateway_with, gateway_with_clock, key, FakeTransport};
     use super::*;
     use std::sync::Mutex;
 
@@ -1232,6 +1305,81 @@ mod tests {
             assert_eq!(request.header("content-type"), Some("application/json"));
             assert_eq!(request.body.as_ref().unwrap().expose(), body);
         }
+    }
+
+    // Epic 2 P1 backend fixes: a transport-level `Code::Network` failure
+    // (connection/DNS, never an HTTP status) retries inside the same
+    // attempt budget as a 5xx, and the retry stays gated behind the
+    // `Server` cooldown/backoff (`SERVER_BACKOFF`) just like `classify_http_status`'s
+    // `RequestOutcome::Server` branch.
+    #[tokio::test]
+    async fn post_job_retries_a_transport_network_blip_then_succeeds() {
+        let transport = FakeTransport::new(vec![
+            Err(TransportError::Network),
+            Ok(TransportResponse {
+                status: 200,
+                body: "{\"candidates\":[]}".to_string(),
+            }),
+        ]);
+        let gateway = gateway_with(vec![key("a", "AIzaA123456789")], transport.clone()).await;
+        let response = gateway
+            .post_job(
+                "/v1beta/interactions",
+                "{}".to_string(),
+                ConsentSnapshot::new(1, false),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(transport.requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn post_job_server_backoff_gates_the_second_dispatch() {
+        let transport = FakeTransport::new(vec![
+            Ok(TransportResponse {
+                status: 503,
+                body: "temporary failure".to_string(),
+            }),
+            Ok(TransportResponse {
+                status: 200,
+                body: "{\"candidates\":[]}".to_string(),
+            }),
+        ]);
+        let (gateway, clock) =
+            gateway_with_clock(vec![key("a", "AIzaA123456789")], transport.clone()).await;
+        let operation = tokio::spawn(async move {
+            gateway
+                .post_job(
+                    "/v1beta/interactions",
+                    "{}".to_string(),
+                    ConsentSnapshot::new(1, false),
+                    CancellationToken::new(),
+                )
+                .await
+        });
+        while transport.requests().is_empty() {
+            tokio::task::yield_now().await;
+        }
+        tokio::task::yield_now().await;
+        assert_eq!(
+            transport.requests().len(),
+            1,
+            "the retry must not dispatch before the backoff elapses"
+        );
+        assert!(
+            !operation.is_finished(),
+            "the operation must still be waiting on the backoff"
+        );
+        clock.advance(params::SERVER_BACKOFF_MAX);
+        let response = tokio::time::timeout(Duration::from_secs(1), operation)
+            .await
+            .expect("the backoff must eventually release the retry")
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(transport.requests().len(), 2);
     }
 
     // Story 2.5 Tasks: "thêm test chuỗi response cho: 429 xoay key, 3×5xx rồi
@@ -1645,18 +1793,32 @@ mod tests {
 
     #[test]
     fn http_statuses_and_default_models_are_stable() {
-        for (status, code) in [
-            (401, Code::Auth),
-            (403, Code::Auth),
-            (404, Code::Model),
-            (429, Code::Quota),
-            (451, Code::Blocked),
-            (400, Code::Request),
-            (503, Code::Network),
+        for (status, outcome, code) in [
+            (401, RequestOutcome::Auth, Code::Auth),
+            (403, RequestOutcome::Auth, Code::Auth),
+            (404, RequestOutcome::Request, Code::Model),
+            (429, RequestOutcome::Quota, Code::Quota),
+            (451, RequestOutcome::Request, Code::Blocked),
+            (400, RequestOutcome::Request, Code::Request),
+            (503, RequestOutcome::Server, Code::Network),
         ] {
-            assert_eq!(classify_http_status(status).unwrap().1.code, code);
+            let (actual_outcome, error) = classify_http_status(status).unwrap();
+            assert_eq!(actual_outcome, outcome, "status {status}");
+            assert_eq!(error.code, code, "status {status}");
         }
         assert!(classify_http_status(200).is_none());
+        assert_eq!(
+            outcome_for_error(&AppError::new(Code::Network, "x")),
+            RequestOutcome::Server
+        );
+        assert_eq!(
+            outcome_for_error(&AppError::new(Code::Timeout, "x")),
+            RequestOutcome::Timeout
+        );
+        assert_eq!(
+            outcome_for_error(&AppError::new(Code::Tls, "x")),
+            RequestOutcome::Request
+        );
         assert_eq!(params::DEFAULT_TRANSCRIBE_MODEL, "gemini-flash-lite-latest");
         assert_eq!(params::DEFAULT_MEMO_MODEL, "gemini-flash-lite-latest");
         assert_eq!(

@@ -96,6 +96,13 @@ export const commands = {
 	 */
 	jobsSubscribe: (onEvent: Channel<JobEvent>) => typedError<null, AppError>(__TAURI_INVOKE("jobs_subscribe", { onEvent })),
 	/**
+	 *  Gỡ đăng ký một Channel đã `jobs_subscribe` trước đó, theo `channel_id`
+	 *  (`Channel::id()` phía frontend) — spec Always: "`jobs_unsubscribe`... gỡ
+	 *  subscriber có `Channel::id()` khớp"; idempotent, `channel_id` không tồn
+	 *  tại vẫn `Ok`.
+	 */
+	jobsUnsubscribe: (channelId: number) => typedError<null, AppError>(__TAURI_INVOKE("jobs_unsubscribe", { channelId })),
+	/**
 	 *  Huỷ một Job — xem [`crate::transcribe::job::CancelOutcome`] cho ý nghĩa
 	 *  kết quả (spec I/O Matrix "Huỷ": "Cancel đến sau commit -> trả kết quả
 	 *  hoàn tất").
@@ -502,7 +509,14 @@ export type TranscribeLanguage = "auto" | "ja" | "vi" | "en";
  *  Kết quả `transcribe_rerun` (spec I/O Matrix "Chạy lại `missing`/`gap(id)`/
  *  `all`", "Không có gì để chạy", "Gọi trùng").
  */
-export type TranscribeRerunOutcome = { kind: "started"; jobId: string } | { kind: "existing"; jobId: string } | { kind: "nothingToRerun" };
+export type TranscribeRerunOutcome = { kind: "started"; jobId: string } | { kind: "existing"; jobId: string } | 
+/**
+ *  The session already has an in-flight rerun targeting a different
+ *  `transcript_id`/`ranges` -- no second Job was enqueued (spec Always:
+ *  "Never enqueue a second rerun for the same session"). The frontend
+ *  treats this like an error notice, not a success.
+ */
+{ kind: "busy"; jobId: string } | { kind: "nothingToRerun" };
 
 /**
  *  Kết quả `transcribe_start` (spec Always: thứ tự gate "Consent → đuôi file

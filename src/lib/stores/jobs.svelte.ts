@@ -64,6 +64,10 @@ export function createJobsStore() {
   // đang `error` (mở lại); `unsubscribe()` chỉ xoá state khi đếm về 0.
   let subscriberCount = 0;
   let pendingSubscribe: Promise<void> | null = null;
+  // The most recently created Channel, kept only so `unsubscribe()` can
+  // release it backend-side via `jobsUnsubscribe(channel.id)` -- never read
+  // for anything else.
+  let currentChannel: Channel<JobEvent> | null = null;
 
   function appendLog(jobId: string, entry: JobLogEntry): void {
     const nextLogs = new Map(logs);
@@ -130,6 +134,7 @@ export function createJobsStore() {
     synced = false;
     const channel = new Channel<JobEvent>();
     channel.onmessage = (event) => applyEvent(event, forGeneration);
+    currentChannel = channel;
 
     try {
       const result = await commands.jobsSubscribe(channel);
@@ -181,6 +186,15 @@ export function createJobsStore() {
     synced = false;
     status = 'idle';
     pendingSubscribe = null;
+    // Release the channel backend-side so its JobEvent subscription actually
+    // stops (spec Always: "jobsStore.unsubscribe() calls it with its
+    // channel's id"). Fire-and-forget: the actor's unsubscribe is idempotent
+    // and this runs from teardown, which cannot usefully await it.
+    if (currentChannel !== null) {
+      const channelId = currentChannel.id;
+      currentChannel = null;
+      void commands.jobsUnsubscribe(channelId).catch(() => {});
+    }
   }
 
   async function start(path: string): Promise<TranscribeStartOutcome | { error: AppError }> {

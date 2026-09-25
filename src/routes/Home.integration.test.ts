@@ -24,6 +24,7 @@ const mocks = vi.hoisted(() => {
   return {
     librarySessionsList: vi.fn(),
     jobsSubscribe: vi.fn(),
+    jobsUnsubscribe: vi.fn().mockResolvedValue({ status: 'ok', data: null }),
     jobsCancel: vi.fn(),
     keysList: vi.fn(),
     FakeChannel,
@@ -38,6 +39,7 @@ vi.mock('../lib/bindings', () => ({
   commands: {
     librarySessionsList: (...args: unknown[]) => mocks.librarySessionsList(...args),
     jobsSubscribe: (...args: unknown[]) => mocks.jobsSubscribe(...args),
+    jobsUnsubscribe: (...args: unknown[]) => mocks.jobsUnsubscribe(...args),
     jobsCancel: (...args: unknown[]) => mocks.jobsCancel(...args),
     keysList: (...args: unknown[]) => mocks.keysList(...args),
   },
@@ -92,6 +94,7 @@ beforeEach(async () => {
   i18n.applyPreference('vi');
   mocks.librarySessionsList.mockReset();
   mocks.jobsSubscribe.mockReset();
+  mocks.jobsUnsubscribe.mockReset().mockResolvedValue({ status: 'ok', data: null });
   mocks.jobsCancel.mockReset();
   mocks.keysList.mockReset().mockResolvedValue({ status: 'ok', data: [] });
   capturedChannel = null;

@@ -20,7 +20,9 @@ use crate::core::error::{AppError, Code};
 use crate::core::Sensitive;
 use crate::secrets::{CredentialStore, KeyId, KeyMaterial, SecretService};
 
-use super::params::{JOB_MAX_WAIT, MAX_ATTEMPTS, MEMO_DEADLINE, QUOTA_COOLDOWN};
+use super::params::{
+    JOB_MAX_WAIT, MAX_ATTEMPTS, MEMO_DEADLINE, QUOTA_COOLDOWN, SERVER_BACKOFF, SERVER_BACKOFF_MAX,
+};
 
 pub trait KeyProvider: Send + Sync + 'static {
     fn load_keys(&self) -> Result<Vec<KeyMaterial>, AppError>;
@@ -622,6 +624,20 @@ impl KeyPoolActor {
                 )));
             }
             RequestOutcome::Server => {
+                // Same `cooldown_until` mechanism as `Quota`, scaled by the
+                // attempts already spent on this request (1s × attempts so
+                // far, capped at `SERVER_BACKOFF_MAX`) so a flaky key does not
+                // get re-dispatched to immediately.
+                let backoff = SERVER_BACKOFF
+                    .saturating_mul(u32::from(lease.attempt))
+                    .min(SERVER_BACKOFF_MAX);
+                if let Some(key) = self
+                    .keys
+                    .iter_mut()
+                    .find(|key| key.material.id == lease.key_id)
+                {
+                    key.cooldown_until = Some(self.clock.now() + backoff);
+                }
                 self.retry_or_finish(lease.request_id, Code::Network, reply);
             }
             RequestOutcome::Quota => {
@@ -986,11 +1002,21 @@ mod tests {
 
     #[tokio::test]
     async fn server_failures_retry_serially_within_the_attempt_budget() {
-        let (pool, _provider, _clock) = pool(vec![material("a", "A")]).await;
+        let (pool, _provider, clock) = pool(vec![material("a", "A")]).await;
         let mut lease = pool.acquire(Priority::Job).await.unwrap();
         let mut attempts = 1;
         loop {
-            match pool.report(lease, RequestOutcome::Server).await {
+            let reporting_pool = pool.clone();
+            let report =
+                tokio::spawn(
+                    async move { reporting_pool.report(lease, RequestOutcome::Server).await },
+                );
+            tokio::task::yield_now().await;
+            // Only the retryable attempts are gated behind the backoff; the
+            // exhausted (4th) reply returns immediately regardless, so
+            // advancing here is harmless in that case.
+            clock.advance(SERVER_BACKOFF_MAX);
+            match report.await.unwrap() {
                 Ok(ReportAction::Retry(next)) => {
                     attempts += 1;
                     lease = next;
@@ -1003,6 +1029,47 @@ mod tests {
             }
         }
         assert_eq!(attempts, MAX_ATTEMPTS);
+    }
+
+    #[tokio::test]
+    async fn server_failure_backoff_gates_the_retry_and_scales_with_attempts() {
+        let (pool, _provider, clock) = pool(vec![material("a", "A")]).await;
+        let first = pool.acquire(Priority::Job).await.unwrap();
+
+        let reporting_pool = pool.clone();
+        let first_wait =
+            tokio::spawn(async move { reporting_pool.report(first, RequestOutcome::Server).await });
+        tokio::task::yield_now().await;
+        assert!(
+            !first_wait.is_finished(),
+            "first retry must wait for its 1s backoff"
+        );
+        clock.advance(SERVER_BACKOFF);
+        let second = match first_wait.await.unwrap().unwrap() {
+            ReportAction::Retry(lease) => lease,
+            ReportAction::Complete => panic!("server failure must retry"),
+        };
+        assert_eq!(second.attempt(), 2);
+
+        let reporting_pool = pool.clone();
+        let second_wait =
+            tokio::spawn(
+                async move { reporting_pool.report(second, RequestOutcome::Server).await },
+            );
+        tokio::task::yield_now().await;
+        // 2nd attempt's backoff scales to 2s; 1s must not be enough yet.
+        clock.advance(SERVER_BACKOFF);
+        tokio::task::yield_now().await;
+        assert!(
+            !second_wait.is_finished(),
+            "second retry's backoff scales with attempts already spent"
+        );
+        clock.advance(SERVER_BACKOFF);
+        let third = match second_wait.await.unwrap().unwrap() {
+            ReportAction::Retry(lease) => lease,
+            ReportAction::Complete => panic!("server failure must retry"),
+        };
+        assert_eq!(third.attempt(), 3);
     }
 
     #[tokio::test]

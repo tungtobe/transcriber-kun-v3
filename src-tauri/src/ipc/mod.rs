@@ -612,6 +612,29 @@ where
     })
 }
 
+/// Pure seam proving a new transcribe Job's `StartParams` actually carry
+/// `Settings.transcribe_language`/`chunk_minutes` (spec Tasks: "settings
+/// transcribe_language / chunk_minutes reach Start/Rerun params") — the
+/// smallest testable unit around what was previously three separate
+/// `let`s inlined at the `jobs.start(...)` call site.
+fn build_start_params(
+    settings: &settings::Settings,
+    source_path: std::path::PathBuf,
+    source_hash: String,
+    source_name: Option<String>,
+    consent: ConsentSnapshot,
+) -> registry::StartParams {
+    registry::StartParams {
+        source_path,
+        source_hash,
+        source_name,
+        model: settings.transcribe_model.clone(),
+        language: settings.transcribe_language,
+        chunk_minutes: settings.chunk_minutes,
+        consent,
+    }
+}
+
 async fn transcribe_start_inner(
     state: &AppState,
     path: String,
@@ -636,9 +659,6 @@ async fn transcribe_start_inner(
     let secrets = state.secrets.clone();
     let jobs = state.jobs.clone();
     let reservation_jobs = state.jobs.clone();
-    let model = settings.transcribe_model.clone();
-    let language = settings.transcribe_language;
-    let chunk_minutes = settings.chunk_minutes;
 
     decide_transcribe_start(
         consent.is_current(),
@@ -661,15 +681,13 @@ async fn transcribe_start_inner(
         },
         move |hash: String| async move {
             let jobs = jobs?;
-            jobs.start(registry::StartParams {
+            jobs.start(build_start_params(
+                &settings,
                 source_path,
-                source_hash: hash,
+                hash,
                 source_name,
-                model,
-                language,
-                chunk_minutes,
                 consent,
-            })
+            ))
             .await
         },
     )
@@ -749,8 +767,19 @@ async fn transcribe_pick_files(
     rename_all_fields = "camelCase"
 )]
 pub enum TranscribeRerunOutcome {
-    Started { job_id: JobId },
-    Existing { job_id: JobId },
+    Started {
+        job_id: JobId,
+    },
+    Existing {
+        job_id: JobId,
+    },
+    /// The session already has an in-flight rerun targeting a different
+    /// `transcript_id`/`ranges` -- no second Job was enqueued (spec Always:
+    /// "Never enqueue a second rerun for the same session"). The frontend
+    /// treats this like an error notice, not a success.
+    Busy {
+        job_id: JobId,
+    },
     NothingToRerun,
 }
 
@@ -815,7 +844,32 @@ where
     Ok(match start_rerun(ranges, proxy_path).await? {
         RerunOutcome::Started { job_id } => TranscribeRerunOutcome::Started { job_id },
         RerunOutcome::Existing { job_id } => TranscribeRerunOutcome::Existing { job_id },
+        RerunOutcome::Busy { job_id } => TranscribeRerunOutcome::Busy { job_id },
     })
+}
+
+/// Same seam as [`build_start_params`], for a rerun Job's `RerunParams`.
+#[allow(clippy::too_many_arguments)]
+fn build_rerun_params(
+    settings: &settings::Settings,
+    session_id: SessionId,
+    transcript_id: TranscriptId,
+    ranges: Vec<rerun::RerunRange>,
+    discard_old: bool,
+    proxy_path: std::path::PathBuf,
+    consent: ConsentSnapshot,
+) -> RerunParams {
+    RerunParams {
+        session_id,
+        transcript_id,
+        ranges,
+        discard_old,
+        proxy_path,
+        model: settings.transcribe_model.clone(),
+        language: settings.transcribe_language,
+        chunk_minutes: settings.chunk_minutes,
+        consent,
+    }
 }
 
 async fn transcribe_rerun_inner(
@@ -833,9 +887,6 @@ async fn transcribe_rerun_inner(
     .await?;
     let consent =
         ConsentSnapshot::new(settings.consent_accepted_version, settings.consent_declined);
-    let model = settings.transcribe_model.clone();
-    let language = settings.transcribe_language;
-    let chunk_minutes = settings.chunk_minutes;
     let secrets = state.secrets.clone();
     let jobs = state.jobs.clone();
 
@@ -893,17 +944,15 @@ async fn transcribe_rerun_inner(
         },
         move |ranges, proxy_path| async move {
             let jobs = jobs?;
-            jobs.start_rerun(RerunParams {
+            jobs.start_rerun(build_rerun_params(
+                &settings,
                 session_id,
                 transcript_id,
                 ranges,
-                discard_old: matches!(scope, RerunScope::All),
+                matches!(scope, RerunScope::All),
                 proxy_path,
-                model,
-                language,
-                chunk_minutes,
                 consent,
-            })
+            ))
             .await
         },
     )
@@ -937,6 +986,24 @@ async fn jobs_subscribe(
     let result = async {
         let jobs = state.jobs.clone()?;
         jobs.subscribe(on_event).await
+    }
+    .await;
+    track_ipc_error(&state.db, result).await
+}
+
+/// Gỡ đăng ký một Channel đã `jobs_subscribe` trước đó, theo `channel_id`
+/// (`Channel::id()` phía frontend) — spec Always: "`jobs_unsubscribe`... gỡ
+/// subscriber có `Channel::id()` khớp"; idempotent, `channel_id` không tồn
+/// tại vẫn `Ok`.
+#[tauri::command]
+#[specta::specta]
+async fn jobs_unsubscribe(
+    state: tauri::State<'_, AppState>,
+    channel_id: u32,
+) -> Result<(), AppError> {
+    let result = async {
+        let jobs = state.jobs.clone()?;
+        jobs.unsubscribe(channel_id).await
     }
     .await;
     track_ipc_error(&state.db, result).await
@@ -1322,6 +1389,7 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             transcribe_pick_files,
             transcribe_rerun,
             jobs_subscribe,
+            jobs_unsubscribe,
             jobs_cancel,
             library_session_get,
             library_session_detail,
@@ -1363,6 +1431,67 @@ mod tests {
         let path = dir.path().join("missing").join("transcript.txt");
         let error = write_transcript_export(&path, "hello").unwrap_err();
         assert_eq!(error.category, Category::Storage);
+    }
+
+    // IPC wiring (spec Tasks): `Settings.transcribe_language`/`chunk_minutes`
+    // must reach a new Job's `StartParams`/`RerunParams` -- proven at the
+    // pure `build_start_params`/`build_rerun_params` seam instead of driving
+    // the whole `transcribe_start_inner`/`transcribe_rerun_inner` gate chain
+    // through a real DB.
+
+    #[test]
+    fn build_start_params_carries_settings_language_and_chunk_minutes() {
+        let settings = settings::Settings {
+            transcribe_model: "gemini-flash-lite-latest".to_string(),
+            transcribe_language: crate::settings::TranscribeLanguage::Ja,
+            chunk_minutes: 17,
+            ..Default::default()
+        };
+        let consent = ConsentSnapshot::new(1, false);
+
+        let params = build_start_params(
+            &settings,
+            std::path::PathBuf::from("/tmp/a.wav"),
+            "hash".to_string(),
+            Some("a.wav".to_string()),
+            consent,
+        );
+
+        assert_eq!(params.language, crate::settings::TranscribeLanguage::Ja);
+        assert_eq!(params.chunk_minutes, 17);
+        assert_eq!(params.model, "gemini-flash-lite-latest");
+        assert_eq!(params.consent, consent);
+    }
+
+    #[test]
+    fn build_rerun_params_carries_settings_language_and_chunk_minutes() {
+        let settings = settings::Settings {
+            transcribe_model: "gemini-flash-lite-latest".to_string(),
+            transcribe_language: crate::settings::TranscribeLanguage::Vi,
+            chunk_minutes: 3,
+            ..Default::default()
+        };
+        let consent = ConsentSnapshot::new(1, false);
+        let session_id = SessionId::new();
+        let transcript_id = TranscriptId::new();
+
+        let params = build_rerun_params(
+            &settings,
+            session_id,
+            transcript_id,
+            one_range(),
+            true,
+            std::path::PathBuf::from("/tmp/proxy.flac"),
+            consent,
+        );
+
+        assert_eq!(params.language, crate::settings::TranscribeLanguage::Vi);
+        assert_eq!(params.chunk_minutes, 3);
+        assert_eq!(params.model, "gemini-flash-lite-latest");
+        assert!(params.discard_old);
+        assert_eq!(params.session_id, session_id);
+        assert_eq!(params.transcript_id, transcript_id);
+        assert_eq!(params.consent, consent);
     }
 
     // I/O Matrix "DB không mở được": settings_get/settings_save trả AppError
@@ -2301,6 +2430,43 @@ mod tests {
         .unwrap();
 
         assert_eq!(result, TranscribeRerunOutcome::Existing { job_id });
+        assert_eq!(start_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn decide_transcribe_rerun_maps_registry_busy_to_the_ipc_busy_outcome() {
+        // Spec I/O Matrix "Different rerun": registry `RerunOutcome::Busy`
+        // must surface as `TranscribeRerunOutcome::Busy`, still without an
+        // error (the frontend treats it as a notice, not a failure).
+        let start_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let session_id = SessionId::new();
+        let job_id = JobId::new();
+
+        let result = decide_transcribe_rerun(
+            true,
+            counting_load(
+                std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                rerun_session_row("file", Some("flac")),
+                rerun_transcript_row(session_id, repo::transcripts::Variant::Primary),
+            ),
+            counting_ranges(
+                std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                one_range(),
+            ),
+            counting_proxy(
+                std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                Ok(std::path::PathBuf::from("/tmp/proxy.flac")),
+            ),
+            counting_rerun_key_check(
+                std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                true,
+            ),
+            counting_rerun_start(start_calls.clone(), RerunOutcome::Busy { job_id }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, TranscribeRerunOutcome::Busy { job_id });
         assert_eq!(start_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
