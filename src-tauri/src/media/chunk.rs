@@ -159,8 +159,8 @@ impl Chunker {
 /// corrupted or future caller from turning a huge duration into an
 /// OOM-aborting allocation here.
 fn initial_capacity(max_samples: usize) -> usize {
-    let default_chunk_samples = (DEFAULT_CHUNK_SECONDS as usize)
-        .saturating_mul(OUTPUT_SAMPLE_RATE as usize);
+    let default_chunk_samples =
+        (DEFAULT_CHUNK_SECONDS as usize).saturating_mul(OUTPUT_SAMPLE_RATE as usize);
     max_samples.min(default_chunk_samples)
 }
 

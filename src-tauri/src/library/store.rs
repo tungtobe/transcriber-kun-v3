@@ -885,11 +885,9 @@ mod tests {
         assert_eq!(data.segments[0].speaker.as_deref(), Some("speaker-a"));
         assert_eq!(data.segments[1].kind, SegmentKind::Gap);
         assert_eq!(data.segments[1].gap_reason, Some(GapReason::ChunkFailed));
-        assert!(
-            get_export_data(&db, session_id, TranscriptId::new())
-                .unwrap()
-                .is_none()
-        );
+        assert!(get_export_data(&db, session_id, TranscriptId::new())
+            .unwrap()
+            .is_none());
     }
 
     /// P0 review fix (IDOR close): a `transcript_id` that exists but belongs
@@ -918,18 +916,14 @@ mod tests {
             .unwrap();
 
         let other_session_id = SessionId::new();
-        assert!(
-            get_export_data(&db, other_session_id, transcript_id)
-                .unwrap()
-                .is_none()
-        );
+        assert!(get_export_data(&db, other_session_id, transcript_id)
+            .unwrap()
+            .is_none());
         // The transcript itself is untouched and still exportable under its
         // real owning session.
-        assert!(
-            get_export_data(&db, owning_session_id, transcript_id)
-                .unwrap()
-                .is_some()
-        );
+        assert!(get_export_data(&db, owning_session_id, transcript_id)
+            .unwrap()
+            .is_some());
     }
 
     /// Dựng một Proxy staging thật (không phụ thuộc `media::create_proxy`,

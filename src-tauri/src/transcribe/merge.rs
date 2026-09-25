@@ -362,7 +362,11 @@ mod tests {
             confirmed_silence: false,
         });
         let segments = builder.finish();
-        assert_eq!(segments.len(), 1, "text bị kẹp phải gộp vào, không tạo segment mới");
+        assert_eq!(
+            segments.len(),
+            1,
+            "text bị kẹp phải gộp vào, không tạo segment mới"
+        );
         assert_eq!(segments[0].text, "a b");
     }
 
@@ -382,7 +386,10 @@ mod tests {
         assert_eq!(segments[1].kind, SegmentKind::Text);
         assert_eq!(segments[1].text, "b");
         assert_eq!(segments[1].start_sec, segments[1].end_sec);
-        assert_eq!(segments[1].start_sec, 5.0, "placeholder phải ghim tại con trỏ");
+        assert_eq!(
+            segments[1].start_sec, 5.0,
+            "placeholder phải ghim tại con trỏ"
+        );
     }
 
     #[test]
