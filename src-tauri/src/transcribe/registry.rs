@@ -831,10 +831,11 @@ fn consent_revoked_error() -> AppError {
 async fn consent_still_current(db: &Arc<Db>) -> Result<bool, AppError> {
     let db = db.clone();
     match tokio::task::spawn_blocking(move || settings::load(&db)).await {
-        Ok(loaded) => Ok(
-            ConsentSnapshot::new(loaded.consent_accepted_version, loaded.consent_declined)
-                .is_current(),
-        ),
+        Ok(loaded) => Ok(ConsentSnapshot::new(
+            loaded.consent_accepted_version,
+            loaded.consent_declined,
+        )
+        .is_current()),
         Err(_) => Err(actor_error()),
     }
 }
@@ -2769,8 +2770,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rerun_consent_revoked_after_the_first_range_stops_before_the_second_and_does_not_swap(
-    ) {
+    async fn rerun_consent_revoked_after_the_first_range_stops_before_the_second_and_does_not_swap()
+    {
         // Same per-chunk consent re-check as file transcribe (spec
         // Boundaries Always P0 review: "before every chunk send (file
         // transcribe and rerun)"), exercised on the Chạy lại pipeline: two
