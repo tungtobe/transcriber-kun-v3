@@ -12,14 +12,34 @@ type NormalizedText = {
   ends: number[];
 };
 
-/** Trim the query, collapse whitespace runs, and compare case-insensitively. */
+/** Trim the query, collapse whitespace runs, normalize to NFC, and compare
+ * case-insensitively — so a query typed/pasted in NFD (e.g. some IME/OS
+ * clipboard paths) still matches transcript text normalized the same way
+ * (spec Always: "normalize both the query and the segment text with
+ * `normalize('NFC')` before case-folding"). */
 export function normalizeTranscriptQuery(query: string): string {
-  return query.trim().replace(/\s+/gu, ' ').toLowerCase();
+  return query.normalize('NFC').trim().replace(/\s+/gu, ' ').toLowerCase();
 }
+
+/** Unicode combining marks (general category M) — grouped with the
+ * preceding base character below so a cluster is normalized as one unit,
+ * matching how NFC would compose the same sequence. */
+const COMBINING_MARK = /^\p{M}$/u;
 
 /**
  * Normalize a segment while retaining offsets into its original UTF-16 text.
  * This lets the UI wrap matches in <mark> without changing transcript text.
+ *
+ * NFC normalization can change codepoint *count* (e.g. NFD "Việt" — 'e' +
+ * combining circumflex + combining dot below — composes to one 'ệ'
+ * codepoint), so a straight per-codepoint offset map would go stale wherever
+ * that happens. Instead each base character is grouped with any combining
+ * marks immediately following it into one cluster, that cluster alone is
+ * `normalize('NFC')`-d, and every output character produced from it shares
+ * the cluster's original `[start, end)` span — keeping offsets valid against
+ * the original text even when NFC shortens the cluster (spec Code Map:
+ * "build the offset map from the NFC-normalized text back to the original
+ * indices").
  */
 function normalizeTextWithOffsets(text: string): NormalizedText {
   let value = '';
@@ -48,11 +68,21 @@ function normalizeTextWithOffsets(text: string): NormalizedText {
       pendingWhitespaceStart = null;
     }
 
-    const lowered = codePoint.toLowerCase();
-    value += lowered;
-    for (let offset = 0; offset < lowered.length; offset += 1) {
+    let cluster = codePoint;
+    let clusterEnd = index;
+    while (index < text.length) {
+      const next = String.fromCodePoint(text.codePointAt(index)!);
+      if (!COMBINING_MARK.test(next)) break;
+      cluster += next;
+      index += next.length;
+      clusterEnd = index;
+    }
+
+    const normalizedCluster = cluster.normalize('NFC').toLowerCase();
+    value += normalizedCluster;
+    for (let offset = 0; offset < normalizedCluster.length; offset += 1) {
       starts.push(start);
-      ends.push(index);
+      ends.push(clusterEnd);
     }
   }
 

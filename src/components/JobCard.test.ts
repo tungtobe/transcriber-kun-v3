@@ -81,6 +81,29 @@ describe('JobCard variant=full', () => {
     expect(screen.getByText('1 file đang chờ')).toBeTruthy();
   });
 
+  // spec I/O Matrix "Single queued job": the card itself can show a queued
+  // Job (Job đầu hàng, nothing running yet) — that Job is also `queued` in
+  // the registry, so it must not count itself as "another" waiting file.
+  it('does not show "N file đang chờ" when the only queued transcribe Job is the one shown on the card', () => {
+    mocks.jobsStore.jobs = new Map([['j1', job('j1', { state: 'queued' })]]);
+    render(JobCard, { variant: 'full', job: job('j1', { state: 'queued' }) });
+
+    expect(screen.queryByText(/file đang chờ/)).toBeNull();
+  });
+
+  // spec I/O Matrix "Queued + another": once a second queued transcribe Job
+  // exists elsewhere, it counts — even while the card itself shows a queued
+  // Job that must stay excluded.
+  it('shows "1 file đang chờ" when another queued transcribe Job exists besides the one shown on the card', () => {
+    mocks.jobsStore.jobs = new Map([
+      ['j1', job('j1', { state: 'queued' })],
+      ['j2', job('j2', { state: 'queued' })],
+    ]);
+    render(JobCard, { variant: 'full', job: job('j1', { state: 'queued' }) });
+
+    expect(screen.getByText('1 file đang chờ')).toBeTruthy();
+  });
+
   it('uses "Đang chạy lại" for a rerun job even with no sourceName', () => {
     render(JobCard, { variant: 'full', job: job('j1', { kind: 'rerun', sourceName: null }) });
     expect(screen.getByText('Đang chạy lại')).toBeTruthy();

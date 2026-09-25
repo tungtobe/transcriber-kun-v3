@@ -51,9 +51,13 @@
   const primaryRunning = $derived(allJobs.find((j) => j.state === 'running') ?? null);
 
   // "N file đang chờ" (story 2.8 Always, tái dùng ở `full`) — mọi Job
-  // Transcribe `queued` trong registry, không chỉ Job đang hiện trên card.
+  // Transcribe `queued` trong registry, không chỉ Job đang hiện trên card,
+  // nhưng loại trừ chính Job đang hiện: khi Job đầu hàng (chưa có Job chạy)
+  // hiện trên card này, nó cũng nằm trong `allJobs` với `state === 'queued'`
+  // — không loại nó ra sẽ tự đếm chính mình là "một file khác đang chờ"
+  // (spec Boundaries: "excludes the job shown on the card").
   const queuedTranscribeCount = $derived(
-    allJobs.filter((j) => j.kind === 'transcribe' && j.state === 'queued').length,
+    allJobs.filter((j) => j.kind === 'transcribe' && j.state === 'queued' && j.jobId !== job?.jobId).length,
   );
 </script>
 

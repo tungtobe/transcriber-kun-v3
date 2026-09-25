@@ -132,7 +132,7 @@ export const commands = {
 	 *  transcript by its opaque ID (including private speaker/gap data), applies
 	 *  the display offset, and owns both the system dialog and file write.
 	 */
-	libraryTranscriptExport: (sessionId: string, transcriptId: string, format: TranscriptExportFormat, offsetSec: number | null) => typedError<TranscriptExportOutcome, AppError>(__TAURI_INVOKE("library_transcript_export", { sessionId, transcriptId, format, offsetSec })),
+	libraryTranscriptExport: (sessionId: string, transcriptId: string, format: TranscriptExportFormat, offsetSec: number | null, gapLabels: GapLabels) => typedError<TranscriptExportOutcome, AppError>(__TAURI_INVOKE("library_transcript_export", { sessionId, transcriptId, format, offsetSec, gapLabels })),
 	/**
 	 *  Liệt kê mọi Phiên cho Home (story 2.9): một truy vấn, mới nhất trước, kèm
 	 *  `missing_gap_count` (gap `chunk_failed` của transcript `primary`) — xem
@@ -240,6 +240,17 @@ export type DiagnosticsSummary = {
 export type ErrorCategoryCount = {
 	category: Category,
 	count: number,
+};
+
+/**
+ *  Localized gap notes for the TXT formatter, supplied by the frontend (the
+ *  same `session.export.gap*` i18n strings Copy already uses) so the export
+ *  note matches the UI language instead of a hard-coded English string.
+ */
+export type GapLabels = {
+	chunkFailed: string,
+	disconnected: string,
+	unknown: string,
 };
 
 /**

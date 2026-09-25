@@ -1134,6 +1134,7 @@ async fn library_transcript_export(
     transcript_id: TranscriptId,
     format: library::export::TranscriptExportFormat,
     offset_sec: f64,
+    gap_labels: library::export::GapLabels,
 ) -> Result<library::export::TranscriptExportOutcome, AppError> {
     let result = async {
         let db = state.db.clone()?;
@@ -1142,7 +1143,7 @@ async fn library_transcript_export(
                 .ok_or_else(|| {
                     AppError::new(Code::Storage, "selected transcript no longer exists")
                 })?;
-            library::export::render_transcript(&data, format, offset_sec)
+            library::export::render_transcript(&data, format, offset_sec, &gap_labels)
         })
         .await?;
 

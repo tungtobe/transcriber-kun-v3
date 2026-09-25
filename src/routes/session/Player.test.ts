@@ -110,6 +110,34 @@ describe('Player', () => {
     expect(audio.currentTime).toBe(0);
   });
 
+  it('seeking past a known duration clamps to duration', async () => {
+    render(Player, {
+      proxyPath: '/data/media/s1/proxy.flac',
+      onRelinkRequest: vi.fn(),
+      relinking: false,
+      relinkMessage: null,
+    });
+
+    const audio = document.querySelector('audio')! as HTMLAudioElement;
+    Object.defineProperty(audio, 'duration', { value: 30, configurable: true });
+    await fireEvent.loadedMetadata(audio);
+
+    const slider = screen.getByRole('slider', { name: 'Tua' }) as HTMLInputElement;
+    expect(slider.max).toBe('30');
+
+    await fireEvent.input(slider, { target: { value: '999' } });
+
+    expect(audio.currentTime).toBe(30);
+    expect(slider.getAttribute('aria-valuenow')).toBe('30');
+    expect(screen.getByText('00:30 / 00:30')).toBeTruthy();
+
+    // ArrowRight from just below duration must clamp too, not overshoot.
+    await fireEvent.keyDown(slider, { key: 'ArrowLeft' });
+    await fireEvent.keyDown(slider, { key: 'ArrowRight' });
+    await fireEvent.keyDown(slider, { key: 'ArrowRight' });
+    expect(audio.currentTime).toBe(30);
+  });
+
   it('changing volume and playback speed writes straight to the <audio> element', async () => {
     render(Player, {
       proxyPath: '/data/media/s1/proxy.flac',

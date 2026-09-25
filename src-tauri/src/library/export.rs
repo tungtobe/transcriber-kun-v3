@@ -2,7 +2,7 @@
 //! the database; the IPC layer supplies the selected transcript's DB record
 //! and writes the rendered bytes after the native save dialog returns a path.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use specta::Type;
 
 use crate::core::error::{AppError, Code};
@@ -41,6 +41,17 @@ impl TranscriptExportFormat {
 pub struct TranscriptExportOutcome {
     pub saved: bool,
     pub has_gaps: bool,
+}
+
+/// Localized gap notes for the TXT formatter, supplied by the frontend (the
+/// same `session.export.gap*` i18n strings Copy already uses) so the export
+/// note matches the UI language instead of a hard-coded English string.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct GapLabels {
+    pub chunk_failed: String,
+    pub disconnected: String,
+    pub unknown: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -91,15 +102,11 @@ fn srt_timestamp(seconds: f64) -> String {
     format!("{hours:02}:{minutes:02}:{seconds:02},{millis:03}")
 }
 
-fn gap_note(row: &SegmentRow) -> &'static str {
+fn gap_note<'a>(row: &SegmentRow, labels: &'a GapLabels) -> &'a str {
     match row.gap_reason {
-        Some(crate::db::repo::segments::GapReason::ChunkFailed) => {
-            "Missing interval: transcription failed"
-        }
-        Some(crate::db::repo::segments::GapReason::Disconnected) => {
-            "Missing interval: disconnected"
-        }
-        None => "Missing interval",
+        Some(crate::db::repo::segments::GapReason::ChunkFailed) => &labels.chunk_failed,
+        Some(crate::db::repo::segments::GapReason::Disconnected) => &labels.disconnected,
+        None => &labels.unknown,
     }
 }
 
@@ -109,7 +116,7 @@ fn has_gaps(data: &TranscriptExportData) -> bool {
         .any(|segment| segment.kind == SegmentKind::Gap)
 }
 
-fn format_txt(data: &TranscriptExportData, offset_sec: f64) -> String {
+fn format_txt(data: &TranscriptExportData, offset_sec: f64, labels: &GapLabels) -> String {
     data.segments
         .iter()
         .map(|segment| match segment.kind {
@@ -122,7 +129,7 @@ fn format_txt(data: &TranscriptExportData, offset_sec: f64) -> String {
                 "[{}–{}] {}",
                 padded_timestamp(display_seconds(segment.start_sec, offset_sec)),
                 padded_timestamp(display_seconds(segment.end_sec, offset_sec)),
-                gap_note(segment)
+                gap_note(segment, labels)
             ),
         })
         .collect::<Vec<_>>()
@@ -218,9 +225,10 @@ pub fn render_transcript(
     data: &TranscriptExportData,
     format: TranscriptExportFormat,
     offset_sec: f64,
+    labels: &GapLabels,
 ) -> Result<RenderedTranscriptExport, AppError> {
     let content = match format {
-        TranscriptExportFormat::Txt => format_txt(data, safe_offset(offset_sec)),
+        TranscriptExportFormat::Txt => format_txt(data, safe_offset(offset_sec), labels),
         TranscriptExportFormat::Srt => format_srt(data, safe_offset(offset_sec)),
         TranscriptExportFormat::Json => format_json(data, offset_sec)?,
     };
@@ -280,18 +288,52 @@ mod tests {
         }
     }
 
+    /// Distinct (non-English) labels so a test that passes them and checks
+    /// the rendered output actually proves `render_transcript` used the
+    /// supplied labels instead of a hard-coded string.
+    fn labels() -> GapLabels {
+        GapLabels {
+            chunk_failed: "Khoảng này bị lỗi khi transcribe".to_string(),
+            disconnected: "Mất kết nối".to_string(),
+            unknown: "Khoảng thiếu".to_string(),
+        }
+    }
+
     #[test]
     fn txt_keeps_text_and_describes_gaps_with_offset() {
         let transcript = record(vec![
             text(0, -4.0, 2.0, "Xin chào", None),
             gap(1, 2.0, 4.5, GapReason::ChunkFailed),
         ]);
-        let output = render_transcript(&transcript, TranscriptExportFormat::Txt, 3.0).unwrap();
+        let output =
+            render_transcript(&transcript, TranscriptExportFormat::Txt, 3.0, &labels()).unwrap();
         assert_eq!(
             output.content,
-            "[00:00] Xin chào\n[00:05–00:08] Missing interval: transcription failed"
+            "[00:00] Xin chào\n[00:05–00:08] Khoảng này bị lỗi khi transcribe"
         );
         assert!(output.has_gaps);
+    }
+
+    #[test]
+    fn txt_uses_the_disconnected_and_unknown_gap_labels() {
+        let transcript = record(vec![
+            gap(0, 0.0, 1.0, GapReason::Disconnected),
+            SegmentRow {
+                idx: 1,
+                start_sec: 1.0,
+                end_sec: 2.0,
+                kind: SegmentKind::Gap,
+                gap_reason: None,
+                text: String::new(),
+                speaker: None,
+            },
+        ]);
+        let output =
+            render_transcript(&transcript, TranscriptExportFormat::Txt, 0.0, &labels()).unwrap();
+        assert_eq!(
+            output.content,
+            "[00:00–00:01] Mất kết nối\n[00:01–00:02] Khoảng thiếu"
+        );
     }
 
     #[test]
@@ -303,7 +345,8 @@ mod tests {
             text(3, 4.0, 4.0, "zero duration", None),
             text(4, 5.0, 6.0, "   ", None),
         ]);
-        let output = render_transcript(&transcript, TranscriptExportFormat::Srt, 1.0).unwrap();
+        let output =
+            render_transcript(&transcript, TranscriptExportFormat::Srt, 1.0, &labels()).unwrap();
         assert_eq!(
             output.content,
             "1\n00:00:02,234 --> 00:00:03,501\nCâu còn lại"
@@ -317,7 +360,8 @@ mod tests {
             text(0, 1.0, 2.0, "clamped to zero", None),
             text(1, 5.0, 7.0, "surviving cue", None),
         ]);
-        let output = render_transcript(&transcript, TranscriptExportFormat::Srt, -3.0).unwrap();
+        let output =
+            render_transcript(&transcript, TranscriptExportFormat::Srt, -3.0, &labels()).unwrap();
         assert_eq!(
             output.content,
             "1\n00:00:02,000 --> 00:00:04,000\nsurviving cue"
@@ -331,7 +375,7 @@ mod tests {
             gap(1, 2.5, 3.5, GapReason::Disconnected),
         ]);
         let value: serde_json::Value = serde_json::from_str(
-            &render_transcript(&transcript, TranscriptExportFormat::Json, 10.0)
+            &render_transcript(&transcript, TranscriptExportFormat::Json, 10.0, &labels())
                 .unwrap()
                 .content,
         )
@@ -348,7 +392,7 @@ mod tests {
     fn json_preserves_negative_offset_metadata_and_clamps_adjusted_timestamps() {
         let transcript = record(vec![text(0, 1.0, 2.0, "clamped", None)]);
         let value: serde_json::Value = serde_json::from_str(
-            &render_transcript(&transcript, TranscriptExportFormat::Json, -3.0)
+            &render_transcript(&transcript, TranscriptExportFormat::Json, -3.0, &labels())
                 .unwrap()
                 .content,
         )

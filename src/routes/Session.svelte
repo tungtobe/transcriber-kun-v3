@@ -4,7 +4,7 @@
   import { i18n } from '../i18n/index.svelte';
   import { commands, type RerunScope, type SessionDetail, type SessionLookup } from '../lib/bindings';
   import { registerKeymap } from '../lib/keymap';
-  import { formatTranscriptCopyText } from '../lib/transcript-export';
+  import { formatTranscriptCopyText, type GapCopyLabels } from '../lib/transcript-export';
   import { cycleTranscriptMatch, findTranscriptMatches } from '../lib/transcript-search';
   import { jobsStore } from '../lib/stores/jobs.svelte';
   import { settingsStore } from '../lib/stores/settings.svelte';
@@ -26,6 +26,15 @@
     | { kind: 'error' };
 
   let view = $state<ViewState>({ kind: 'loading' });
+  // Monotonic guard against stale async results (spec Boundaries/Always: "a
+  // load token ... captured before the `await` and compared after it"; same
+  // idea as `jobsStore`'s `generation`). Only `load()` bumps it — it alone
+  // represents "the user is now looking at a different session/id". The
+  // other async handlers (`loadDetail`, relink, export, copy) just read the
+  // current value before their own `await` and compare it after: if it
+  // changed meanwhile, the user navigated away and the result is dropped
+  // silently instead of being applied to whatever session is now shown.
+  let loadToken = 0;
   let subscribed = false;
   let cancelling = $state(false);
   let rerunStarting = $state(false);
@@ -112,7 +121,22 @@
     }, 4_000);
   }
 
+  // Reused by both Copy (client-side formatting) and Export (passed to the
+  // Rust TXT formatter) so the gap note text is always the same localized
+  // string in both places (spec Always: "The frontend passes the same
+  // `session.export.gap*` i18n strings that Copy uses"). Code Map: "reuse
+  // `GapCopyLabels`" — the export IPC call's `gapLabels` parameter has the
+  // same shape.
+  function gapLabels(): GapCopyLabels {
+    return {
+      chunkFailed: i18n.t('session.export.gapChunkFailed'),
+      disconnected: i18n.t('session.export.gapDisconnected'),
+      unknown: i18n.t('session.export.gapUnknown'),
+    };
+  }
+
   async function handleCopyTranscript(transcript: NonNullable<SessionDetail['transcript']>): Promise<void> {
+    const token = loadToken;
     transcriptActionError = null;
     transcriptToast = null;
     try {
@@ -121,15 +145,13 @@
       const text = formatTranscriptCopyText(
         transcript.segments,
         settingsStore.timestampOffsetSec,
-        {
-          chunkFailed: i18n.t('session.export.gapChunkFailed'),
-          disconnected: i18n.t('session.export.gapDisconnected'),
-          unknown: i18n.t('session.export.gapUnknown'),
-        },
+        gapLabels(),
       );
       await clipboard.writeText(text);
+      if (token !== loadToken) return;
       showTranscriptToast(i18n.t('session.export.copySuccess'));
     } catch {
+      if (token !== loadToken) return;
       transcriptActionError = i18n.t('session.export.copyError');
     }
   }
@@ -140,6 +162,7 @@
     format: 'txt' | 'srt' | 'json',
   ): Promise<void> {
     if (exporting) return;
+    const token = loadToken;
     exporting = true;
     transcriptActionError = null;
     transcriptToast = null;
@@ -149,7 +172,9 @@
         transcriptId,
         format,
         settingsStore.timestampOffsetSec,
+        gapLabels(),
       );
+      if (token !== loadToken) return;
       if (result.status !== 'ok') {
         transcriptActionError = i18n.t('session.export.exportError');
         return;
@@ -160,15 +185,18 @@
         : i18n.t('session.export.success');
       showTranscriptToast(message);
     } catch {
+      if (token !== loadToken) return;
       transcriptActionError = i18n.t('session.export.exportError');
     } finally {
-      exporting = false;
+      if (token === loadToken) exporting = false;
     }
   }
 
   async function loadDetail(sessionId: string): Promise<void> {
+    const token = loadToken;
     try {
       const result = await commands.librarySessionDetail(sessionId);
+      if (token !== loadToken) return;
       if (result.status !== 'ok') {
         view = { kind: 'error' };
         return;
@@ -179,6 +207,7 @@
       }
       view = { kind: 'saved', sessionId, detail: result.data };
     } catch {
+      if (token !== loadToken) return;
       view = { kind: 'error' };
     }
   }
@@ -197,18 +226,31 @@
   }
 
   async function load(id: string): Promise<void> {
+    // Bump the generation: this is the one place that represents "now
+    // showing a different session" (spec Always: "every async result tied
+    // to a session is applied only if the session is still the one
+    // displayed"). Everything below, and every in-flight async handler from
+    // the previous session, compares against this new value from now on.
+    const token = ++loadToken;
     view = { kind: 'loading' };
     setSearchQuery('');
     transcriptActionError = null;
     transcriptToast = null;
+    // Buttons on the incoming session must never inherit a stuck-disabled
+    // state left over from an in-flight export/relink on the session being
+    // left (spec Always: "`load()` also resets `exporting` and `relinking`").
+    exporting = false;
+    relinking = false;
     try {
       const result = await commands.librarySessionGet(id);
+      if (token !== loadToken) return;
       if (result.status === 'ok') {
         applyLookup(result.data);
       } else {
         view = { kind: 'error' };
       }
     } catch {
+      if (token !== loadToken) return;
       view = { kind: 'error' };
     }
   }
@@ -291,10 +333,12 @@
   async function handleRelinkRequest(): Promise<void> {
     if (view.kind !== 'saved' || relinking) return;
     const sessionId = view.sessionId;
+    const token = loadToken;
     relinking = true;
     relinkMessage = null;
     try {
       const result = await commands.libraryProxyRelink(sessionId);
+      if (token !== loadToken) return;
       if (result.status !== 'ok') {
         relinkMessage = i18n.t('session.player.relinkError');
         return;
@@ -314,9 +358,10 @@
           break;
       }
     } catch {
+      if (token !== loadToken) return;
       relinkMessage = i18n.t('session.player.relinkError');
     } finally {
-      relinking = false;
+      if (token === loadToken) relinking = false;
     }
   }
 </script>
