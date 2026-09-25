@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 09-22-2026 06:12
-last_updated: 09-25-2026 16:29
+last_updated: 09-26-2026 00:29
 project: transcriber_kun
 project_key: NOKEY
 tracking_system: file-system
@@ -51,16 +51,16 @@ development_status:
   epic-1-retrospective: optional
 
   epic-2: in-progress
-  2-1-media-pipeline-thuần-rust-và-kiểm-chứng-phát-flac-spike-s1-s: review
-  2-2-gemini-transcribe-adapter-theo-họ-model-và-parser-chịu-lỗi-s: review
-  2-3-lưu-phiên-và-transcript-bền-vững: review
-  2-4-job-transcribe-file-hàng-đợi-tiến-độ-và-huỷ: review
-  2-5-chịu-lỗi-chunk-khoảng-thiếu-và-chạy-lại: review
-  2-6-settings-chunking-offset-và-ngôn-ngữ-transcribe: review
-  2-7-transcript-detail-hiển-thị-trình-phát-và-click-to-seek: review
-  2-8-nhận-file-dialog-kéo-thả-kiểm-tra-định-dạng-phát-hiện-trùng: review
-  2-9-home-danh-sách-phiên-và-card-job: review
-  2-10-tìm-trong-transcript-export-và-copy: review
+  2-1-media-pipeline-thuần-rust-và-kiểm-chứng-phát-flac-spike-s1-s: done
+  2-2-gemini-transcribe-adapter-theo-họ-model-và-parser-chịu-lỗi-s: done
+  2-3-lưu-phiên-và-transcript-bền-vững: done
+  2-4-job-transcribe-file-hàng-đợi-tiến-độ-và-huỷ: done
+  2-5-chịu-lỗi-chunk-khoảng-thiếu-và-chạy-lại: done
+  2-6-settings-chunking-offset-và-ngôn-ngữ-transcribe: done
+  2-7-transcript-detail-hiển-thị-trình-phát-và-click-to-seek: done
+  2-8-nhận-file-dialog-kéo-thả-kiểm-tra-định-dạng-phát-hiện-trùng: done
+  2-9-home-danh-sách-phiên-và-card-job: done
+  2-10-tìm-trong-transcript-export-và-copy: done
   epic-2-retrospective: optional
 
   epic-3: backlog
