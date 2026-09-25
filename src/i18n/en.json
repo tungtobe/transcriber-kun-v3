@@ -296,6 +296,7 @@
   "session.job.logError": "Error ({category}): {detail}",
   "session.rerun.nothingToRerun": "There is nothing missing left to rerun.",
   "session.rerun.error": "Could not start the rerun. Try again later.",
+  "session.rerun.busy": "Another rerun for this session is already in progress.",
   "closeConfirm.dialog.title": "A task is still running",
   "closeConfirm.dialog.body": "Closing the app will cancel every transcribe task that is running or queued.",
   "closeConfirm.dialog.stay": "Stay",

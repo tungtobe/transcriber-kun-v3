@@ -296,6 +296,7 @@
   "session.job.logError": "エラー({category}): {detail}",
   "session.rerun.nothingToRerun": "再実行が必要な欠けている部分はありません。",
   "session.rerun.error": "再実行を開始できませんでした。しばらくしてからもう一度お試しください。",
+  "session.rerun.busy": "このセッションでは別の再実行がすでに進行中です。",
   "closeConfirm.dialog.title": "実行中のタスクがあります",
   "closeConfirm.dialog.body": "アプリを閉じると、実行中または待機中の文字起こしタスクはすべてキャンセルされます。",
   "closeConfirm.dialog.stay": "とどまる",

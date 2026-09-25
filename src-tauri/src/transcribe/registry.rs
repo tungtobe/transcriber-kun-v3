@@ -132,11 +132,25 @@ pub struct RerunParams {
 }
 
 /// Trả về từ `JobRegistryHandle::start_rerun` (spec Always: "Mỗi Phiên tối
-/// đa một Job Chạy lại đang chờ/chạy: gọi lại trả Job hiện có").
+/// đa một Job Chạy lại đang chờ/chạy: gọi lại trả Job hiện có" -- và "khi
+/// Phiên đã có một Job Chạy lại đang chờ/chạy với `transcript_id`/`ranges`
+/// khác, trả `Busy` thay vì xếp thêm Job thứ hai").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RerunOutcome {
-    Started { job_id: JobId },
-    Existing { job_id: JobId },
+    Started {
+        job_id: JobId,
+    },
+    /// Same session, same `transcript_id`, same `ranges` as the in-flight
+    /// rerun -- the caller's request is a duplicate of that Job.
+    Existing {
+        job_id: JobId,
+    },
+    /// Same session, but a different `transcript_id` or `ranges` than the
+    /// in-flight rerun -- never enqueued as a second Job; the caller should
+    /// surface this as a busy notice instead of an error.
+    Busy {
+        job_id: JobId,
+    },
 }
 
 /// Trả về từ `JobRegistryHandle::start` (spec 2.8 Always: "Tạo Job trong
@@ -288,6 +302,18 @@ impl JobRegistryHandle {
         response.await.map_err(|_| actor_error())
     }
 
+    /// Removes the subscriber whose `Channel::id()` matches `channel_id`, so
+    /// a closed frontend store stops holding a live `JobEvent` subscription
+    /// open. Idempotent -- an unknown id is `Ok(())` (spec Always).
+    pub async fn unsubscribe(&self, channel_id: u32) -> Result<(), AppError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::Unsubscribe { channel_id, reply })
+            .await
+            .map_err(|_| actor_error())?;
+        response.await.map_err(|_| actor_error())
+    }
+
     pub async fn is_busy(&self, session_id: SessionId) -> Result<bool, AppError> {
         let (reply, response) = oneshot::channel();
         self.commands
@@ -334,6 +360,10 @@ enum Command {
     },
     Subscribe {
         channel: Channel<JobEvent>,
+        reply: oneshot::Sender<()>,
+    },
+    Unsubscribe {
+        channel_id: u32,
         reply: oneshot::Sender<()>,
     },
     IsBusy {
@@ -398,6 +428,12 @@ struct JobEntry {
     attempt: Option<u32>,
     waiting_quota: bool,
     cancel: CancellationToken,
+    /// `Some` only for `JobKind::Rerun` -- kept on the entry itself (not just
+    /// `pending_rerun_params`, which is emptied the moment the pipeline
+    /// starts) so `handle_start_rerun`'s same-target dedup keeps working for
+    /// the whole lifetime of an in-flight rerun, running or still queued.
+    rerun_transcript_id: Option<TranscriptId>,
+    rerun_ranges: Option<Vec<RerunRange>>,
 }
 
 /// Milliseconds are kept as `u64` everywhere internally (source durations
@@ -492,6 +528,11 @@ impl JobRegistryActor {
             Command::StartRerun { params, reply } => self.handle_start_rerun(params, reply),
             Command::Cancel { job_id, reply } => self.handle_cancel(job_id, reply),
             Command::Subscribe { channel, reply } => self.handle_subscribe(channel, reply),
+            Command::Unsubscribe { channel_id, reply } => {
+                self.subscribers
+                    .retain(|channel| channel.id() != channel_id);
+                let _ = reply.send(());
+            }
             Command::IsBusy { session_id, reply } => {
                 let busy = self
                     .jobs
@@ -547,6 +588,8 @@ impl JobRegistryActor {
             attempt: None,
             waiting_quota: false,
             cancel: CancellationToken::new(),
+            rerun_transcript_id: None,
+            rerun_ranges: None,
         };
         self.order.push_back(job_id);
         self.jobs.insert(job_id, entry);
@@ -573,15 +616,25 @@ impl JobRegistryActor {
     }
 
     /// Chạy lại (2.5): trả `Existing` nếu Phiên đã có một Job Chạy lại đang
-    /// chờ/chạy (spec Always: "Mỗi Phiên tối đa một Job Chạy lại đang
-    /// chờ/chạy"), ngược lại tạo Job mới trong cùng hàng đợi.
+    /// chờ/chạy với cùng `transcript_id` và `ranges` (spec Always: "Mỗi Phiên
+    /// tối đa một Job Chạy lại đang chờ/chạy"); nếu Job đang chờ/chạy đó nhắm
+    /// `transcript_id`/`ranges` khác, trả `Busy` thay vì xếp thêm Job thứ hai
+    /// cho cùng Phiên. Không có Job Chạy lại nào đang chờ/chạy -> tạo Job mới
+    /// trong cùng hàng đợi.
     fn handle_start_rerun(&mut self, params: RerunParams, reply: oneshot::Sender<RerunOutcome>) {
         let existing = self.jobs.iter().find_map(|(job_id, entry)| {
             (entry.session_id == params.session_id && entry.kind == JobKind::Rerun)
-                .then_some(*job_id)
+                .then_some((*job_id, entry))
         });
-        if let Some(job_id) = existing {
-            let _ = reply.send(RerunOutcome::Existing { job_id });
+        if let Some((job_id, entry)) = existing {
+            let same_target = entry.rerun_transcript_id == Some(params.transcript_id)
+                && entry.rerun_ranges.as_deref() == Some(params.ranges.as_slice());
+            let outcome = if same_target {
+                RerunOutcome::Existing { job_id }
+            } else {
+                RerunOutcome::Busy { job_id }
+            };
+            let _ = reply.send(outcome);
             return;
         }
 
@@ -606,6 +659,8 @@ impl JobRegistryActor {
             attempt: None,
             waiting_quota: false,
             cancel: CancellationToken::new(),
+            rerun_transcript_id: Some(params.transcript_id),
+            rerun_ranges: Some(params.ranges.clone()),
         };
         self.order.push_back(job_id);
         self.jobs.insert(job_id, entry);
@@ -1789,6 +1844,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unsubscribe_stops_delivering_events_and_is_idempotent_for_an_unknown_id() {
+        // Spec I/O Matrix "Unsubscribe": "subscribe rồi unsubscribe(id) ->
+        // channel không còn nhận event nữa"; "unknown id -> Ok".
+        let root = tempdir().unwrap();
+        let source = wav_fixture(root.path(), "a.wav");
+        let transcriber = FakeTranscriber::new(vec![Behavior::Success("xin chào".to_string())]);
+        let handle = registry_for_test(root.path(), transcriber);
+        let (channel, received) = test_channel();
+        let channel_id = channel.id();
+        handle.subscribe(channel).await.unwrap();
+
+        handle.unsubscribe(channel_id).await.unwrap();
+        // Unknown id is Ok, and unsubscribing twice is Ok too.
+        handle.unsubscribe(channel_id).await.unwrap();
+        handle.unsubscribe(987_654_321).await.unwrap();
+
+        let events_before = received.lock().unwrap().len();
+        start_new(&handle, start_params(source, "hash-unsub")).await;
+        wait_until_empty(&handle, Duration::from_secs(5)).await;
+        let events_after = received.lock().unwrap().len();
+        assert_eq!(
+            events_before, events_after,
+            "channel đã unsubscribe không được nhận thêm JobEvent nào"
+        );
+    }
+
+    #[tokio::test]
     async fn happy_path_commits_and_emits_a_result_event() {
         let root = tempdir().unwrap();
         let source = wav_fixture(root.path(), "a.wav");
@@ -2770,6 +2852,132 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rerun_with_discard_old_commits_only_the_new_segments() {
+        // IPC wiring: `RerunParams.discard_old` (mapped 1:1 from
+        // `scope == RerunScope::All` in `transcribe_rerun_inner`) actually
+        // reaches the registry pipeline -- `true` drops every old segment
+        // (even ones outside the requested ranges), so the committed
+        // transcript holds only what the transcriber just returned.
+        let root = tempdir().unwrap();
+        let db = Arc::new(Db::open(root.path()).unwrap());
+        seed_current_consent(&db);
+        let session_id = SessionId::new();
+        let old_transcript_id = TranscriptId::new();
+        let proxy_path = seed_partial_session(
+            root.path(),
+            &db,
+            session_id,
+            old_transcript_id,
+            4.0,
+            &[
+                rerun_text_draft(0.0, 1.0, "hello"),
+                rerun_gap_draft(1.0, 2.0),
+                rerun_text_draft(2.0, 3.0, "hello"),
+                rerun_gap_draft(3.0, 4.0),
+            ],
+        );
+        let ranges = resolved_missing_ranges(&db, old_transcript_id, 4_000);
+        assert_eq!(ranges.len(), 2, "hai gap phải giải ra đúng hai vùng");
+
+        let transcriber = FakeTranscriber::new(vec![
+            Behavior::Success("vá 1".to_string()),
+            Behavior::Success("vá 2".to_string()),
+        ]);
+        let (handle, actor) = channel(db.clone(), root.path().to_path_buf(), transcriber.clone());
+        tokio::spawn(actor.run());
+
+        let outcome = handle
+            .start_rerun(RerunParams {
+                session_id,
+                transcript_id: old_transcript_id,
+                ranges,
+                discard_old: true,
+                proxy_path,
+                model: "gemini-flash-lite-latest".to_string(),
+                language: TranscribeLanguage::Auto,
+                chunk_minutes: 5,
+                consent: ConsentSnapshot::new(1, false),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(outcome, RerunOutcome::Started { .. }));
+        wait_until_empty(&handle, Duration::from_secs(5)).await;
+
+        let new_transcript_id = db
+            .with_connection(|conn| Ok(repo::transcripts::primary_for_session(conn, session_id)?))
+            .unwrap()
+            .unwrap();
+        let segments = db
+            .with_connection(|conn| {
+                Ok(repo::segments::list_for_transcript(
+                    conn,
+                    new_transcript_id,
+                )?)
+            })
+            .unwrap();
+        assert_eq!(
+            segments.iter().map(|s| s.text.as_str()).collect::<Vec<_>>(),
+            vec!["vá 1", "vá 2"],
+            "discard_old=true phải bỏ hẳn Segment cũ ngoài vùng, chỉ giữ Segment mới"
+        );
+    }
+
+    #[tokio::test]
+    async fn rerun_with_chunk_minutes_of_one_splits_a_150_second_range_into_three_chunks() {
+        // IPC wiring: `RerunParams.chunk_minutes` (captured from
+        // `settings.chunk_minutes` in `transcribe_rerun_inner`, same as
+        // `StartParams.chunk_minutes`) actually drives the rerun pipeline's
+        // decode chunking, not just the transcribe-file pipeline's.
+        let root = tempdir().unwrap();
+        let db = Arc::new(Db::open(root.path()).unwrap());
+        seed_current_consent(&db);
+        let session_id = SessionId::new();
+        let old_transcript_id = TranscriptId::new();
+        let proxy_path = seed_partial_session(
+            root.path(),
+            &db,
+            session_id,
+            old_transcript_id,
+            150.0,
+            &[rerun_gap_draft(0.0, 150.0)],
+        );
+        let ranges = resolved_missing_ranges(&db, old_transcript_id, 150_000);
+        assert_eq!(ranges.len(), 1);
+
+        let transcriber = FakeTranscriber::new(vec![
+            Behavior::Success("một".to_string()),
+            Behavior::Success("hai".to_string()),
+            Behavior::Success("ba".to_string()),
+        ]);
+        let (handle, actor) = channel(db.clone(), root.path().to_path_buf(), transcriber.clone());
+        tokio::spawn(actor.run());
+
+        let outcome = handle
+            .start_rerun(RerunParams {
+                session_id,
+                transcript_id: old_transcript_id,
+                ranges,
+                discard_old: true,
+                proxy_path,
+                model: "gemini-flash-lite-latest".to_string(),
+                language: TranscribeLanguage::Auto,
+                chunk_minutes: 1,
+                consent: ConsentSnapshot::new(1, false),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(outcome, RerunOutcome::Started { .. }));
+        wait_until_empty(&handle, Duration::from_secs(10)).await;
+
+        assert_eq!(
+            transcriber.call_count(),
+            3,
+            "chunk_minutes=1 trên vùng 150s phải chia thành 3 Chunk"
+        );
+        assert_eq!(transcriber.chunk_start_ms(), vec![0, 60_000, 120_000]);
+    }
+
+    #[tokio::test]
     async fn rerun_consent_revoked_after_the_first_range_stops_before_the_second_and_does_not_swap()
     {
         // Same per-chunk consent re-check as file transcribe (spec
@@ -2829,6 +3037,7 @@ mod tests {
         let job_id = match outcome {
             RerunOutcome::Started { job_id } => job_id,
             RerunOutcome::Existing { .. } => panic!("expected a new Chạy lại Job"),
+            RerunOutcome::Busy { .. } => panic!("expected Started, not Busy"),
         };
         wait_until_empty(&handle, Duration::from_secs(5)).await;
 
@@ -3002,6 +3211,7 @@ mod tests {
         let job_id = match outcome {
             RerunOutcome::Started { job_id } => job_id,
             RerunOutcome::Existing { .. } => panic!("phải là Job mới"),
+            RerunOutcome::Busy { .. } => panic!("expected Started, not Busy"),
         };
         wait_until_empty(&handle, Duration::from_secs(5)).await;
 
@@ -3071,6 +3281,7 @@ mod tests {
         let job_id = match outcome {
             RerunOutcome::Started { job_id } => job_id,
             RerunOutcome::Existing { .. } => panic!("phải là Job mới"),
+            RerunOutcome::Busy { .. } => panic!("expected Started, not Busy"),
         };
         wait_until_state(&handle, job_id, JobState::Running).await;
         handle.cancel(job_id).await.unwrap();
@@ -3126,6 +3337,7 @@ mod tests {
         let job_id = match first {
             RerunOutcome::Started { job_id } => job_id,
             RerunOutcome::Existing { .. } => panic!("phải là Job mới lần đầu"),
+            RerunOutcome::Busy { .. } => panic!("expected Started, not Busy"),
         };
         wait_until_state(&handle, job_id, JobState::Running).await;
 
@@ -3139,6 +3351,76 @@ mod tests {
                 .count(),
             1,
             "registry vẫn chỉ có một Job Chạy lại cho Phiên này"
+        );
+
+        handle.cancel(job_id).await.unwrap();
+        wait_until_empty(&handle, Duration::from_secs(2)).await;
+    }
+
+    #[tokio::test]
+    async fn rerun_calling_again_for_a_different_target_returns_busy_without_a_second_job() {
+        // Spec I/O Matrix "Different rerun": "gap(3) running, gap(7)
+        // requested -> Busy, no new job".
+        let root = tempdir().unwrap();
+        let db = Arc::new(Db::open(root.path()).unwrap());
+        seed_current_consent(&db);
+        let session_id = SessionId::new();
+        let old_transcript_id = TranscriptId::new();
+        let proxy_path = seed_partial_session(
+            root.path(),
+            &db,
+            session_id,
+            old_transcript_id,
+            2.0,
+            &[
+                rerun_text_draft(0.0, 1.0, "hello"),
+                rerun_gap_draft(1.0, 2.0),
+            ],
+        );
+        let ranges = resolved_missing_ranges(&db, old_transcript_id, 2_000);
+
+        let transcriber = FakeTranscriber::new(vec![Behavior::BlockUntilCancelled]);
+        let (handle, actor) = channel(db.clone(), root.path().to_path_buf(), transcriber);
+        tokio::spawn(actor.run());
+
+        let params = RerunParams {
+            session_id,
+            transcript_id: old_transcript_id,
+            ranges,
+            discard_old: false,
+            proxy_path,
+            model: "gemini-flash-lite-latest".to_string(),
+            language: TranscribeLanguage::Auto,
+            chunk_minutes: 5,
+            consent: ConsentSnapshot::new(1, false),
+        };
+        let first = handle.start_rerun(params.clone()).await.unwrap();
+        let job_id = match first {
+            RerunOutcome::Started { job_id } => job_id,
+            RerunOutcome::Existing { .. } => panic!("phải là Job mới lần đầu"),
+            RerunOutcome::Busy { .. } => panic!("expected Started, not Busy"),
+        };
+        wait_until_state(&handle, job_id, JobState::Running).await;
+
+        // Same session, same transcript, but a different range than the
+        // in-flight rerun.
+        let mut different = params.clone();
+        different.ranges = vec![RerunRange {
+            start_sample: 0,
+            start_ms: 0,
+            end_sample: 8_000,
+            end_ms: 500,
+        }];
+        let second = handle.start_rerun(different).await.unwrap();
+        assert_eq!(second, RerunOutcome::Busy { job_id });
+
+        let jobs = handle.snapshot().await.unwrap();
+        assert_eq!(
+            jobs.iter()
+                .filter(|job| job.session_id == session_id)
+                .count(),
+            1,
+            "Busy không được xếp thêm Job Chạy lại thứ hai cho cùng Phiên"
         );
 
         handle.cancel(job_id).await.unwrap();
@@ -3261,6 +3543,7 @@ mod tests {
         let job_id = match outcome {
             RerunOutcome::Started { job_id } => job_id,
             RerunOutcome::Existing { .. } => panic!("phải là Job mới"),
+            RerunOutcome::Busy { .. } => panic!("expected Started, not Busy"),
         };
         wait_until_empty(&handle, Duration::from_secs(5)).await;
 

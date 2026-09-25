@@ -81,9 +81,14 @@ pub fn boot<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
         // Story 2.3 AD-18: dọn mọi thứ một crash giữa publish và commit có
         // thể để lại (`library::store::reconcile`) — non-fatal, root là
         // `app_data_dir` giống `Db::open` ở trên (cùng gốc chứa `media/`).
-        if let Ok(data_dir) = app.path().app_data_dir() {
-            if let Err(err) = crate::library::store::reconcile(db, &data_dir) {
-                tracing::warn!(error = %err, "không reconcile được thư viện lúc boot");
+        match app.path().app_data_dir() {
+            Ok(data_dir) => {
+                if let Err(err) = crate::library::store::reconcile(db, &data_dir) {
+                    tracing::warn!(error = %err, "không reconcile được thư viện lúc boot");
+                }
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "không resolve được thư mục dữ liệu, bỏ qua reconcile lúc boot");
             }
         }
     }

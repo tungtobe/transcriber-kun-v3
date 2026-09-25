@@ -3,12 +3,16 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
   jobsSubscribe: vi.fn(),
+  jobsUnsubscribe: vi.fn(),
   jobsCancel: vi.fn(),
   transcribeStart: vi.fn(),
   transcribeRerun: vi.fn(),
 }));
 
+let nextFakeChannelId = 1;
+
 class FakeChannel<T> {
+  id = nextFakeChannelId++;
   onmessage: (event: T) => void = () => {};
 }
 
@@ -19,6 +23,7 @@ vi.mock('@tauri-apps/api/core', () => ({
 vi.mock('../bindings', () => ({
   commands: {
     jobsSubscribe: (...args: unknown[]) => mocks.jobsSubscribe(...args),
+    jobsUnsubscribe: (...args: unknown[]) => mocks.jobsUnsubscribe(...args),
     jobsCancel: (...args: unknown[]) => mocks.jobsCancel(...args),
     transcribeStart: (...args: unknown[]) => mocks.transcribeStart(...args),
     transcribeRerun: (...args: unknown[]) => mocks.transcribeRerun(...args),
@@ -48,6 +53,7 @@ describe('jobsStore', () => {
   beforeEach(() => {
     vi.resetModules();
     mocks.jobsSubscribe.mockReset();
+    mocks.jobsUnsubscribe.mockReset();
     mocks.jobsCancel.mockReset();
     mocks.transcribeStart.mockReset();
     mocks.transcribeRerun.mockReset();
@@ -56,6 +62,7 @@ describe('jobsStore', () => {
       capturedChannel = channel;
       return Promise.resolve({ status: 'ok', data: null });
     });
+    mocks.jobsUnsubscribe.mockResolvedValue({ status: 'ok', data: null });
   });
 
   it('applies a snapshot then keeps jobs in sync as updated/result events arrive', async () => {
@@ -280,6 +287,31 @@ describe('jobsStore', () => {
 
     capturedChannel!.onmessage({ kind: 'result', seq: 5, jobId: 'b', sessionId: 'session-b' });
     expect(store.resultSeq).toBe(2);
+  });
+
+  it('unsubscribe releases the Channel backend-side via jobsUnsubscribe(channel.id)', async () => {
+    const { createJobsStore } = await import('./jobs.svelte');
+    const store = createJobsStore();
+
+    await store.subscribe();
+    const channelId = capturedChannel!.id;
+    expect(mocks.jobsUnsubscribe).not.toHaveBeenCalled();
+
+    store.unsubscribe();
+    expect(mocks.jobsUnsubscribe).toHaveBeenCalledTimes(1);
+    expect(mocks.jobsUnsubscribe).toHaveBeenCalledWith(channelId);
+  });
+
+  it('rerun passes the busy outcome through untouched', async () => {
+    mocks.transcribeRerun.mockResolvedValueOnce({
+      status: 'ok',
+      data: { kind: 'busy', jobId: 'j1' },
+    });
+    const { createJobsStore } = await import('./jobs.svelte');
+    const store = createJobsStore();
+
+    const outcome = await store.rerun('s1', 't1', { kind: 'gap', gapId: 7 });
+    expect(outcome).toEqual({ kind: 'busy', jobId: 'j1' });
   });
 
   it('cancel returns the outcome on success and null on failure', async () => {

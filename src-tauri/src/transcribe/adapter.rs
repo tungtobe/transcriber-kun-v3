@@ -75,7 +75,8 @@ fn model_id(model: &str) -> Result<&str, AppError> {
     {
         return Err(AppError::new(Code::Model, "Gemini model ID is invalid"));
     }
-    if id.contains("transcribe") || id.contains("live-translate") {
+    let lowercase_id = id.to_ascii_lowercase();
+    if lowercase_id.contains("transcribe") || lowercase_id.contains("live-translate") {
         return Err(AppError::new(
             Code::Model,
             "Select a general Gemini model for file transcription",
@@ -247,6 +248,21 @@ mod tests {
         assert!(
             build_general_request("models/../oops", &chunk(), TranscribeLanguage::Auto).is_err()
         );
+    }
+
+    #[test]
+    fn model_guard_rejects_mixed_case_transcribe_and_live_translate_ids() {
+        // Spec I/O Matrix "Mixed-case model": `Gemini-2.5-Transcribe` must be
+        // rejected the same as its lowercase form (`Code::Model`).
+        for model in [
+            "Gemini-2.5-Transcribe",
+            "GEMINI-3.5-TRANSCRIBE",
+            "models/Gemini-3.5-Live-Translate-Preview",
+        ] {
+            let error =
+                build_general_request(model, &chunk(), TranscribeLanguage::Auto).unwrap_err();
+            assert_eq!(error.code, Code::Model);
+        }
     }
 
     #[test]

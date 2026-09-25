@@ -275,6 +275,13 @@
         rerunError = i18n.t('session.rerun.nothingToRerun');
         return;
       }
+      if (outcome.kind === 'busy') {
+        // Spec Always: a different in-flight rerun for this session -- treat
+        // like an error notice, never navigate as if this request started
+        // anything.
+        rerunError = i18n.t('session.rerun.busy');
+        return;
+      }
       view = { kind: 'job', jobId: outcome.jobId, sessionId };
     } finally {
       rerunStarting = false;

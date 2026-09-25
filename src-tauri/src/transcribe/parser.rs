@@ -68,11 +68,27 @@ pub fn parse_general_response(body: &str, chunk: &Chunk) -> Result<ChunkTranscri
     Ok(result)
 }
 
+/// Strips a leading ```` ``` ```` or ```` ```json ```` code fence
+/// case-insensitively, allowing optional whitespace between the backticks
+/// and the `json` label (spec Always: "parser strips a leading code fence
+/// case-insensitively, with optional whitespace between ``` and json").
+fn strip_leading_fence(text: &str) -> &str {
+    let Some(after_backticks) = text.strip_prefix("```") else {
+        return text;
+    };
+    let after_ws = after_backticks.trim_start();
+    let consumed_ws = after_backticks.len() - after_ws.len();
+    let is_json_label =
+        after_ws.len() >= 4 && after_ws.as_bytes()[..4].eq_ignore_ascii_case(b"json");
+    if is_json_label {
+        &after_backticks[consumed_ws + 4..]
+    } else {
+        after_backticks
+    }
+}
+
 pub fn parse_general_text(text: &str, chunk: &Chunk) -> Result<ChunkTranscript, AppError> {
-    let clean = text
-        .trim()
-        .trim_start_matches("```json")
-        .trim_start_matches("```")
+    let clean = strip_leading_fence(text.trim())
         .trim_end_matches("```")
         .trim();
     if clean.is_empty() {
@@ -281,6 +297,17 @@ mod tests {
                 .unwrap()
                 .confirmed_silence
         );
+        // Spec I/O Matrix "Upper fence silence": an upper-case ```` ```JSON
+        // ```` fence, with or without whitespace before the label, still
+        // strips to a fenced `[]` and yields confirmed silence.
+        for fenced in ["```JSON\n[]\n```", "``` JSON\n[]\n```", "```Json\n[]\n```"] {
+            assert!(
+                parse_general_text(fenced, &chunk())
+                    .unwrap()
+                    .confirmed_silence,
+                "{fenced} must parse as confirmed silence"
+            );
+        }
         assert!(parse_general_text("", &chunk()).is_err());
         assert!(parse_general_response("{\"candidates\":[]}", &chunk()).is_err());
         assert!(parse_general_response(
