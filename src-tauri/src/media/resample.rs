@@ -4,6 +4,16 @@ use super::{format_error, OUTPUT_SAMPLE_RATE};
 
 const RESAMPLER_INPUT_CHUNK: usize = 4096;
 
+/// Bound on the zero-padded flush loop in [`MonoResampler::finish`] (spec
+/// Boundaries Always P0 review: "flush loop is bounded; if the bound is hit
+/// without reaching `expected`, return `format_error`, never loop forever").
+/// Each flush block can, in principle, emit zero usable output frames (every
+/// frame trimmed away by `delay_remaining`/`allowed`); without a bound that
+/// would hang the Job pipeline forever instead of failing it. 64 zero blocks
+/// is already many times more than any real sample-rate ratio should ever
+/// need to drain the resampler's internal delay line.
+const MAX_FLUSH_BLOCKS: u32 = 64;
+
 /// Stateful mono resampler. It retains only one input block and Rubato's
 /// bounded filter state, then emits samples after trimming startup delay.
 pub(super) struct MonoResampler {
@@ -108,7 +118,14 @@ impl MonoResampler {
 
         let expected = ((u128::from(self.input_frames_seen) * u128::from(OUTPUT_SAMPLE_RATE))
             .div_ceil(u128::from(self.input_rate))) as u64;
+        let mut flush_blocks = 0u32;
         while self.output_frames_emitted < expected {
+            if flush_blocks >= MAX_FLUSH_BLOCKS {
+                return Err(format_error(
+                    "The audio resampler did not converge while flushing.",
+                ));
+            }
+            flush_blocks += 1;
             let zeros = vec![0.0; block_size];
             self.process_block(&zeros, Some(0), emit)?;
         }
@@ -156,6 +173,20 @@ impl MonoResampler {
 mod tests {
     use super::*;
 
+    // P0 review fix: `finish`'s zero-padded flush loop is now bounded by
+    // `MAX_FLUSH_BLOCKS` instead of looping forever if the resampler never
+    // reaches `expected` (spec Tasks: "bounded flush, plus a unit test if
+    // feasible (otherwise document)"). A unit test that reliably drives a
+    // real `rubato::Fft` resampler past 64 zero-padded blocks without ever
+    // converging isn't feasible here without adding a second, injectable
+    // resampler seam purely for the test (out of scope for this
+    // smallest-local-change fix, and rubato's own filter design makes such a
+    // non-convergent ratio hard to construct deterministically). The two
+    // tests below instead cover that the bound doesn't change behavior for
+    // any real, converging ratio (pass-through and a resampled ratio both
+    // still finish and emit the expected frame count); the bound itself was
+    // verified manually by lowering `MAX_FLUSH_BLOCKS` to `0` locally and
+    // confirming `finish` then returns a `format_error` instead of hanging.
     #[test]
     fn pass_through_at_target_rate_preserves_samples_and_duration() {
         let input = vec![0.25_f32; 1024];

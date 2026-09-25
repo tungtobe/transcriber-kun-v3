@@ -9,12 +9,16 @@
   import { i18n } from '../../i18n/index.svelte';
   import { settingsStore } from '../../lib/stores/settings.svelte';
 
-  /** Rỗng, không phải số nguyên, hoặc nhỏ hơn `min` -> `null` (không lưu). */
-  function parseIntegerAtLeast(value: string, min: number): number | null {
+  // Mirrors `settings::MAX_CHUNK_MINUTES` (Rust, P0 review fix).
+  const MAX_CHUNK_MINUTES = 60;
+
+  /** Rỗng, không phải số nguyên, nhỏ hơn `min`, hoặc lớn hơn `max` (nếu có) -> `null` (không lưu). */
+  function parseIntegerAtLeast(value: string, min: number, max?: number): number | null {
     const trimmed = value.trim();
     if (!/^-?\d+$/.test(trimmed)) return null;
     const parsed = Number(trimmed);
     if (!Number.isSafeInteger(parsed) || parsed < min) return null;
+    if (max !== undefined && parsed > max) return null;
     return parsed;
   }
 
@@ -23,12 +27,12 @@
 
   function handleChunkMinutesInput(event: Event): void {
     const value = (event.currentTarget as HTMLInputElement).value;
-    chunkMinutesError = parseIntegerAtLeast(value, 1) === null;
+    chunkMinutesError = parseIntegerAtLeast(value, 1, MAX_CHUNK_MINUTES) === null;
   }
 
   function commitChunkMinutes(event: Event): void {
     const value = (event.currentTarget as HTMLInputElement).value;
-    const parsed = parseIntegerAtLeast(value, 1);
+    const parsed = parseIntegerAtLeast(value, 1, MAX_CHUNK_MINUTES);
     if (parsed === null) {
       chunkMinutesError = true;
       return;
@@ -65,6 +69,8 @@
       id="settings-chunking-minutes"
       inputmode="numeric"
       autocomplete="off"
+      min="1"
+      max={MAX_CHUNK_MINUTES}
       value={settingsStore.chunkMinutes}
       aria-invalid={chunkMinutesError ? 'true' : undefined}
       oninput={handleChunkMinutesInput}

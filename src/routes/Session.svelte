@@ -135,6 +135,7 @@
   }
 
   async function handleExportTranscript(
+    sessionId: string,
     transcriptId: string,
     format: 'txt' | 'srt' | 'json',
   ): Promise<void> {
@@ -144,6 +145,7 @@
     transcriptToast = null;
     try {
       const result = await commands.libraryTranscriptExport(
+        sessionId,
         transcriptId,
         format,
         settingsStore.timestampOffsetSec,
@@ -371,13 +373,13 @@
           </button>
         </div>
         <div class="transcript-export-actions">
-          <button type="button" class="transcript-toolbar-button" disabled={exporting} onclick={() => handleExportTranscript(transcript.id, 'txt')}>
+          <button type="button" class="transcript-toolbar-button" disabled={exporting} onclick={() => handleExportTranscript(sessionId, transcript.id, 'txt')}>
             {i18n.t('session.export.txt')}
           </button>
-          <button type="button" class="transcript-toolbar-button" disabled={exporting} onclick={() => handleExportTranscript(transcript.id, 'srt')}>
+          <button type="button" class="transcript-toolbar-button" disabled={exporting} onclick={() => handleExportTranscript(sessionId, transcript.id, 'srt')}>
             {i18n.t('session.export.srt')}
           </button>
-          <button type="button" class="transcript-toolbar-button" disabled={exporting} onclick={() => handleExportTranscript(transcript.id, 'json')}>
+          <button type="button" class="transcript-toolbar-button" disabled={exporting} onclick={() => handleExportTranscript(sessionId, transcript.id, 'json')}>
             {i18n.t('session.export.json')}
           </button>
           <button type="button" class="transcript-toolbar-button transcript-copy-button" onclick={() => handleCopyTranscript(transcript)}>

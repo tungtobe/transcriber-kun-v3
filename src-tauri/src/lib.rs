@@ -46,12 +46,17 @@ pub fn run() {
                 let window = window.clone();
                 tauri::async_runtime::spawn(async move {
                     let state = window.state::<ipc::boot::AppState>();
+                    // P0 review fix: when the registry actor is unreachable
+                    // (`snapshot()` returns `Err`), fail closed -- treat it as
+                    // busy and emit `CloseRequested` instead of silently
+                    // exiting mid-Job (spec Boundaries Always: "khi
+                    // `jobs.snapshot()` trả `Err`, coi là bận").
                     let busy = match &state.jobs {
                         Ok(jobs) => jobs
                             .snapshot()
                             .await
                             .map(|jobs| !jobs.is_empty())
-                            .unwrap_or(false),
+                            .unwrap_or(true),
                         Err(_) => false,
                     };
                     if busy {

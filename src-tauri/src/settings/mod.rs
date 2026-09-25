@@ -66,6 +66,12 @@ impl TranscribeLanguage {
 /// `load` fallback về khi khoá thiếu hoặc hỏng.
 const DEFAULT_CHUNK_MINUTES: u32 = 5;
 
+/// Trần trên của `chunkMinutes` (spec Boundaries Always P0 review: "là số
+/// nguyên trong `1..=60`") -- một giá trị lớn hơn từng bị `Chunker::new`
+/// hiểu là "cấp phát trước ngần này mẫu" và có thể abort tiến trình
+/// (`Vec::with_capacity` OOM) trước khi kịp validate lại ở `media::chunk`.
+const MAX_CHUNK_MINUTES: u32 = 60;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
@@ -239,14 +245,14 @@ pub fn load(db: &Db) -> Settings {
     let live_model = load_model_field(&raw, KEY_LIVE_MODEL, DEFAULT_LIVE_MODEL);
     let memo_model = load_model_field(&raw, KEY_MEMO_MODEL, DEFAULT_MEMO_MODEL);
 
-    // `chunk_minutes` fallback độc lập: một giá trị parse được nhưng < 1
-    // (không thể xảy ra qua `save`, nhưng có thể qua hàng bị sửa tay) fallback
-    // giống hệt JSON hỏng (spec Boundaries Always: "chunk_minutes là số
-    // nguyên >= 1").
+    // `chunk_minutes` fallback độc lập: một giá trị parse được nhưng ngoài
+    // `1..=MAX_CHUNK_MINUTES` (không thể xảy ra qua `save`, nhưng có thể qua
+    // hàng bị sửa tay) fallback giống hệt JSON hỏng (spec Boundaries Always:
+    // "chunkMinutes là số nguyên trong 1..=60").
     let chunk_minutes = match raw.get(KEY_CHUNK_MINUTES) {
         None => DEFAULT_CHUNK_MINUTES,
         Some(value) => match serde_json::from_str::<u32>(value) {
-            Ok(parsed) if parsed >= 1 => parsed,
+            Ok(parsed) if (1..=MAX_CHUNK_MINUTES).contains(&parsed) => parsed,
             _ => {
                 tracing::warn!(
                     key = KEY_CHUNK_MINUTES,
@@ -309,14 +315,15 @@ fn require_non_blank_model(field: &str, value: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-/// Từ chối `chunkMinutes < 1` trước khi ghi (spec Boundaries Always: "Rust
-/// `settings::save` cũng từ chối (`Code::Format`)"). `timestampOffsetSec`
-/// không cần kiểm tương tự -- kiểu `u32` đã loại âm.
+/// Từ chối `chunkMinutes` ngoài `1..=MAX_CHUNK_MINUTES` trước khi ghi (spec
+/// Boundaries Always P0 review: "chunkMinutes là số nguyên trong 1..=60 ...
+/// Rust `settings::save` từ chối các giá trị ngoài khoảng (`Code::Format`)").
+/// `timestampOffsetSec` không cần kiểm tương tự -- kiểu `u32` đã loại âm.
 fn require_min_chunk_minutes(value: u32) -> Result<(), AppError> {
-    if value < 1 {
+    if !(1..=MAX_CHUNK_MINUTES).contains(&value) {
         return Err(AppError::new(
             Code::Format,
-            "chunkMinutes phải là số nguyên lớn hơn hoặc bằng 1",
+            format!("chunkMinutes phải là số nguyên từ 1 đến {MAX_CHUNK_MINUTES}"),
         ));
     }
     Ok(())
@@ -998,6 +1005,80 @@ mod tests {
         db.with_connection(|conn| {
             conn.execute(
                 "INSERT INTO settings (key, value) VALUES ('chunkMinutes', '0')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(load(&db).chunk_minutes, 5);
+    }
+
+    // P0 review fix: `chunkMinutes` now has an upper bound too, closing the
+    // hole where a huge stored/typed value reached `Chunker::new` and could
+    // abort the process via an oversized `Vec::with_capacity` (spec I/O
+    // Matrix "Save chunk 61" / "Load corrupt chunk" / "Save chunk 60").
+
+    #[test]
+    fn save_rejects_chunk_minutes_above_max() {
+        let db = open_db();
+        let err = save(
+            &db,
+            &Settings {
+                chunk_minutes: 61,
+                ..Default::default()
+            },
+        )
+        .expect_err("chunkMinutes = 61 phải bị từ chối");
+
+        assert_eq!(err.category, Category::Format);
+    }
+
+    #[test]
+    fn save_rejecting_chunk_minutes_above_max_does_not_write_any_row() {
+        let db = open_db();
+        let previously_saved = Settings {
+            chunk_minutes: 7,
+            ..Default::default()
+        };
+        save(&db, &previously_saved).unwrap();
+
+        let err = save(
+            &db,
+            &Settings {
+                chunk_minutes: 61,
+                ..Default::default()
+            },
+        )
+        .expect_err("phải từ chối trước khi ghi");
+        assert_eq!(err.category, Category::Format);
+
+        assert_eq!(load(&db), previously_saved);
+    }
+
+    #[test]
+    fn save_accepts_max_chunk_minutes() {
+        let db = open_db();
+        let expected = Settings {
+            chunk_minutes: 60,
+            ..Default::default()
+        };
+
+        save(&db, &expected).unwrap();
+
+        assert_eq!(load(&db), expected);
+    }
+
+    /// A hand-edited row of `5000` parses fine as a `u32` but is above the
+    /// new ceiling -- `load` must fall back exactly like a parse failure or a
+    /// too-small value (spec I/O Matrix "Load corrupt chunk: DB row 5000 ->
+    /// chunk_minutes = 5").
+    #[test]
+    fn oversized_chunk_minutes_row_falls_back_to_default_like_corrupt_json() {
+        let db = open_db();
+        db.with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO settings (key, value) VALUES ('chunkMinutes', '5000')",
                 [],
             )?;
             Ok(())

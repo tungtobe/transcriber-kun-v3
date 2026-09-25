@@ -28,6 +28,7 @@ use crate::db::Db;
 use crate::gemini::{CancellationToken, ConsentSnapshot, GeminiGateway, JobObserver};
 use crate::library::store::{self, FileSessionDraft, SessionDraft, TranscriptDraft};
 use crate::media::{self, Chunk, ChunkBudget, ChunkOptions, Chunker};
+use crate::settings;
 use crate::settings::TranscribeLanguage;
 use crate::transcribe::adapter::{transcribe_chunk_observed, TranscribeFailure};
 use crate::transcribe::merge::{splice_rerun, MergeBuilder};
@@ -814,6 +815,30 @@ fn is_fatal(error: &AppError) -> bool {
     )
 }
 
+fn consent_revoked_error() -> AppError {
+    // Content-free: never logs/echoes the consent values themselves, only
+    // that the Job is stopping because of them.
+    AppError::new(Code::Blocked, "consent is no longer current")
+}
+
+/// Re-reads Settings from `db` and checks whether consent is still current
+/// (spec Boundaries Always P0 review: "Consent is re-read from settings
+/// before every chunk send (file transcribe and rerun). If it is no longer
+/// current, the Job stops with a `Code::Blocked` error and does not commit").
+/// Only ever called from the registry's per-chunk loops -- never inside the
+/// gateway retry loop (spec Never: "no re-check of consent inside the
+/// gateway retry loop; per-chunk bound is accepted").
+async fn consent_still_current(db: &Arc<Db>) -> Result<bool, AppError> {
+    let db = db.clone();
+    match tokio::task::spawn_blocking(move || settings::load(&db)).await {
+        Ok(loaded) => Ok(
+            ConsentSnapshot::new(loaded.consent_accepted_version, loaded.consent_declined)
+                .is_current(),
+        ),
+        Err(_) => Err(actor_error()),
+    }
+}
+
 /// Forwards Gemini progress signals for one running Job back to the actor.
 /// Fire-and-forget (`try_send`): a dropped progress tick under backpressure
 /// is harmless — the next one carries the current truth regardless.
@@ -965,6 +990,7 @@ async fn run_job_inner(
         params,
         total_ms,
         chunk_count,
+        db,
         transcriber,
         cancel,
         handle,
@@ -1029,11 +1055,13 @@ async fn run_job_inner(
 /// transcribe each Chunk in order through `transcriber`, merging results.
 /// Returns the merged segments plus `Some(outcome)` when the whole Job must
 /// stop here instead of proceeding to commit (cancelled, or a fatal error).
+#[allow(clippy::too_many_arguments)]
 async fn decode_and_transcribe(
     job_id: JobId,
     params: &StartParams,
     total_ms: u64,
     initial_chunk_count: u32,
+    db: &Arc<Db>,
     transcriber: &Arc<dyn ChunkTranscriber>,
     cancel: &CancellationToken,
     handle: &JobRegistryHandle,
@@ -1104,6 +1132,22 @@ async fn decode_and_transcribe(
             })
             .await;
 
+        // Re-read consent from Settings right before this chunk is sent
+        // (spec Boundaries Always P0 review) -- a revocation that lands
+        // between two chunk sends must stop the Job before any more audio
+        // leaves the machine, never merely at the next Job start.
+        match consent_still_current(db).await {
+            Ok(true) => {}
+            Ok(false) => {
+                outcome = Some(JobOutcome::Error(consent_revoked_error()));
+                break;
+            }
+            Err(err) => {
+                outcome = Some(JobOutcome::Error(err));
+                break;
+            }
+        }
+
         let observer: Arc<dyn JobObserver> = Arc::new(RegistryObserver {
             handle: handle.clone(),
             job_id,
@@ -1149,7 +1193,14 @@ async fn decode_and_transcribe(
     // unblocks immediately instead of waiting on a timeout (spec Always:
     // "Huỷ: ngừng gửi Chunk mới ≤ 2 s").
     drop(chunk_rx);
-    let _ = decode_handle.await;
+    // A panic in the decode task (`JoinError`) must turn the Job into an
+    // error, never a silent commit of whatever was merged so far (spec
+    // Boundaries Always P0 review) -- but only when nothing has already
+    // decided this Job's outcome (a cancellation or a fatal transcribe error
+    // already found above takes precedence).
+    if decode_handle.await.is_err() && outcome.is_none() {
+        outcome = Some(JobOutcome::Error(actor_error()));
+    }
 
     (merge.finish(), outcome)
 }
@@ -1227,6 +1278,7 @@ async fn run_rerun_job_inner(
         params.consent,
         &params.proxy_path,
         &params.ranges,
+        db,
         transcriber,
         cancel,
         handle,
@@ -1260,10 +1312,22 @@ async fn run_rerun_job_inner(
         Err(_) => return JobOutcome::Error(actor_error()),
     };
 
+    // An open-ended tail range (`end_sample == u64::MAX`, spec Boundaries
+    // Always) consumed real audio past its nominal `end_ms` -- its
+    // seconds-range for `splice_rerun` must extend to true infinity too, or
+    // `clamp_to_range`/`trim_outside_ranges` would clip new/old segments back
+    // down to the nominal (possibly short) boundary and lose the tail again.
     let ranges_sec: Vec<(f64, f64)> = params
         .ranges
         .iter()
-        .map(|range| (range.start_ms as f64 / 1000.0, range.end_ms as f64 / 1000.0))
+        .map(|range| {
+            let end_sec = if range.end_sample == u64::MAX {
+                f64::INFINITY
+            } else {
+                range.end_ms as f64 / 1000.0
+            };
+            (range.start_ms as f64 / 1000.0, end_sec)
+        })
         .collect();
     let merged = splice_rerun(old_drafts, &ranges_sec, per_range_segments);
 
@@ -1308,6 +1372,7 @@ async fn decode_and_transcribe_ranges(
     consent: ConsentSnapshot,
     proxy_path: &Path,
     ranges: &[RerunRange],
+    db: &Arc<Db>,
     transcriber: &Arc<dyn ChunkTranscriber>,
     cancel: &CancellationToken,
     handle: &JobRegistryHandle,
@@ -1395,6 +1460,21 @@ async fn decode_and_transcribe_ranges(
         chunk.start_ms += range.start_ms;
         chunk.start_sample += range.start_sample;
 
+        // Re-read consent from Settings right before this chunk is sent,
+        // same as the file-transcribe pipeline (spec Boundaries Always P0
+        // review).
+        match consent_still_current(db).await {
+            Ok(true) => {}
+            Ok(false) => {
+                outcome = Some(JobOutcome::Error(consent_revoked_error()));
+                break;
+            }
+            Err(err) => {
+                outcome = Some(JobOutcome::Error(err));
+                break;
+            }
+        }
+
         let observer: Arc<dyn JobObserver> = Arc::new(RegistryObserver {
             handle: handle.clone(),
             job_id,
@@ -1426,7 +1506,11 @@ async fn decode_and_transcribe_ranges(
     }
 
     drop(chunk_rx);
-    let _ = decode_handle.await;
+    // Same JoinError-must-not-commit contract as `decode_and_transcribe`
+    // (spec Boundaries Always P0 review).
+    if decode_handle.await.is_err() && outcome.is_none() {
+        outcome = Some(JobOutcome::Error(actor_error()));
+    }
 
     let per_range = builders.into_iter().map(MergeBuilder::finish).collect();
     (per_range, outcome)
@@ -1626,8 +1710,30 @@ mod tests {
         }
     }
 
+    /// The registry now re-reads consent from Settings before every chunk
+    /// send (P0 review fix). Every pipeline test below passes
+    /// `ConsentSnapshot::new(1, false)` straight into
+    /// `StartParams`/`RerunParams` without itself touching Settings, so this
+    /// persists a currently-accepted consent into the test `Db` first --
+    /// exactly what the real `ipc::` start gate already guarantees before
+    /// ever calling `start`/`start_rerun`. A test that specifically wants to
+    /// exercise a mid-Job revocation calls `settings::save` again (same
+    /// on-disk file, WAL-shared) after the first chunk.
+    fn seed_current_consent(db: &Db) {
+        settings::save(
+            db,
+            &settings::Settings {
+                consent_accepted_version: crate::consent::CURRENT_VERSION,
+                consent_declined: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    }
+
     fn registry_for_test(root: &Path, transcriber: Arc<dyn ChunkTranscriber>) -> JobRegistryHandle {
         let db = Arc::new(Db::open(root).unwrap());
+        seed_current_consent(&db);
         let (handle, actor) = channel(db, root.to_path_buf(), transcriber);
         tokio::spawn(actor.run());
         handle
@@ -2254,10 +2360,113 @@ mod tests {
         assert_eq!(transcriber.chunk_start_ms(), vec![0, 60_000, 120_000]);
     }
 
+    /// A transcriber whose first call revokes consent in `db` (as a real
+    /// Settings write, not just an in-memory flag) as a side effect, before
+    /// returning that first chunk's successful transcript -- lets a test
+    /// exercise the registry's per-chunk consent re-check deterministically
+    /// without racing a real clock or a second process.
+    struct RevokeConsentAfterFirstChunk {
+        db: Arc<Db>,
+        calls: Mutex<u32>,
+    }
+
+    impl ChunkTranscriber for RevokeConsentAfterFirstChunk {
+        fn transcribe(
+            &self,
+            _model: String,
+            chunk: Chunk,
+            _language: TranscribeLanguage,
+            _consent: ConsentSnapshot,
+            _cancellation: CancellationToken,
+            _observer: Arc<dyn JobObserver>,
+        ) -> TranscribeChunkFuture {
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            if *calls == 1 {
+                settings::save(
+                    &self.db,
+                    &settings::Settings {
+                        consent_accepted_version: 0,
+                        consent_declined: true,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            }
+            drop(calls);
+            Box::pin(async move {
+                Ok(ChunkTranscript {
+                    segments: vec![Segment {
+                        start: chunk.start_ms as f64 / 1000.0,
+                        end: (chunk.start_ms + chunk.duration_ms) as f64 / 1000.0,
+                        text: "ok".to_string(),
+                        speaker: None,
+                    }],
+                    unresolved: vec![],
+                    confirmed_silence: false,
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn consent_revoked_after_the_first_chunk_stops_the_job_before_the_second_chunk_and_does_not_commit(
+    ) {
+        // spec Acceptance Criteria: "Given a running Job, when consent is
+        // revoked in settings, then no further chunk request is issued and
+        // no session is committed." I/O Matrix "Consent revoked mid-job":
+        // "chunk 2 never sent; Job Error Blocked".
+        let root = tempdir().unwrap();
+        let db = Arc::new(Db::open(root.path()).unwrap());
+        seed_current_consent(&db);
+        // 150 s at chunkMinutes=1 would normally be 3 Chunks (see the test
+        // above) -- consent revoked on the first must stop before a second
+        // is ever requested.
+        let source = wav_fixture_seconds(root.path(), "a.wav", 150);
+        let transcriber = Arc::new(RevokeConsentAfterFirstChunk {
+            db: db.clone(),
+            calls: Mutex::new(0),
+        });
+        let (handle, actor) = channel(
+            db.clone(),
+            root.path().to_path_buf(),
+            transcriber.clone() as Arc<dyn ChunkTranscriber>,
+        );
+        tokio::spawn(actor.run());
+        let (channel, received) = test_channel();
+        handle.subscribe(channel).await.unwrap();
+
+        let params = StartParams {
+            chunk_minutes: 1,
+            ..start_params(source, "hash-consent-revoked")
+        };
+        let (job_id, session_id) = start_new(&handle, params).await;
+        wait_until_empty(&handle, Duration::from_secs(10)).await;
+
+        assert_eq!(
+            *transcriber.calls.lock().unwrap(),
+            1,
+            "chunk thứ hai không bao giờ được gửi sau khi consent bị revoke"
+        );
+        let events = received.lock().unwrap().clone();
+        assert!(events.iter().any(
+            |event| matches!(event, JobEvent::Error { job_id: id, error, .. } if *id == job_id && error.category == Category::Blocked)
+        ));
+        db.with_connection(|conn| {
+            assert!(
+                repo::sessions::get(conn, session_id)?.is_none(),
+                "consent bị revoke giữa chừng không được commit Phiên"
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn captured_language_reaches_the_transcriber_and_is_saved_on_the_transcript() {
         let root = tempdir().unwrap();
         let db = Arc::new(Db::open(root.path()).unwrap());
+        seed_current_consent(&db);
         let source = wav_fixture(root.path(), "a.wav");
         let transcriber = FakeTranscriber::new(vec![Behavior::Success("こんにちは".to_string())]);
         let (handle, actor) = channel(db.clone(), root.path().to_path_buf(), transcriber.clone());
@@ -2287,6 +2496,7 @@ mod tests {
     async fn auto_language_leaves_the_transcript_language_null() {
         let root = tempdir().unwrap();
         let db = Arc::new(Db::open(root.path()).unwrap());
+        seed_current_consent(&db);
         let source = wav_fixture(root.path(), "a.wav");
         let transcriber = FakeTranscriber::new(vec![Behavior::Success("hello".to_string())]);
         let (handle, actor) = channel(db.clone(), root.path().to_path_buf(), transcriber);
@@ -2469,6 +2679,7 @@ mod tests {
     {
         let root = tempdir().unwrap();
         let db = Arc::new(Db::open(root.path()).unwrap());
+        seed_current_consent(&db);
         let session_id = SessionId::new();
         let old_transcript_id = TranscriptId::new();
         let proxy_path = seed_partial_session(
@@ -2556,9 +2767,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rerun_consent_revoked_after_the_first_range_stops_before_the_second_and_does_not_swap(
+    ) {
+        // Same per-chunk consent re-check as file transcribe (spec
+        // Boundaries Always P0 review: "before every chunk send (file
+        // transcribe and rerun)"), exercised on the Chạy lại pipeline: two
+        // gap ranges to retry, consent revoked as a side effect of the first
+        // range's transcribe call -- the second range must never be sent and
+        // the old transcript must survive untouched (no swap/commit).
+        let root = tempdir().unwrap();
+        let db = Arc::new(Db::open(root.path()).unwrap());
+        seed_current_consent(&db);
+        let session_id = SessionId::new();
+        let old_transcript_id = TranscriptId::new();
+        let proxy_path = seed_partial_session(
+            root.path(),
+            &db,
+            session_id,
+            old_transcript_id,
+            4.0,
+            &[
+                rerun_text_draft(0.0, 1.0, "hello"),
+                rerun_gap_draft(1.0, 2.0),
+                rerun_text_draft(2.0, 3.0, "hello"),
+                rerun_gap_draft(3.0, 4.0),
+            ],
+        );
+        let ranges = resolved_missing_ranges(&db, old_transcript_id, 4_000);
+        assert_eq!(ranges.len(), 2, "hai gap phải giải ra đúng hai vùng");
+
+        let transcriber = Arc::new(RevokeConsentAfterFirstChunk {
+            db: db.clone(),
+            calls: Mutex::new(0),
+        });
+        let (handle, actor) = channel(
+            db.clone(),
+            root.path().to_path_buf(),
+            transcriber.clone() as Arc<dyn ChunkTranscriber>,
+        );
+        tokio::spawn(actor.run());
+        let (channel, received) = test_channel();
+        handle.subscribe(channel).await.unwrap();
+
+        let outcome = handle
+            .start_rerun(RerunParams {
+                session_id,
+                transcript_id: old_transcript_id,
+                ranges,
+                discard_old: false,
+                proxy_path,
+                model: "gemini-flash-lite-latest".to_string(),
+                language: TranscribeLanguage::Auto,
+                chunk_minutes: 5,
+                consent: ConsentSnapshot::new(1, false),
+            })
+            .await
+            .unwrap();
+        let job_id = match outcome {
+            RerunOutcome::Started { job_id } => job_id,
+            RerunOutcome::Existing { .. } => panic!("expected a new Chạy lại Job"),
+        };
+        wait_until_empty(&handle, Duration::from_secs(5)).await;
+
+        assert_eq!(
+            *transcriber.calls.lock().unwrap(),
+            1,
+            "vùng thứ hai không bao giờ được gửi sau khi consent bị revoke"
+        );
+        let events = received.lock().unwrap().clone();
+        assert!(events.iter().any(
+            |event| matches!(event, JobEvent::Error { job_id: id, error, .. } if *id == job_id && error.category == Category::Blocked)
+        ));
+
+        // The old transcript is untouched: no swap happened.
+        assert!(db
+            .with_connection(|conn| Ok(repo::transcripts::get(conn, old_transcript_id)?))
+            .unwrap()
+            .is_some());
+        let primary = db
+            .with_connection(|conn| Ok(repo::transcripts::primary_for_session(conn, session_id)?))
+            .unwrap()
+            .unwrap();
+        assert_eq!(primary, old_transcript_id, "primary vẫn là transcript cũ");
+    }
+
+    #[tokio::test]
     async fn rerun_missing_with_one_gap_still_failing_stays_partial_with_only_that_gap_left() {
         let root = tempdir().unwrap();
         let db = Arc::new(Db::open(root.path()).unwrap());
+        seed_current_consent(&db);
         let session_id = SessionId::new();
         let old_transcript_id = TranscriptId::new();
         let proxy_path = seed_partial_session(
@@ -2659,6 +2956,7 @@ mod tests {
     async fn rerun_fatal_transcriber_error_leaves_the_old_transcript_and_segments_untouched() {
         let root = tempdir().unwrap();
         let db = Arc::new(Db::open(root.path()).unwrap());
+        seed_current_consent(&db);
         let session_id = SessionId::new();
         let old_transcript_id = TranscriptId::new();
         let original_segments = vec![
@@ -2733,6 +3031,7 @@ mod tests {
     async fn rerun_cancelled_leaves_the_old_transcript_untouched() {
         let root = tempdir().unwrap();
         let db = Arc::new(Db::open(root.path()).unwrap());
+        seed_current_consent(&db);
         let session_id = SessionId::new();
         let old_transcript_id = TranscriptId::new();
         let proxy_path = seed_partial_session(
@@ -2789,6 +3088,7 @@ mod tests {
     async fn rerun_calling_again_for_the_same_session_returns_the_existing_job() {
         let root = tempdir().unwrap();
         let db = Arc::new(Db::open(root.path()).unwrap());
+        seed_current_consent(&db);
         let session_id = SessionId::new();
         let old_transcript_id = TranscriptId::new();
         let proxy_path = seed_partial_session(
@@ -2848,6 +3148,7 @@ mod tests {
         // Prompt thêm câu chỉ định tiếng Nhật; `transcripts.language = 'ja'`."
         let root = tempdir().unwrap();
         let db = Arc::new(Db::open(root.path()).unwrap());
+        seed_current_consent(&db);
         let session_id = SessionId::new();
         let old_transcript_id = TranscriptId::new();
         let proxy_path = seed_partial_session(
@@ -2901,6 +3202,7 @@ mod tests {
     async fn rerun_commit_with_a_stale_expected_transcript_writes_nothing_and_errors() {
         let root = tempdir().unwrap();
         let db = Arc::new(Db::open(root.path()).unwrap());
+        seed_current_consent(&db);
         let session_id = SessionId::new();
         let old_transcript_id = TranscriptId::new();
         let proxy_path = seed_partial_session(

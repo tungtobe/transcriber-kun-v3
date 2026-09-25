@@ -284,7 +284,7 @@ describe('Session route', () => {
     render(Session, { routeParams: { id: 's1' } });
 
     await fireEvent.click(await screen.findByRole('button', { name: 'Xuất TXT' }));
-    expect(mocks.libraryTranscriptExport).toHaveBeenCalledWith('t1', 'txt', 42);
+    expect(mocks.libraryTranscriptExport).toHaveBeenCalledWith('s1', 't1', 'txt', 42);
     expect(screen.queryByText('Đã lưu transcript.')).toBeNull();
     expect(screen.queryByRole('alert')).toBeNull();
   });

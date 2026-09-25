@@ -441,16 +441,26 @@ pub fn get_detail(
 }
 
 /// Read one transcript and all of its segments for export. The caller passes
-/// the selected transcript's opaque ID; every field, including speaker and
-/// gap data, comes from the same DB connection and segment order.
+/// the selected transcript's opaque ID *and* the session it believes owns it
+/// -- `session_id` must match the transcript's actual `session_id` or this
+/// returns `None`, exactly like the transcript not existing at all (spec
+/// Boundaries Always P0 review: "`get_export_data` returns `None` unless the
+/// transcript's `session_id` matches"). Without this check, any signed-in
+/// caller who could guess/enumerate a bare `transcript_id` could export a
+/// transcript belonging to a different session (IDOR) -- `ipc::` passes the
+/// currently open session's own ID, never one taken from the request alone.
 pub fn get_export_data(
     db: &Db,
+    session_id: SessionId,
     transcript_id: TranscriptId,
 ) -> Result<Option<TranscriptExportData>, AppError> {
     db.with_connection(|conn| {
         let Some(transcript) = repo::transcripts::get(conn, transcript_id)? else {
             return Ok(None);
         };
+        if transcript.session_id != session_id {
+            return Ok(None);
+        }
         let segments = repo::segments::list_for_transcript(conn, transcript_id)?;
         Ok(Some(TranscriptExportData {
             transcript,
@@ -868,12 +878,58 @@ mod tests {
             })
             .unwrap();
 
-        let data = get_export_data(&db, transcript_id).unwrap().unwrap();
+        let data = get_export_data(&db, session_id, transcript_id)
+            .unwrap()
+            .unwrap();
         assert_eq!(data.transcript.session_id, session_id);
         assert_eq!(data.segments[0].speaker.as_deref(), Some("speaker-a"));
         assert_eq!(data.segments[1].kind, SegmentKind::Gap);
         assert_eq!(data.segments[1].gap_reason, Some(GapReason::ChunkFailed));
-        assert!(get_export_data(&db, TranscriptId::new()).unwrap().is_none());
+        assert!(
+            get_export_data(&db, session_id, TranscriptId::new())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// P0 review fix (IDOR close): a `transcript_id` that exists but belongs
+    /// to a *different* session must be treated exactly like "does not
+    /// exist" -- `get_export_data` never returns data across a session
+    /// boundary just because the caller happened to know/guess the bare
+    /// transcript id (spec I/O Matrix "Export wrong session").
+    #[test]
+    fn get_export_data_returns_none_when_the_session_id_does_not_own_the_transcript() {
+        let root = tempdir().unwrap();
+        let db = open_db(root.path());
+        let owning_session_id = SessionId::new();
+        let outcome = commit_file_session(
+            &db,
+            root.path(),
+            JobId::new(),
+            owning_session_id,
+            sample_draft(None),
+            Err(storage_error("no proxy in export ownership test")),
+        )
+        .unwrap();
+        let transcript_id = db
+            .with_connection(|conn| {
+                Ok(repo::transcripts::primary_for_session(conn, outcome.session_id)?.unwrap())
+            })
+            .unwrap();
+
+        let other_session_id = SessionId::new();
+        assert!(
+            get_export_data(&db, other_session_id, transcript_id)
+                .unwrap()
+                .is_none()
+        );
+        // The transcript itself is untouched and still exportable under its
+        // real owning session.
+        assert!(
+            get_export_data(&db, owning_session_id, transcript_id)
+                .unwrap()
+                .is_some()
+        );
     }
 
     /// Dựng một Proxy staging thật (không phụ thuộc `media::create_proxy`,

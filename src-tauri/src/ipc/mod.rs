@@ -1063,6 +1063,7 @@ async fn library_session_detail(
 async fn library_transcript_export(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
+    session_id: SessionId,
     transcript_id: TranscriptId,
     format: library::export::TranscriptExportFormat,
     offset_sec: f64,
@@ -1070,9 +1071,10 @@ async fn library_transcript_export(
     let result = async {
         let db = state.db.clone()?;
         let rendered = blocking(move || {
-            let data = library::store::get_export_data(&db, transcript_id)?.ok_or_else(|| {
-                AppError::new(Code::Storage, "selected transcript no longer exists")
-            })?;
+            let data = library::store::get_export_data(&db, session_id, transcript_id)?
+                .ok_or_else(|| {
+                    AppError::new(Code::Storage, "selected transcript no longer exists")
+                })?;
             library::export::render_transcript(&data, format, offset_sec)
         })
         .await?;
@@ -1280,7 +1282,13 @@ async fn app_close_confirm(
         for _ in 0..40 {
             match jobs.snapshot().await {
                 Ok(remaining) if remaining.is_empty() => break,
-                _ => {}
+                Ok(_) => {}
+                // Registry unreachable: nothing left to wait for (spec
+                // Boundaries Always P0 review: "`app_close_confirm` treats
+                // `snapshot()` `Err` as 'nothing left to wait for' (break)")
+                // -- the user already confirmed closing, so exit now instead
+                // of burning the full ~4 s poll budget.
+                Err(_) => break,
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
