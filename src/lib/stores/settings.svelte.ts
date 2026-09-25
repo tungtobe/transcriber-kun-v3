@@ -34,6 +34,10 @@ const DEFAULT_MEMO_MODEL = 'gemini-flash-lite-latest';
 // (Rust) as an offline-first fallback, same reasoning as the model defaults
 // above.
 const DEFAULT_CHUNK_MINUTES = 5;
+// Mirrors `settings::MAX_CHUNK_MINUTES` (Rust, P0 review fix) -- a defense-
+// in-depth ceiling matching Rust's `save`/`load` range check, on top of the
+// primary inline block in Settings -> Chunking.
+const MAX_CHUNK_MINUTES = 60;
 const DEFAULT_TIMESTAMP_OFFSET_SEC = 0;
 const DEFAULT_TRANSCRIBE_LANGUAGE: TranscribeLanguage = 'auto';
 const DEFAULT_SETTINGS: Settings = {
@@ -66,6 +70,11 @@ function isNonNegativeInteger(value: unknown): value is number {
 /** Same, plus the `>= 1` floor `chunkMinutes` itself requires. */
 function isPositiveInteger(value: unknown): value is number {
   return isNonNegativeInteger(value) && value >= 1;
+}
+
+/** `chunkMinutes` itself: a positive integer capped at `MAX_CHUNK_MINUTES` (spec Boundaries Always: "1..=60"). */
+function isChunkMinutes(value: unknown): value is number {
+  return isPositiveInteger(value) && value <= MAX_CHUNK_MINUTES;
 }
 
 function systemTheme(): ResolvedTheme {
@@ -121,7 +130,7 @@ function normalizeSettings(value: Partial<Settings> | null | undefined): Setting
       : DEFAULT_TRANSCRIBE_MODEL,
     liveModel: isNonEmptyModelName(value?.liveModel) ? value.liveModel : DEFAULT_LIVE_MODEL,
     memoModel: isNonEmptyModelName(value?.memoModel) ? value.memoModel : DEFAULT_MEMO_MODEL,
-    chunkMinutes: isPositiveInteger(value?.chunkMinutes)
+    chunkMinutes: isChunkMinutes(value?.chunkMinutes)
       ? value.chunkMinutes
       : DEFAULT_CHUNK_MINUTES,
     timestampOffsetSec: isNonNegativeInteger(value?.timestampOffsetSec)
@@ -453,7 +462,7 @@ export function createSettingsStore() {
    * ... và không lưu").
    */
   async function setChunkMinutes(next: number): Promise<void> {
-    if (!isPositiveInteger(next)) return;
+    if (!isChunkMinutes(next)) return;
     const waiting = ensureReady();
     applySettings({ ...snapshot(), chunkMinutes: next });
     error = null;

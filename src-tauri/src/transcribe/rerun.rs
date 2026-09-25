@@ -81,6 +81,30 @@ fn invalid_gap_error() -> AppError {
     )
 }
 
+/// Tolerance (ms) used to decide a range "reaches the end of the recording"
+/// (spec Boundaries Always P0 review) -- `total_duration_ms` comes from
+/// `probe`'s float `duration_seconds` rounded to ms, so the true tail can sit
+/// up to about a second past it (container duration metadata is an estimate,
+/// not exact sample count).
+const TAIL_RANGE_TOLERANCE_MS: u64 = 1_000;
+
+/// Marks the last range in `ranges` as open-ended (`end_sample = u64::MAX`,
+/// `end_ms` unchanged) when it reaches the end of the recording, so decoding
+/// routes every sample up to the Proxy's *true* end into it instead of
+/// stopping at a possibly-short `total_duration_ms` estimate (spec Boundaries
+/// Always P0 review: "the last range that reaches the end of the recording
+/// ... is open-ended -- it consumes decoded samples to the true end of the
+/// Proxy"). `end_ms` is left as-is: `duration_ms()` still needs a finite
+/// value for progress estimates.
+fn mark_tail_open_ended(mut ranges: Vec<RerunRange>, total_duration_ms: u64) -> Vec<RerunRange> {
+    if let Some(last) = ranges.last_mut() {
+        if last.end_ms + TAIL_RANGE_TOLERANCE_MS >= total_duration_ms {
+            last.end_sample = u64::MAX;
+        }
+    }
+    ranges
+}
+
 /// Giải `scope` thành danh sách vùng tuyệt đối, tăng dần, không chồng lấp
 /// (spec Always: "`gap_id` = `idx` của Segment gap `chunk_failed` trong đúng
 /// `transcript_id`; Rust tự tra range từ DB"). `segments` phải là toàn bộ
@@ -94,14 +118,20 @@ pub fn resolve_ranges(
     total_duration_ms: u64,
 ) -> Result<Vec<RerunRange>, AppError> {
     match scope {
-        RerunScope::All => Ok(vec![range_from_ms(0, total_duration_ms)]),
-        RerunScope::Missing => Ok(segments
-            .iter()
-            .filter(|row| {
-                row.kind == SegmentKind::Gap && row.gap_reason == Some(GapReason::ChunkFailed)
-            })
-            .map(|row| range_from_sec(row.start_sec, row.end_sec))
-            .collect()),
+        RerunScope::All => Ok(mark_tail_open_ended(
+            vec![range_from_ms(0, total_duration_ms)],
+            total_duration_ms,
+        )),
+        RerunScope::Missing => {
+            let ranges = segments
+                .iter()
+                .filter(|row| {
+                    row.kind == SegmentKind::Gap && row.gap_reason == Some(GapReason::ChunkFailed)
+                })
+                .map(|row| range_from_sec(row.start_sec, row.end_sec))
+                .collect();
+            Ok(mark_tail_open_ended(ranges, total_duration_ms))
+        }
         RerunScope::Gap { gap_id } => {
             let row = segments
                 .iter()
@@ -110,7 +140,8 @@ pub fn resolve_ranges(
             if row.kind != SegmentKind::Gap || row.gap_reason != Some(GapReason::ChunkFailed) {
                 return Err(invalid_gap_error());
             }
-            Ok(vec![range_from_sec(row.start_sec, row.end_sec)])
+            let ranges = vec![range_from_sec(row.start_sec, row.end_sec)];
+            Ok(mark_tail_open_ended(ranges, total_duration_ms))
         }
     }
 }
@@ -164,7 +195,13 @@ pub fn decode_ranges_and_chunk(
                 offset += skip;
                 continue;
             }
-            let take = ((range.end_sample - position) as usize).min(samples.len() - offset);
+            // `range.end_sample` can be `u64::MAX` for an open-ended tail
+            // range (spec Boundaries Always) -- subtract with saturation and
+            // only narrow to `usize` after clamping to the buffer length still
+            // remaining, so this never overflows regardless of pointer width.
+            let remaining_in_range = range.end_sample.saturating_sub(position);
+            let remaining_in_buffer = (samples.len() - offset) as u64;
+            let take = remaining_in_range.min(remaining_in_buffer) as usize;
             if take == 0 {
                 active += 1;
                 continue;
@@ -224,6 +261,9 @@ mod tests {
         assert_eq!(ranges.len(), 1);
         assert_eq!(ranges[0].start_ms, 0);
         assert_eq!(ranges[0].end_ms, 90_000);
+        // `all` always reaches the end of the recording by definition -- it
+        // must always come back open-ended (spec Boundaries Always).
+        assert_eq!(ranges[0].end_sample, u64::MAX);
     }
 
     #[test]
@@ -241,6 +281,27 @@ mod tests {
     }
 
     #[test]
+    fn resolve_ranges_missing_marks_only_the_tail_range_open_ended() {
+        let segments = vec![
+            gap_row(0, 0.0, 10.0),
+            text_row(1, 10.0, 20.0),
+            gap_row(2, 20.0, 30.0),
+        ];
+        let ranges = resolve_ranges(RerunScope::Missing, &segments, 30_000).unwrap();
+        assert_eq!(ranges.len(), 2);
+        assert_ne!(
+            ranges[0].end_sample,
+            u64::MAX,
+            "vùng không chạm cuối bản ghi phải giữ end_sample hữu hạn"
+        );
+        assert_eq!(
+            ranges[1].end_sample,
+            u64::MAX,
+            "vùng cuối cùng chạm hết bản ghi phải open-ended"
+        );
+    }
+
+    #[test]
     fn resolve_ranges_missing_on_a_complete_transcript_is_empty() {
         let segments = vec![text_row(0, 0.0, 10.0)];
         assert!(resolve_ranges(RerunScope::Missing, &segments, 10_000)
@@ -252,6 +313,20 @@ mod tests {
     fn resolve_ranges_gap_finds_the_exact_idx() {
         let segments = vec![text_row(0, 0.0, 10.0), gap_row(1, 10.0, 20.0)];
         let ranges = resolve_ranges(RerunScope::Gap { gap_id: 1 }, &segments, 20_000).unwrap();
+        assert_eq!(ranges.len(), 1);
+        assert_eq!((ranges[0].start_ms, ranges[0].end_ms), (10_000, 20_000));
+        // This gap reaches the end of the (20 s) recording -- open-ended.
+        assert_eq!(ranges[0].end_sample, u64::MAX);
+    }
+
+    #[test]
+    fn resolve_ranges_gap_not_reaching_the_end_stays_closed() {
+        let segments = vec![
+            text_row(0, 0.0, 10.0),
+            gap_row(1, 10.0, 20.0),
+            text_row(2, 20.0, 30.0),
+        ];
+        let ranges = resolve_ranges(RerunScope::Gap { gap_id: 1 }, &segments, 30_000).unwrap();
         assert_eq!(ranges, vec![range_from_sec(10.0, 20.0)]);
     }
 
@@ -358,5 +433,57 @@ mod tests {
         )
         .unwrap();
         assert_eq!(total_samples, 32_000);
+    }
+
+    fn wav_fixture_samples(dir: &Path, name: &str, sample_count: u32) -> std::path::PathBuf {
+        let path = dir.join(name);
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+        for frame in 0..sample_count {
+            let sample = ((frame as f32 * 0.05).sin() * 5_000.0) as i16;
+            writer.write_sample(sample).unwrap();
+        }
+        writer.finalize().unwrap();
+        path
+    }
+
+    /// spec I/O Matrix "Rerun all, proxy longer": the range's nominal end (2 s
+    /// / 2000 ms, as `total_duration_ms` reported it) is shorter than the
+    /// Proxy's real decoded length (2.5 s) -- an open-ended range
+    /// (`end_sample = u64::MAX`) must still consume every real sample to the
+    /// Proxy's true end, not stop short at the nominal boundary.
+    #[test]
+    fn decode_ranges_and_chunk_routes_every_sample_to_an_open_ended_tail_range_past_its_nominal_end(
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        // 2.5 s of real audio (40_000 samples at 16 kHz).
+        let source = wav_fixture_samples(dir.path(), "a.wav", 40_000);
+
+        let mut declared = range_from_ms(0, 2_000);
+        declared.end_sample = u64::MAX;
+        let ranges = vec![declared];
+
+        let mut total_samples = 0u64;
+        decode_ranges_and_chunk(
+            &source,
+            &ranges,
+            ChunkOptions::default(),
+            &CancellationToken::new(),
+            |range_index, chunk| {
+                assert_eq!(range_index, 0);
+                total_samples += chunk.sample_count;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            total_samples, 40_000,
+            "vùng open-ended phải nhận hết mẫu thật tới cuối Proxy, kể cả vượt end_ms danh nghĩa"
+        );
     }
 }

@@ -46,7 +46,7 @@ describe('SettingsChunking', () => {
     expect(screen.queryByRole('alert')).toBeNull();
   });
 
-  it.each(['0', '-2', '1.5', 'abc', ''])(
+  it.each(['0', '-2', '1.5', 'abc', '', '61', '100'])(
     'blocks an invalid chunkMinutes value (%s) inline without saving',
     async (value) => {
       render(SettingsChunking);
@@ -59,6 +59,17 @@ describe('SettingsChunking', () => {
       expect(screen.getByRole('alert')).toBeTruthy();
     },
   );
+
+  it('saves the max chunkMinutes boundary (60)', async () => {
+    render(SettingsChunking);
+    const input = screen.getByLabelText('Độ dài Chunk');
+
+    await fireEvent.input(input, { target: { value: '60' } });
+    await fireEvent.change(input);
+
+    expect(mocks.settingsStore.setChunkMinutes).toHaveBeenCalledWith(60);
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
 
   it('saves a valid offset (including zero) on change', async () => {
     render(SettingsChunking);

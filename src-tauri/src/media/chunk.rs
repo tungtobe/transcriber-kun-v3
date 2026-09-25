@@ -98,7 +98,7 @@ impl Chunker {
             options,
             max_samples,
             next_start_sample: 0,
-            pending: Vec::with_capacity(max_samples),
+            pending: Vec::with_capacity(initial_capacity(max_samples)),
         })
     }
 
@@ -143,9 +143,25 @@ impl Chunker {
         let sample_count = samples.len() as u64;
         emit_bounded_chunks(&samples, start_sample, self.options.budget, emit)?;
         self.next_start_sample = self.next_start_sample.saturating_add(sample_count);
-        self.pending = Vec::with_capacity(self.max_samples);
+        self.pending = Vec::with_capacity(initial_capacity(self.max_samples));
         Ok(())
     }
+}
+
+/// Caps the up-front allocation for `pending` at one default chunk's worth of
+/// samples (300 s x 16 kHz), regardless of how large `max_samples` actually
+/// is (spec Boundaries Always P0 review: "`Chunker::new` never pre-allocates
+/// more than the default chunk of capacity, whatever `max_duration_seconds`
+/// is"). `max_samples` itself is untouched -- this only bounds the initial
+/// `Vec` capacity; `push`/`extend_from_slice` still grow it on demand for a
+/// genuinely large configured chunk. Defense in depth: `chunkMinutes` is
+/// already validated to `1..=60` by `settings::save`/`load`, but this keeps a
+/// corrupted or future caller from turning a huge duration into an
+/// OOM-aborting allocation here.
+fn initial_capacity(max_samples: usize) -> usize {
+    let default_chunk_samples = (DEFAULT_CHUNK_SECONDS as usize)
+        .saturating_mul(OUTPUT_SAMPLE_RATE as usize);
+    max_samples.min(default_chunk_samples)
 }
 
 fn emit_bounded_chunks<F>(
@@ -263,6 +279,23 @@ mod tests {
                 pair[1].start_sample
             );
         }
+    }
+
+    /// P0 review fix: a huge `max_duration_seconds` (e.g. a corrupted
+    /// `chunkMinutes` that bypassed `settings` validation) must not make
+    /// `Chunker::new` try to pre-allocate that many samples up front -- it
+    /// must succeed cheaply instead of aborting the process on an OOM.
+    #[test]
+    fn a_huge_max_duration_does_not_try_to_preallocate_it_all() {
+        let chunker = Chunker::new(ChunkOptions {
+            max_duration_seconds: 10_000_000_000,
+            budget: ChunkBudget::default(),
+        })
+        .unwrap();
+        assert_eq!(
+            chunker.pending.capacity(),
+            DEFAULT_CHUNK_SECONDS as usize * OUTPUT_SAMPLE_RATE as usize
+        );
     }
 
     #[test]

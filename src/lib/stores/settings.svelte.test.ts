@@ -518,11 +518,28 @@ describe('settingsStore chunking/offset/language setters', () => {
     expect(mocks.settingsSave).toHaveBeenCalledWith(settings('system', 'system', false, undefined, undefined, undefined, 3));
 
     mocks.settingsSave.mockClear();
-    for (const invalid of [0, -2, 1.5, Number.NaN]) {
+    for (const invalid of [0, -2, 1.5, Number.NaN, 61, 100]) {
       await store.setChunkMinutes(invalid);
     }
     expect(mocks.settingsSave).not.toHaveBeenCalled();
     expect(store.chunkMinutes).toBe(3);
+  });
+
+  it('accepts the max chunkMinutes boundary (60) but rejects one above it', async () => {
+    mocks.settingsGet.mockResolvedValue({ status: 'ok', data: settings() });
+    mocks.settingsSave.mockResolvedValue({ status: 'ok', data: null });
+    const { createSettingsStore } = await import('./settings.svelte');
+    const store = createSettingsStore();
+    await store.load();
+
+    await store.setChunkMinutes(60);
+    expect(store.chunkMinutes).toBe(60);
+    expect(mocks.settingsSave).toHaveBeenCalledWith(settings('system', 'system', false, undefined, undefined, undefined, 60));
+
+    mocks.settingsSave.mockClear();
+    await store.setChunkMinutes(61);
+    expect(mocks.settingsSave).not.toHaveBeenCalled();
+    expect(store.chunkMinutes).toBe(60);
   });
 
   it('optimistically persists a valid timestampOffsetSec and never calls settingsSave for an invalid one', async () => {
@@ -601,5 +618,18 @@ describe('settingsStore chunking/offset/language setters', () => {
     expect(store.chunkMinutes).toBe(5);
     expect(store.timestampOffsetSec).toBe(0);
     expect(store.transcribeLanguage).toBe('auto');
+  });
+
+  it('normalizes an out-of-range loaded chunkMinutes to the default', async () => {
+    mocks.settingsGet.mockResolvedValue({
+      status: 'ok',
+      data: { ...settings(), chunkMinutes: 5000 },
+    });
+    const { createSettingsStore } = await import('./settings.svelte');
+    const store = createSettingsStore();
+
+    await store.load();
+
+    expect(store.chunkMinutes).toBe(5);
   });
 });
