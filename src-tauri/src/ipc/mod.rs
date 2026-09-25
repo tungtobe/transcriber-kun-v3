@@ -435,6 +435,42 @@ fn save_diagnostics_bundle(app: &tauri::AppHandle, bundle: &str) -> Result<bool,
     Ok(true)
 }
 
+fn write_transcript_export(path: &std::path::Path, content: &str) -> Result<(), AppError> {
+    std::fs::write(path, content.as_bytes()).map_err(AppError::from)
+}
+
+/// Open the native save dialog on Tauri's main thread and write the selected
+/// transcript export on the blocking worker. The WebView never receives the
+/// chosen path and cancellation is returned as `false` without an error.
+fn save_transcript_export(
+    app: &tauri::AppHandle,
+    default_file_name: String,
+    format: library::export::TranscriptExportFormat,
+    content: String,
+) -> Result<bool, AppError> {
+    let filter_label = format.filter_label().to_string();
+    let extension = format.extension().to_string();
+    let (tx, rx) = std::sync::mpsc::channel::<Option<std::path::PathBuf>>();
+
+    app.run_on_main_thread(move || {
+        let picked = rfd::FileDialog::new()
+            .set_file_name(&default_file_name)
+            .add_filter(&filter_label, &[extension.as_str()])
+            .save_file();
+        let _ = tx.send(picked);
+    })
+    .map_err(|err| AppError::new(Code::Storage, err.to_string()))?;
+
+    let picked = rx
+        .recv()
+        .map_err(|err| AppError::new(Code::Storage, err.to_string()))?;
+    let Some(path) = picked else {
+        return Ok(false);
+    };
+    write_transcript_export(&path, &content)?;
+    Ok(true)
+}
+
 /// Xuất gói chẩn đoán: build bundle (log allow-list + bộ đếm) rồi mở dialog
 /// lưu hệ thống trong `spawn_blocking` — bản thân dialog chạy trên main
 /// thread qua [`save_diagnostics_bundle`], `spawn_blocking` ở đây chỉ giữ
@@ -1019,6 +1055,45 @@ async fn library_session_detail(
     track_ipc_error(&state.db, result).await
 }
 
+/// Export the transcript currently selected in Session detail. Rust reads the
+/// transcript by its opaque ID (including private speaker/gap data), applies
+/// the display offset, and owns both the system dialog and file write.
+#[tauri::command]
+#[specta::specta]
+async fn library_transcript_export(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    transcript_id: TranscriptId,
+    format: library::export::TranscriptExportFormat,
+    offset_sec: f64,
+) -> Result<library::export::TranscriptExportOutcome, AppError> {
+    let result = async {
+        let db = state.db.clone()?;
+        let rendered = blocking(move || {
+            let data = library::store::get_export_data(&db, transcript_id)?.ok_or_else(|| {
+                AppError::new(Code::Storage, "selected transcript no longer exists")
+            })?;
+            library::export::render_transcript(&data, format, offset_sec)
+        })
+        .await?;
+
+        let has_gaps = rendered.has_gaps;
+        let content = rendered.content;
+        let default_file_name = format!("transcript-{}.{}", transcript_id, format.extension());
+        let app_for_dialog = app.clone();
+        let saved = tauri::async_runtime::spawn_blocking(move || {
+            save_transcript_export(&app_for_dialog, default_file_name, format, content)
+        })
+        .await
+        .map_err(|err| AppError::new(Code::Storage, err.to_string()))
+        .and_then(|inner| inner)?;
+
+        Ok(library::export::TranscriptExportOutcome { saved, has_gaps })
+    }
+    .await;
+    track_ipc_error(&state.db, result).await
+}
+
 /// Một dòng phiên cho danh sách Home (story 2.9) — xem
 /// [`repo::sessions::SessionListRow`] cho logic đọc thật. `created_at` giữ
 /// dạng `f64` (mili-giây epoch, UTC) chứ không phải `i64`, cùng lý do
@@ -1242,6 +1317,7 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             jobs_cancel,
             library_session_get,
             library_session_detail,
+            library_transcript_export,
             library_sessions_list,
             library_proxy_relink,
             app_close_confirm
@@ -1263,6 +1339,22 @@ mod tests {
         specta_builder()
             .export(Typescript::default(), "../src/lib/bindings.ts")
             .expect("failed to export typescript bindings");
+    }
+
+    #[test]
+    fn transcript_export_write_saves_the_rendered_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.txt");
+        write_transcript_export(&path, "[00:00] hello").unwrap();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "[00:00] hello");
+    }
+
+    #[test]
+    fn transcript_export_write_errors_for_an_unwritable_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing").join("transcript.txt");
+        let error = write_transcript_export(&path, "hello").unwrap_err();
+        assert_eq!(error.category, Category::Storage);
     }
 
     // I/O Matrix "DB không mở được": settings_get/settings_save trả AppError

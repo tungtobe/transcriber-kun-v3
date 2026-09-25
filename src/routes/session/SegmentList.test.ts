@@ -74,6 +74,41 @@ describe('SegmentList', () => {
     expect(onSeek).toHaveBeenCalledWith(10);
   });
 
+  it('marks the active search match and scrolls its segment into view', () => {
+    render(SegmentList, {
+      segments: segments(),
+      currentTime: 0,
+      playing: false,
+      rerunStarting: false,
+      matches: [{ segmentIndex: 1, start: 0, end: 5 }],
+      activeMatchIndex: 0,
+      onSeek: vi.fn(),
+      onTogglePlay: vi.fn(),
+      onRerun: vi.fn(),
+    });
+
+    const mark = screen.getByText('đoạn');
+    expect(mark.tagName).toBe('MARK');
+    expect(mark.className).toContain('search-match-current');
+    expect(Element.prototype.scrollIntoView).toHaveBeenCalledWith({ block: 'center', behavior: 'smooth' });
+  });
+
+  it('does not scroll when there is no active search match', () => {
+    render(SegmentList, {
+      segments: segments(),
+      currentTime: 0,
+      playing: false,
+      rerunStarting: false,
+      matches: [],
+      activeMatchIndex: -1,
+      onSeek: vi.fn(),
+      onTogglePlay: vi.fn(),
+      onRerun: vi.fn(),
+    });
+
+    expect(Element.prototype.scrollIntoView).not.toHaveBeenCalled();
+  });
+
   it('toggles play on Space when focus is on a segment row, without scrolling the page', async () => {
     const onTogglePlay = vi.fn();
     render(SegmentList, {

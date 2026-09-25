@@ -3,7 +3,11 @@
   import { link } from '@keenmate/svelte-spa-router';
   import { i18n } from '../i18n/index.svelte';
   import { commands, type RerunScope, type SessionDetail, type SessionLookup } from '../lib/bindings';
+  import { registerKeymap } from '../lib/keymap';
+  import { formatTranscriptCopyText } from '../lib/transcript-export';
+  import { cycleTranscriptMatch, findTranscriptMatches } from '../lib/transcript-search';
   import { jobsStore } from '../lib/stores/jobs.svelte';
+  import { settingsStore } from '../lib/stores/settings.svelte';
   import SessionHeader from './session/SessionHeader.svelte';
   import PartialBanner from './session/PartialBanner.svelte';
   import SegmentList from './session/SegmentList.svelte';
@@ -28,6 +32,15 @@
   let rerunError = $state<string | null>(null);
   let relinking = $state(false);
   let relinkMessage = $state<string | null>(null);
+  let searchQuery = $state('');
+  let activeMatchIndex = $state(-1);
+  let searchInput = $state<HTMLInputElement | null>(null);
+  let exporting = $state(false);
+  let transcriptActionError = $state<string | null>(null);
+  let transcriptToast = $state<string | null>(null);
+  let transcriptToastTimer: ReturnType<typeof setTimeout> | undefined;
+  let previousSearchQuery: string | undefined;
+  let previousTranscriptId: string | null | undefined;
 
   // Trình phát: state sống ở đây (không phải trong `Player.svelte`) vì
   // `SegmentList` (highlight/click-to-seek/Space toggle) cần đọc/điều khiển
@@ -36,6 +49,120 @@
   let currentTime = $state(0);
   let duration = $state(0);
   let playing = $state(false);
+
+  const searchMatches = $derived.by(() => {
+    const segments = view.kind === 'saved' ? (view.detail.transcript?.segments ?? []) : [];
+    return findTranscriptMatches(segments, searchQuery);
+  });
+
+  $effect(() => {
+    const query = searchQuery;
+    const transcriptId = view.kind === 'saved' ? (view.detail.transcript?.id ?? null) : null;
+    if (query === previousSearchQuery && transcriptId === previousTranscriptId) return;
+    previousSearchQuery = query;
+    previousTranscriptId = transcriptId;
+    const segments = view.kind === 'saved' ? (view.detail.transcript?.segments ?? []) : [];
+    activeMatchIndex = findTranscriptMatches(segments, query).length > 0 ? 0 : -1;
+  });
+  const searchCountLabel = $derived(i18n.t('session.search.count', {
+    current: activeMatchIndex >= 0 && searchMatches.length > 0 ? activeMatchIndex + 1 : 0,
+    total: searchMatches.length,
+  }));
+
+  function setSearchQuery(value: string): void {
+    searchQuery = value;
+  }
+
+  function handleSearchInput(event: Event): void {
+    setSearchQuery((event.currentTarget as HTMLInputElement).value);
+  }
+
+  function moveSearchMatch(direction: -1 | 1): void {
+    activeMatchIndex = cycleTranscriptMatch(activeMatchIndex, searchMatches.length, direction);
+  }
+
+  function handleSearchKeydown(event: KeyboardEvent): void {
+    if (event.key !== 'Enter') return;
+    event.preventDefault();
+    moveSearchMatch(event.shiftKey ? -1 : 1);
+  }
+
+  function focusTranscriptSearch(): void {
+    if (view.kind !== 'saved' || !view.detail.transcript) return;
+    searchInput?.focus();
+    searchInput?.select();
+  }
+
+  $effect(() => {
+    if (view.kind !== 'saved' || !view.detail.transcript) return;
+    const removeMetaFind = registerKeymap({ id: 'session-transcript-find-meta', combo: 'Meta+F', handler: focusTranscriptSearch });
+    const removeControlFind = registerKeymap({ id: 'session-transcript-find-control', combo: 'Control+F', handler: focusTranscriptSearch });
+    return () => {
+      removeMetaFind();
+      removeControlFind();
+    };
+  });
+
+  function showTranscriptToast(message: string): void {
+    if (transcriptToastTimer) clearTimeout(transcriptToastTimer);
+    transcriptToast = message;
+    transcriptToastTimer = setTimeout(() => {
+      transcriptToast = null;
+      transcriptToastTimer = undefined;
+    }, 4_000);
+  }
+
+  async function handleCopyTranscript(transcript: NonNullable<SessionDetail['transcript']>): Promise<void> {
+    transcriptActionError = null;
+    transcriptToast = null;
+    try {
+      const clipboard = navigator.clipboard;
+      if (!clipboard?.writeText) throw new Error('clipboard unavailable');
+      const text = formatTranscriptCopyText(
+        transcript.segments,
+        settingsStore.timestampOffsetSec,
+        {
+          chunkFailed: i18n.t('session.export.gapChunkFailed'),
+          disconnected: i18n.t('session.export.gapDisconnected'),
+          unknown: i18n.t('session.export.gapUnknown'),
+        },
+      );
+      await clipboard.writeText(text);
+      showTranscriptToast(i18n.t('session.export.copySuccess'));
+    } catch {
+      transcriptActionError = i18n.t('session.export.copyError');
+    }
+  }
+
+  async function handleExportTranscript(
+    transcriptId: string,
+    format: 'txt' | 'srt' | 'json',
+  ): Promise<void> {
+    if (exporting) return;
+    exporting = true;
+    transcriptActionError = null;
+    transcriptToast = null;
+    try {
+      const result = await commands.libraryTranscriptExport(
+        transcriptId,
+        format,
+        settingsStore.timestampOffsetSec,
+      );
+      if (result.status !== 'ok') {
+        transcriptActionError = i18n.t('session.export.exportError');
+        return;
+      }
+      if (!result.data.saved) return;
+      const message = format === 'srt' && result.data.hasGaps
+        ? i18n.t('session.export.srtSuccessWithGaps')
+        : i18n.t('session.export.success');
+      showTranscriptToast(message);
+    } catch {
+      transcriptActionError = i18n.t('session.export.exportError');
+    } finally {
+      exporting = false;
+    }
+  }
 
   async function loadDetail(sessionId: string): Promise<void> {
     try {
@@ -69,6 +196,9 @@
 
   async function load(id: string): Promise<void> {
     view = { kind: 'loading' };
+    setSearchQuery('');
+    transcriptActionError = null;
+    transcriptToast = null;
     try {
       const result = await commands.librarySessionGet(id);
       if (result.status === 'ok') {
@@ -96,6 +226,7 @@
 
   onDestroy(() => {
     if (subscribed) jobsStore.unsubscribe();
+    if (transcriptToastTimer) clearTimeout(transcriptToastTimer);
   });
 
   const job = $derived(view.kind === 'job' ? (jobsStore.jobs.get(view.jobId) ?? null) : null);
@@ -208,6 +339,60 @@
       partial={transcript?.status === 'partial'}
     />
 
+    {#if transcript}
+      <div class="transcript-toolbar">
+        <div class="transcript-search">
+          <label for="transcript-search-input">{i18n.t('session.search.label')}</label>
+          <input
+            bind:this={searchInput}
+            id="transcript-search-input"
+            type="search"
+            value={searchQuery}
+            placeholder={i18n.t('session.search.placeholder')}
+            oninput={handleSearchInput}
+            onkeydown={handleSearchKeydown}
+          />
+          <span class="transcript-search-count" role="status" aria-live="polite">{searchCountLabel}</span>
+          <button
+            type="button"
+            class="transcript-toolbar-button"
+            disabled={searchMatches.length === 0}
+            onclick={() => moveSearchMatch(-1)}
+          >
+            {i18n.t('session.search.previous')}
+          </button>
+          <button
+            type="button"
+            class="transcript-toolbar-button"
+            disabled={searchMatches.length === 0}
+            onclick={() => moveSearchMatch(1)}
+          >
+            {i18n.t('session.search.next')}
+          </button>
+        </div>
+        <div class="transcript-export-actions">
+          <button type="button" class="transcript-toolbar-button" disabled={exporting} onclick={() => handleExportTranscript(transcript.id, 'txt')}>
+            {i18n.t('session.export.txt')}
+          </button>
+          <button type="button" class="transcript-toolbar-button" disabled={exporting} onclick={() => handleExportTranscript(transcript.id, 'srt')}>
+            {i18n.t('session.export.srt')}
+          </button>
+          <button type="button" class="transcript-toolbar-button" disabled={exporting} onclick={() => handleExportTranscript(transcript.id, 'json')}>
+            {i18n.t('session.export.json')}
+          </button>
+          <button type="button" class="transcript-toolbar-button transcript-copy-button" onclick={() => handleCopyTranscript(transcript)}>
+            {i18n.t('session.export.copy')}
+          </button>
+        </div>
+        {#if transcriptActionError}
+          <p class="transcript-action-error" role="alert">{transcriptActionError}</p>
+        {/if}
+      </div>
+      {#if transcriptToast}
+        <p class="transcript-toast" role="status" aria-live="polite">{transcriptToast}</p>
+      {/if}
+    {/if}
+
     <div class="session-body">
       <div class="session-main">
         {#if transcript?.status === 'partial'}
@@ -222,6 +407,8 @@
         {/if}
         <SegmentList
           segments={transcript?.segments ?? []}
+          matches={searchMatches}
+          {activeMatchIndex}
           {currentTime}
           {playing}
           rerunStarting={rerunStarting}
@@ -339,6 +526,95 @@
     grid-template-columns: minmax(0, 1fr) var(--panel-detail-width);
     flex: 1;
     min-height: 0;
+  }
+
+  .transcript-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-3);
+    padding: var(--space-3) var(--space-4);
+    border-bottom: 1px solid var(--color-border);
+    background: var(--color-surface);
+  }
+
+  .transcript-search,
+  .transcript-export-actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-2);
+  }
+
+  .transcript-search label {
+    color: var(--color-text-secondary);
+    font-size: var(--text-label-size);
+    font-weight: 600;
+  }
+
+  .transcript-search input {
+    min-width: 180px;
+    min-height: 34px;
+    flex: 1;
+    padding: 0 var(--space-3);
+    border: 1px solid var(--color-border-strong);
+    border-radius: var(--radius-md);
+    background: var(--color-bg);
+    color: var(--color-text);
+    font: inherit;
+  }
+
+  .transcript-search input:focus-visible,
+  .transcript-toolbar-button:focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 2px;
+  }
+
+  .transcript-search-count {
+    min-width: 42px;
+    color: var(--color-text-muted);
+    font-family: var(--font-mono);
+    font-size: var(--text-help-size);
+    font-variant-numeric: tabular-nums;
+    text-align: center;
+  }
+
+  .transcript-toolbar-button {
+    min-height: 34px;
+    padding: 0 var(--space-3);
+    border: 1px solid var(--color-border-strong);
+    border-radius: var(--radius-md);
+    background: var(--color-surface);
+    color: var(--color-text);
+    font: inherit;
+    font-size: var(--text-label-size);
+    cursor: pointer;
+  }
+
+  .transcript-toolbar-button:disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
+  }
+
+  .transcript-copy-button {
+    border-color: var(--color-accent-border);
+    background: var(--color-accent-soft);
+  }
+
+  .transcript-action-error {
+    flex-basis: 100%;
+    margin: 0;
+    color: var(--color-danger);
+    font-size: var(--text-help-size);
+  }
+
+  .transcript-toast {
+    margin: 0;
+    padding: var(--space-2) var(--space-4);
+    background: var(--color-info-soft);
+    color: var(--color-text-secondary);
+    font-size: var(--text-help-size);
   }
 
   .session-main {

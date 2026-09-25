@@ -121,6 +121,12 @@ export const commands = {
 	transcript: TranscriptDetail | null,
 } | null, AppError>(__TAURI_INVOKE("library_session_detail", { sessionId })),
 	/**
+	 *  Export the transcript currently selected in Session detail. Rust reads the
+	 *  transcript by its opaque ID (including private speaker/gap data), applies
+	 *  the display offset, and owns both the system dialog and file write.
+	 */
+	libraryTranscriptExport: (transcriptId: string, format: TranscriptExportFormat, offsetSec: number | null) => typedError<TranscriptExportOutcome, AppError>(__TAURI_INVOKE("library_transcript_export", { transcriptId, format, offsetSec })),
+	/**
 	 *  Liệt kê mọi Phiên cho Home (story 2.9): một truy vấn, mới nhất trước, kèm
 	 *  `missing_gap_count` (gap `chunk_failed` của transcript `primary`) — xem
 	 *  [`repo::sessions::list_for_home`] cho logic đọc thật.
@@ -522,6 +528,13 @@ export type TranscriptDetail = {
 	model: string,
 	language: string | null,
 	segments: SegmentDetail[],
+};
+
+export type TranscriptExportFormat = "txt" | "srt" | "json";
+
+export type TranscriptExportOutcome = {
+	saved: boolean,
+	hasGaps: boolean,
 };
 
 /**

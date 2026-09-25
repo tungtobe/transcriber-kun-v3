@@ -12,9 +12,12 @@ const mocks = vi.hoisted(() => {
     librarySessionGet: vi.fn(),
     librarySessionDetail: vi.fn(),
     libraryProxyRelink: vi.fn(),
+    libraryTranscriptExport: vi.fn(),
     jobsSubscribe: vi.fn(),
     jobsCancel: vi.fn(),
     transcribeRerun: vi.fn(),
+    clipboardWriteText: vi.fn(),
+    settingsStore: { timestampOffsetSec: 0 },
     FakeChannel,
     intakeStore: {
       notices: [] as Array<{ id: string; variant: string; title: string; message: string }>,
@@ -38,6 +41,7 @@ vi.mock('../lib/bindings', () => ({
     librarySessionGet: (...args: unknown[]) => mocks.librarySessionGet(...args),
     librarySessionDetail: (...args: unknown[]) => mocks.librarySessionDetail(...args),
     libraryProxyRelink: (...args: unknown[]) => mocks.libraryProxyRelink(...args),
+    libraryTranscriptExport: (...args: unknown[]) => mocks.libraryTranscriptExport(...args),
     jobsSubscribe: (...args: unknown[]) => mocks.jobsSubscribe(...args),
     jobsCancel: (...args: unknown[]) => mocks.jobsCancel(...args),
     transcribeRerun: (...args: unknown[]) => mocks.transcribeRerun(...args),
@@ -48,19 +52,31 @@ vi.mock('../lib/bindings', () => ({
 // keep it a plain fake so this suite never boots the real store (which needs
 // its own `events`/`commands.settingsGet` wiring — out of scope here).
 vi.mock('../lib/stores/settings.svelte', () => ({
-  settingsStore: { timestampOffsetSec: 0 },
+  settingsStore: mocks.settingsStore,
 }));
 
 type CapturedChannel = { onmessage: (event: unknown) => void };
 let capturedChannel: CapturedChannel | null = null;
 
-afterEach(() => cleanup());
+afterEach(() => {
+  cleanup();
+  vi.useRealTimers();
+});
 
 beforeEach(async () => {
   i18n.applyPreference('vi');
   mocks.librarySessionGet.mockReset();
   mocks.librarySessionDetail.mockReset();
   mocks.libraryProxyRelink.mockReset();
+  mocks.libraryTranscriptExport.mockReset();
+  mocks.clipboardWriteText.mockReset();
+  mocks.settingsStore.timestampOffsetSec = 0;
+  mocks.libraryTranscriptExport.mockResolvedValue({ status: 'ok', data: { saved: false, hasGaps: false } });
+  mocks.clipboardWriteText.mockResolvedValue(undefined);
+  Object.defineProperty(navigator, 'clipboard', {
+    configurable: true,
+    value: { writeText: (...args: unknown[]) => mocks.clipboardWriteText(...args) },
+  });
   mocks.jobsSubscribe.mockReset();
   mocks.jobsCancel.mockReset();
   mocks.transcribeRerun.mockReset();
@@ -137,6 +153,160 @@ describe('Session route', () => {
     expect(screen.getByText('xin chào')).toBeTruthy();
     expect(screen.getByText('các bạn')).toBeTruthy();
     expect(mocks.jobsSubscribe).not.toHaveBeenCalled();
+  });
+
+  it('searches the selected transcript, highlights matches, and cycles forward and backward', async () => {
+    mocks.librarySessionGet.mockResolvedValue({
+      status: 'ok',
+      data: { kind: 'session', sessionId: 's1', title: 'cuộc họp', durationSec: 120, status: 'complete', partial: false, transcriptId: 't1' },
+    });
+    mocks.librarySessionDetail.mockResolvedValue({
+      status: 'ok',
+      data: detail({
+        transcript: {
+          id: 't1', variant: 'primary', status: 'complete', model: 'm', language: null,
+          segments: [textSegment(0, 0, 10, 'Giao diện đầu'), textSegment(1, 10, 20, 'Giao diện sau')],
+        },
+      }),
+    });
+    render(Session, { routeParams: { id: 's1' } });
+
+    const input = await screen.findByRole('searchbox', { name: 'Tìm trong transcript' });
+    await fireEvent.input(input, { target: { value: '  giao   diện  ' } });
+    expect(screen.getByText('1/2')).toBeTruthy();
+    expect(document.querySelectorAll('mark').length).toBe(2);
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Tiếp' }));
+    expect(screen.getByText('2/2')).toBeTruthy();
+    await fireEvent.keyDown(input, { key: 'Enter' });
+    expect(screen.getByText('1/2')).toBeTruthy();
+    await fireEvent.keyDown(input, { key: 'Enter', shiftKey: true });
+    expect(screen.getByText('2/2')).toBeTruthy();
+    await fireEvent.click(screen.getByRole('button', { name: 'Trước' }));
+    expect(screen.getByText('1/2')).toBeTruthy();
+    expect(Element.prototype.scrollIntoView).toHaveBeenCalled();
+  });
+
+  it('shows 0/0 for an empty or absent query, disables navigation, and does not scroll', async () => {
+    mocks.librarySessionGet.mockResolvedValue({
+      status: 'ok',
+      data: { kind: 'session', sessionId: 's1', title: 'cuộc họp', durationSec: 120, status: 'complete', partial: false, transcriptId: 't1' },
+    });
+    mocks.librarySessionDetail.mockResolvedValue({ status: 'ok', data: detail() });
+    render(Session, { routeParams: { id: 's1' } });
+
+    const input = await screen.findByRole('searchbox', { name: 'Tìm trong transcript' });
+    expect(screen.getByText('0/0')).toBeTruthy();
+    expect((screen.getByRole('button', { name: 'Trước' }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole('button', { name: 'Tiếp' }) as HTMLButtonElement).disabled).toBe(true);
+    await fireEvent.input(input, { target: { value: 'không có' } });
+    expect(screen.getByText('0/0')).toBeTruthy();
+    expect(Element.prototype.scrollIntoView).not.toHaveBeenCalled();
+  });
+
+  it('focuses transcript search on Meta+F and Control+F in the saved detail view', async () => {
+    mocks.librarySessionGet.mockResolvedValue({
+      status: 'ok',
+      data: { kind: 'session', sessionId: 's1', title: 'cuộc họp', durationSec: 120, status: 'complete', partial: false, transcriptId: 't1' },
+    });
+    mocks.librarySessionDetail.mockResolvedValue({ status: 'ok', data: detail() });
+    render(Session, { routeParams: { id: 's1' } });
+
+    const input = await screen.findByRole('searchbox', { name: 'Tìm trong transcript' });
+    const { installKeymap } = await import('../lib/keymap');
+    const removeKeymap = installKeymap(document);
+    (input as HTMLInputElement).blur();
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'f', metaKey: true, bubbles: true }));
+    expect(document.activeElement).toBe(input);
+    (input as HTMLInputElement).blur();
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'f', ctrlKey: true, bubbles: true }));
+    expect(document.activeElement).toBe(input);
+    removeKeymap();
+  });
+
+  it('copies all transcript text and gap notes, shows a polite toast, and expires it after four seconds', async () => {
+    mocks.librarySessionGet.mockResolvedValue({
+      status: 'ok',
+      data: { kind: 'session', sessionId: 's1', title: 'cuộc họp', durationSec: 120, status: 'partial', partial: true, transcriptId: 't1' },
+    });
+    mocks.settingsStore.timestampOffsetSec = 3_600;
+    mocks.librarySessionDetail.mockResolvedValue({
+      status: 'ok',
+      data: detail({
+        transcript: {
+          id: 't1', variant: 'primary', status: 'partial', model: 'm', language: null,
+          segments: [textSegment(0, 0, 10, 'xin chào'), gapSegment(1, 10, 20, 'chunk_failed')],
+        },
+      }),
+    });
+    render(Session, { routeParams: { id: 's1' } });
+    const copyButton = await screen.findByRole('button', { name: 'Copy toàn bộ' });
+
+    vi.useFakeTimers();
+    await fireEvent.click(copyButton);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(mocks.clipboardWriteText).toHaveBeenCalledWith(
+      '[01:00:00] xin chào\n[01:00:10–01:00:20] Khoảng này bị lỗi khi transcribe',
+    );
+    const toast = screen.getByText('Đã copy transcript.');
+    expect(toast.getAttribute('aria-live')).toBe('polite');
+    await vi.advanceTimersByTimeAsync(3_999);
+    expect(screen.queryByText('Đã copy transcript.')).toBeTruthy();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(screen.queryByText('Đã copy transcript.')).toBeNull();
+  });
+
+  it('reports clipboard failures inline and never shows a success toast', async () => {
+    mocks.librarySessionGet.mockResolvedValue({
+      status: 'ok',
+      data: { kind: 'session', sessionId: 's1', title: 'cuộc họp', durationSec: 120, status: 'complete', partial: false, transcriptId: 't1' },
+    });
+    mocks.librarySessionDetail.mockResolvedValue({ status: 'ok', data: detail() });
+    mocks.clipboardWriteText.mockRejectedValue(new Error('denied'));
+    render(Session, { routeParams: { id: 's1' } });
+
+    await fireEvent.click(await screen.findByRole('button', { name: 'Copy toàn bộ' }));
+    expect((await screen.findByRole('alert')).textContent).toContain('Không thể copy transcript.');
+    expect(screen.queryByText('Đã copy transcript.')).toBeNull();
+  });
+
+  it('exports the selected transcript and offset; cancellation stays silent', async () => {
+    mocks.librarySessionGet.mockResolvedValue({
+      status: 'ok',
+      data: { kind: 'session', sessionId: 's1', title: 'cuộc họp', durationSec: 120, status: 'partial', partial: true, transcriptId: 't1' },
+    });
+    mocks.settingsStore.timestampOffsetSec = 42;
+    mocks.librarySessionDetail.mockResolvedValue({
+      status: 'ok',
+      data: detail({ transcript: { ...detail().transcript, status: 'partial', segments: [gapSegment(0, 0, 10, 'chunk_failed')] } }),
+    });
+    render(Session, { routeParams: { id: 's1' } });
+
+    await fireEvent.click(await screen.findByRole('button', { name: 'Xuất TXT' }));
+    expect(mocks.libraryTranscriptExport).toHaveBeenCalledWith('t1', 'txt', 42);
+    expect(screen.queryByText('Đã lưu transcript.')).toBeNull();
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('reports SRT gap omission after a successful save and shows export errors inline', async () => {
+    mocks.librarySessionGet.mockResolvedValue({
+      status: 'ok',
+      data: { kind: 'session', sessionId: 's1', title: 'cuộc họp', durationSec: 120, status: 'partial', partial: true, transcriptId: 't1' },
+    });
+    mocks.librarySessionDetail.mockResolvedValue({
+      status: 'ok',
+      data: detail({ transcript: { ...detail().transcript, status: 'partial', segments: [gapSegment(0, 0, 10, 'chunk_failed')] } }),
+    });
+    mocks.libraryTranscriptExport.mockResolvedValueOnce({ status: 'ok', data: { saved: true, hasGaps: true } })
+      .mockResolvedValueOnce({ status: 'error', error: { category: 'storage', code: 'storage', detailRedacted: 'disk full' } });
+    render(Session, { routeParams: { id: 's1' } });
+
+    await fireEvent.click(await screen.findByRole('button', { name: 'Xuất SRT' }));
+    expect(await screen.findByText('Đã lưu SRT. Các khoảng thiếu không được đưa vào phụ đề.')).toBeTruthy();
+    await fireEvent.click(screen.getByRole('button', { name: 'Xuất JSON' }));
+    expect((await screen.findByRole('alert')).textContent).toContain('Không thể xuất transcript.');
+    expect(screen.queryByText('Đã lưu transcript.')).toBeNull();
   });
 
   it('shows a partial banner listing the chunk_failed ranges, with two rerun buttons', async () => {

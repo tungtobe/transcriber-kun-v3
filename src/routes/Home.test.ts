@@ -54,7 +54,7 @@ const mocks = vi.hoisted(() => ({
     status: 'subscribed' as 'idle' | 'subscribed' | 'error',
     subscribe: vi.fn(() => Promise.resolve()),
     unsubscribe: vi.fn(),
-    cancel: vi.fn(() => Promise.resolve('cancelling')),
+    cancel: vi.fn<() => Promise<'cancelling' | 'alreadyFinished' | null>>(() => Promise.resolve('cancelling')),
   },
   libraryStore: {
     sessions: [] as unknown[],

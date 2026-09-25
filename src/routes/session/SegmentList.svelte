@@ -11,6 +11,7 @@
   import type { RerunScope } from '../../lib/bindings';
   import { i18n } from '../../i18n/index.svelte';
   import { displayTimestamp } from '../../lib/time';
+  import type { TranscriptSearchMatch } from '../../lib/transcript-search';
   import { RotateCcwIcon, ChevronDownIcon } from '../../components/icons';
 
   export type SegmentDetailView = {
@@ -26,6 +27,8 @@
     segments,
     currentTime,
     playing,
+    matches = [],
+    activeMatchIndex = -1,
     rerunStarting,
     onSeek,
     onTogglePlay,
@@ -36,6 +39,8 @@
      * "highlight so `currentTime` gốc với `[start, end)`"). */
     currentTime: number;
     playing: boolean;
+    matches?: TranscriptSearchMatch[];
+    activeMatchIndex?: number;
     rerunStarting: boolean;
     onSeek: (startSec: number) => void;
     onTogglePlay: () => void;
@@ -44,6 +49,42 @@
 
   let rowEls = new Map<number, HTMLElement>();
   let autoScroll = $state(true);
+
+  type IndexedMatch = TranscriptSearchMatch & { matchIndex: number };
+  type TextPart = { text: string; matched: boolean; current: boolean };
+
+  const matchesBySegment = $derived.by(() => {
+    const grouped = new Map<number, IndexedMatch[]>();
+    matches.forEach((match, matchIndex) => {
+      const group = grouped.get(match.segmentIndex) ?? [];
+      group.push({ ...match, matchIndex });
+      grouped.set(match.segmentIndex, group);
+    });
+    return grouped;
+  });
+
+  function textParts(segmentIndex: number, text: string): TextPart[] {
+    const segmentMatches = matchesBySegment.get(segmentIndex) ?? [];
+    if (segmentMatches.length === 0) return [{ text, matched: false, current: false }];
+
+    const parts: TextPart[] = [];
+    let cursor = 0;
+    for (const match of segmentMatches) {
+      const start = Math.max(cursor, Math.min(text.length, match.start));
+      const end = Math.max(start, Math.min(text.length, match.end));
+      if (start > cursor) parts.push({ text: text.slice(cursor, start), matched: false, current: false });
+      if (end > start) {
+        parts.push({ text: text.slice(start, end), matched: true, current: match.matchIndex === activeMatchIndex });
+        cursor = end;
+      }
+    }
+    if (cursor < text.length) parts.push({ text: text.slice(cursor), matched: false, current: false });
+    return parts;
+  }
+
+  function hasCurrentSearchMatch(segmentIndex: number): boolean {
+    return (matchesBySegment.get(segmentIndex) ?? []).some((match) => match.matchIndex === activeMatchIndex);
+  }
 
   function sec(value: number | null): number {
     return value ?? 0;
@@ -71,6 +112,11 @@
     const index = activeIndex;
     if (!playing || !autoScroll || index < 0) return;
     scrollRowIntoView(index, 'nearest');
+  });
+
+  $effect(() => {
+    const match = matches[activeMatchIndex];
+    if (match) scrollRowIntoView(match.segmentIndex, 'center');
   });
 
   function handleUserScrollSignal(): void {
@@ -137,6 +183,7 @@
           class="segment-row segment-row-gap"
           class:segment-row-gap-failed={segment.gapReason === 'chunk_failed'}
           class:segment-row-active={activeIndex === index}
+          class:segment-row-search-active={hasCurrentSearchMatch(index)}
           aria-current={activeIndex === index ? 'true' : undefined}
           use:registerRow={index}
         >
@@ -164,6 +211,7 @@
         <div
           class="segment-row"
           class:segment-row-active={activeIndex === index}
+          class:segment-row-search-active={hasCurrentSearchMatch(index)}
           role="button"
           tabindex="0"
           aria-current={activeIndex === index ? 'true' : undefined}
@@ -177,7 +225,15 @@
           }}
         >
           <span class="segment-time">{displayTimestamp(sec(segment.startSec))}</span>
-          <p class="segment-text">{segment.text}</p>
+          <p class="segment-text">
+            {#each textParts(index, segment.text) as part}
+              {#if part.matched}
+                <mark class:search-match-current={part.current}>{part.text}</mark>
+              {:else}
+                {part.text}
+              {/if}
+            {/each}
+          </p>
         </div>
       {/if}
     {/each}
@@ -225,6 +281,11 @@
     background: var(--color-accent-soft);
   }
 
+  .segment-row-search-active {
+    outline: 2px solid var(--color-accent);
+    outline-offset: -2px;
+  }
+
   .segment-time {
     color: var(--color-text-muted);
     font-family: var(--font-mono);
@@ -238,6 +299,17 @@
     color: var(--color-text);
     font-size: var(--text-body-size);
     line-height: 1.55;
+  }
+
+  mark {
+    border-radius: 2px;
+    background: var(--color-mark);
+    color: var(--color-text);
+  }
+
+  mark.search-match-current {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 1px;
   }
 
   .segment-row-gap {

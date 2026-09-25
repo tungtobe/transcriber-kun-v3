@@ -330,6 +330,14 @@ pub struct TranscriptDetail {
     pub segments: Vec<SegmentDetail>,
 }
 
+/// Transcript record for export. Unlike [`TranscriptDetail`], this keeps
+/// speaker labels because the detail UI intentionally does not display them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TranscriptExportData {
+    pub transcript: repo::transcripts::TranscriptRow,
+    pub segments: Vec<repo::segments::SegmentRow>,
+}
+
 /// Chi tiết đầy đủ một Phiên cho `/session/:id` (story 2.7, Task:
 /// "`SessionDetail { session_id, kind, title, created_at, duration_sec,
 /// recovered, source_name, proxy_path, transcript }`"). `proxy_path` là
@@ -430,6 +438,25 @@ pub fn get_detail(
         proxy_path,
         transcript,
     }))
+}
+
+/// Read one transcript and all of its segments for export. The caller passes
+/// the selected transcript's opaque ID; every field, including speaker and
+/// gap data, comes from the same DB connection and segment order.
+pub fn get_export_data(
+    db: &Db,
+    transcript_id: TranscriptId,
+) -> Result<Option<TranscriptExportData>, AppError> {
+    db.with_connection(|conn| {
+        let Some(transcript) = repo::transcripts::get(conn, transcript_id)? else {
+            return Ok(None);
+        };
+        let segments = repo::segments::list_for_transcript(conn, transcript_id)?;
+        Ok(Some(TranscriptExportData {
+            transcript,
+            segments,
+        }))
+    })
 }
 
 /// Kết quả [`relink_proxy`] (spec I/O Matrix "Chọn lại khớp/sai/Phiên live").
@@ -797,6 +824,56 @@ mod tests {
                 segments: vec![text_segment(0.0, 1.0, "xin chào")],
             },
         }
+    }
+
+    #[test]
+    fn get_export_data_reads_speaker_and_gap_from_the_selected_transcript() {
+        let root = tempdir().unwrap();
+        let db = open_db(root.path());
+        let session_id = SessionId::new();
+        let outcome = commit_file_session(
+            &db,
+            root.path(),
+            JobId::new(),
+            session_id,
+            FileSessionDraft {
+                session: SessionDraft {
+                    title: "meeting".to_string(),
+                    source_hash: None,
+                    source_name: None,
+                    duration_sec: 5.0,
+                },
+                transcript: TranscriptDraft {
+                    model: "model".to_string(),
+                    language: Some("en".to_string()),
+                    segments: vec![
+                        SegmentDraft {
+                            start_sec: 0.0,
+                            end_sec: 2.0,
+                            kind: SegmentKind::Text,
+                            gap_reason: None,
+                            text: "hello".to_string(),
+                            speaker: Some("speaker-a".to_string()),
+                        },
+                        gap_segment(2.0, 3.0, GapReason::ChunkFailed),
+                    ],
+                },
+            },
+            Err(storage_error("no proxy in export test")),
+        )
+        .unwrap();
+        let transcript_id = db
+            .with_connection(|conn| {
+                Ok(repo::transcripts::primary_for_session(conn, outcome.session_id)?.unwrap())
+            })
+            .unwrap();
+
+        let data = get_export_data(&db, transcript_id).unwrap().unwrap();
+        assert_eq!(data.transcript.session_id, session_id);
+        assert_eq!(data.segments[0].speaker.as_deref(), Some("speaker-a"));
+        assert_eq!(data.segments[1].kind, SegmentKind::Gap);
+        assert_eq!(data.segments[1].gap_reason, Some(GapReason::ChunkFailed));
+        assert!(get_export_data(&db, TranscriptId::new()).unwrap().is_none());
     }
 
     /// Dựng một Proxy staging thật (không phụ thuộc `media::create_proxy`,
