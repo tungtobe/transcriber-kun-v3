@@ -148,14 +148,20 @@
   }
 
   function registerRow(node: HTMLElement, index: number) {
-    rowEls.set(index, node);
+    // `current` is reassigned on every `update` so a row that shifts more
+    // than once (e.g. key 5 -> 6 -> 7 as earlier rows are added/removed)
+    // still deletes the index it actually holds, not the index it was
+    // registered under the first time (spec Boundaries: `registerRow`).
+    let current = index;
+    rowEls.set(current, node);
     return {
       update(nextIndex: number) {
-        rowEls.delete(index);
-        rowEls.set(nextIndex, node);
+        rowEls.delete(current);
+        current = nextIndex;
+        rowEls.set(current, node);
       },
       destroy() {
-        rowEls.delete(index);
+        rowEls.delete(current);
       },
     };
   }

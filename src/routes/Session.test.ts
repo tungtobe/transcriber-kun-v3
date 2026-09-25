@@ -60,6 +60,15 @@ vi.mock('../lib/stores/settings.svelte', () => ({
 type CapturedChannel = { onmessage: (event: unknown) => void };
 let capturedChannel: CapturedChannel | null = null;
 
+// The vi.json `session.export.gap*` strings — what `handleExportTranscript`
+// must pass through as `gapLabels` (spec Always: "same ... strings that Copy
+// uses").
+const VI_GAP_LABELS = {
+  chunkFailed: 'Khoảng này bị lỗi khi transcribe',
+  disconnected: 'Mất kết nối',
+  unknown: 'Khoảng thiếu',
+};
+
 afterEach(() => {
   cleanup();
   vi.useRealTimers();
@@ -287,7 +296,7 @@ describe('Session route', () => {
     render(Session, { routeParams: { id: 's1' } });
 
     await fireEvent.click(await screen.findByRole('button', { name: 'Xuất TXT' }));
-    expect(mocks.libraryTranscriptExport).toHaveBeenCalledWith('s1', 't1', 'txt', 42);
+    expect(mocks.libraryTranscriptExport).toHaveBeenCalledWith('s1', 't1', 'txt', 42, VI_GAP_LABELS);
     expect(screen.queryByText('Đã lưu transcript.')).toBeNull();
     expect(screen.queryByRole('alert')).toBeNull();
   });
@@ -444,6 +453,143 @@ describe('Session route', () => {
     expect(mocks.librarySessionDetail).toHaveBeenCalledTimes(1);
   });
 
+  it('stays silent on a cancelled relink dialog — no message, no reload', async () => {
+    mocks.librarySessionGet.mockResolvedValue({
+      status: 'ok',
+      data: { kind: 'session', sessionId: 's1', title: 'cuộc họp', durationSec: 120, status: 'complete', partial: false, transcriptId: 't1' },
+    });
+    mocks.librarySessionDetail.mockResolvedValue({ status: 'ok', data: detail({ proxyPath: null }) });
+    mocks.libraryProxyRelink.mockResolvedValue({ status: 'ok', data: 'cancelled' });
+    render(Session, { routeParams: { id: 's1' } });
+
+    const relinkButton = await screen.findByRole('button', { name: 'Chọn lại file nguồn' });
+    await fireEvent.click(relinkButton);
+    await waitFor(() => expect(mocks.libraryProxyRelink).toHaveBeenCalledWith('s1'));
+
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(mocks.librarySessionDetail).toHaveBeenCalledTimes(1);
+    expect(screen.getByText('Không có audio · Chọn lại file nguồn')).toBeTruthy();
+  });
+
+  it('shows the live-unsupported message and keeps the Transcript unchanged', async () => {
+    mocks.librarySessionGet.mockResolvedValue({
+      status: 'ok',
+      data: { kind: 'session', sessionId: 's1', title: 'cuộc họp', durationSec: 120, status: 'complete', partial: false, transcriptId: 't1' },
+    });
+    mocks.librarySessionDetail.mockResolvedValue({ status: 'ok', data: detail({ proxyPath: null, kind: 'live' }) });
+    mocks.libraryProxyRelink.mockResolvedValue({ status: 'ok', data: 'liveUnsupported' });
+    render(Session, { routeParams: { id: 's1' } });
+
+    const relinkButton = await screen.findByRole('button', { name: 'Chọn lại file nguồn' });
+    await fireEvent.click(relinkButton);
+
+    expect(await screen.findByText('Phiên live này chưa có Recording để tái tạo.')).toBeTruthy();
+    expect(mocks.librarySessionDetail).toHaveBeenCalledTimes(1);
+  });
+
+  it('shows the generic relink error message when the IPC call itself fails', async () => {
+    mocks.librarySessionGet.mockResolvedValue({
+      status: 'ok',
+      data: { kind: 'session', sessionId: 's1', title: 'cuộc họp', durationSec: 120, status: 'complete', partial: false, transcriptId: 't1' },
+    });
+    mocks.librarySessionDetail.mockResolvedValue({ status: 'ok', data: detail({ proxyPath: null }) });
+    mocks.libraryProxyRelink.mockResolvedValue({
+      status: 'error',
+      error: { category: 'storage', code: 'storage', detailRedacted: 'dialog failed' },
+    });
+    render(Session, { routeParams: { id: 's1' } });
+
+    const relinkButton = await screen.findByRole('button', { name: 'Chọn lại file nguồn' });
+    await fireEvent.click(relinkButton);
+
+    expect(await screen.findByText('Không chọn được file. Thử lại sau.')).toBeTruthy();
+    expect(mocks.librarySessionDetail).toHaveBeenCalledTimes(1);
+  });
+
+  it('drops a stale relink result after navigating away — B unaffected, no relink message (spec I/O Matrix "Relink then navigate")', async () => {
+    mocks.librarySessionGet.mockImplementation((id: string) => Promise.resolve({
+      status: 'ok',
+      data: { kind: 'session', sessionId: id, title: id, durationSec: 120, status: 'complete', partial: false, transcriptId: 't1' },
+    }));
+    mocks.librarySessionDetail.mockImplementation((id: string) => Promise.resolve({
+      status: 'ok',
+      data: detail({ sessionId: id, title: id, proxyPath: id === 's1' ? null : '/data/media/s2/proxy.flac' }),
+    }));
+    let resolveRelink: (value: unknown) => void = () => {};
+    const pendingRelink = new Promise((resolve) => { resolveRelink = resolve; });
+    mocks.libraryProxyRelink.mockReturnValue(pendingRelink);
+
+    const { rerender } = render(Session, { routeParams: { id: 's1' } });
+    const relinkButton = await screen.findByRole('button', { name: 'Chọn lại file nguồn' });
+    await fireEvent.click(relinkButton);
+    expect(mocks.libraryProxyRelink).toHaveBeenCalledWith('s1');
+
+    await rerender({ routeParams: { id: 's2' } });
+    expect(await screen.findByRole('heading', { name: 's2' })).toBeTruthy();
+
+    resolveRelink({ status: 'ok', data: 'hashMismatch' });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('drops a stale detail load — slow load A, navigate to B, A resolves after: view shows B (spec I/O Matrix "Slow detail")', async () => {
+    mocks.librarySessionGet.mockImplementation((id: string) => Promise.resolve({
+      status: 'ok',
+      data: { kind: 'session', sessionId: id, title: id, durationSec: 120, status: 'complete', partial: false, transcriptId: 't1' },
+    }));
+    let resolveA: (value: unknown) => void = () => {};
+    const pendingA = new Promise((resolve) => { resolveA = resolve; });
+    mocks.librarySessionDetail.mockImplementation((id: string) => {
+      if (id === 's1') return pendingA;
+      return Promise.resolve({ status: 'ok', data: detail({ sessionId: id, title: id }) });
+    });
+
+    const { rerender } = render(Session, { routeParams: { id: 's1' } });
+    await waitFor(() => expect(mocks.librarySessionDetail).toHaveBeenCalledWith('s1'));
+
+    await rerender({ routeParams: { id: 's2' } });
+    expect(await screen.findByRole('heading', { name: 's2' })).toBeTruthy();
+
+    resolveA({ status: 'ok', data: detail({ sessionId: 's1', title: 's1' }) });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(screen.queryByRole('heading', { name: 's1' })).toBeNull();
+    expect(screen.getByRole('heading', { name: 's2' })).toBeTruthy();
+  });
+
+  it('drops a stale export result after navigating away — B\'s export buttons stay enabled and A\'s toast never shows on B (spec I/O Matrix "Export then navigate")', async () => {
+    mocks.librarySessionGet.mockImplementation((id: string) => Promise.resolve({
+      status: 'ok',
+      data: { kind: 'session', sessionId: id, title: id, durationSec: 120, status: 'complete', partial: false, transcriptId: 't1' },
+    }));
+    mocks.librarySessionDetail.mockImplementation((id: string) => Promise.resolve({
+      status: 'ok',
+      data: detail({ sessionId: id, title: id }),
+    }));
+    let resolveExport: (value: unknown) => void = () => {};
+    const pendingExport = new Promise((resolve) => { resolveExport = resolve; });
+    mocks.libraryTranscriptExport.mockReturnValue(pendingExport);
+
+    const { rerender } = render(Session, { routeParams: { id: 's1' } });
+    const exportButtonA = await screen.findByRole('button', { name: 'Xuất TXT' });
+    await fireEvent.click(exportButtonA);
+    expect((exportButtonA as HTMLButtonElement).disabled).toBe(true);
+
+    await rerender({ routeParams: { id: 's2' } });
+    const exportButtonB = await screen.findByRole('button', { name: 'Xuất TXT' });
+    expect((exportButtonB as HTMLButtonElement).disabled).toBe(false);
+
+    resolveExport({ status: 'ok', data: { saved: true, hasGaps: false } });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(screen.queryByText('Đã lưu transcript.')).toBeNull();
+    expect((exportButtonB as HTMLButtonElement).disabled).toBe(false);
+  });
+
   it('shows "not found" when the detail lookup returns null after a session lookup', async () => {
     mocks.librarySessionGet.mockResolvedValue({
       status: 'ok',
@@ -497,7 +643,12 @@ describe('Session route', () => {
 
     const summary = screen.getByText('Nhật ký diễn biến');
     await fireEvent.click(summary);
-    expect(screen.getAllByText(/Đoạn 6 \/ 18/).length).toBeGreaterThan(0);
+    // The main card also shows "Đoạn 6 / 18" on its own, in a separate <p> —
+    // asserting on that alone would pass even if the log panel rendered
+    // nothing. The log line joins state/chunk/key/attempt with " · " into
+    // one string that only the log panel's <li> renders (spec Tasks: "a line
+    // unique to the log panel").
+    expect(screen.getByText('Đang transcribe · Đoạn 6 / 18 · Key thứ 2 · Lần thử 1')).toBeTruthy();
   });
 
   it('re-resolves to the saved Phiên once the Job leaves the registry', async () => {

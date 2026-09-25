@@ -207,6 +207,62 @@ describe('SegmentList', () => {
     expect(screen.queryByRole('button', { name: 'Xuống dòng đang phát' })).toBeNull();
   });
 
+  it('stops auto-scroll on ArrowDown while playing, and shows the jump-to-active button', async () => {
+    render(SegmentList, {
+      segments: segments(),
+      currentTime: 12,
+      playing: true,
+      rerunStarting: false,
+      onSeek: vi.fn(),
+      onTogglePlay: vi.fn(),
+      onRerun: vi.fn(),
+    });
+
+    const region = screen.getByRole('region', { name: 'Danh sách đoạn transcript' });
+    expect(screen.queryByRole('button', { name: 'Xuống dòng đang phát' })).toBeNull();
+
+    await fireEvent.keyDown(region, { key: 'ArrowDown' });
+
+    expect(await screen.findByRole('button', { name: 'Xuống dòng đang phát' })).toBeTruthy();
+  });
+
+  it('stops auto-scroll on PageDown while playing, and shows the jump-to-active button', async () => {
+    render(SegmentList, {
+      segments: segments(),
+      currentTime: 12,
+      playing: true,
+      rerunStarting: false,
+      onSeek: vi.fn(),
+      onTogglePlay: vi.fn(),
+      onRerun: vi.fn(),
+    });
+
+    const region = screen.getByRole('region', { name: 'Danh sách đoạn transcript' });
+    expect(screen.queryByRole('button', { name: 'Xuống dòng đang phát' })).toBeNull();
+
+    await fireEvent.keyDown(region, { key: 'PageDown' });
+
+    expect(await screen.findByRole('button', { name: 'Xuống dòng đang phát' })).toBeTruthy();
+  });
+
+  it('does not stop auto-scroll on ArrowDown/PageDown while paused', async () => {
+    render(SegmentList, {
+      segments: segments(),
+      currentTime: 12,
+      playing: false,
+      rerunStarting: false,
+      onSeek: vi.fn(),
+      onTogglePlay: vi.fn(),
+      onRerun: vi.fn(),
+    });
+
+    const region = screen.getByRole('region', { name: 'Danh sách đoạn transcript' });
+    await fireEvent.keyDown(region, { key: 'ArrowDown' });
+    await fireEvent.keyDown(region, { key: 'PageDown' });
+
+    expect(screen.queryByRole('button', { name: 'Xuống dòng đang phát' })).toBeNull();
+  });
+
   it('does not react to wheel scrolling while paused', async () => {
     render(SegmentList, {
       segments: segments(),
