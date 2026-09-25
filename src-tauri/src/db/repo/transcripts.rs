@@ -88,6 +88,7 @@ fn derive_status(segment_drafts: &[SegmentDraft]) -> Status {
 /// `replace_primary_transcript`) bọc lời gọi này trong transaction của chính
 /// nó, cùng với việc ghi `sessions` (spec Tasks: "trong transaction của
 /// caller").
+#[allow(clippy::too_many_arguments)]
 pub fn insert_with_segments(
     conn: &Connection,
     id: TranscriptId,
