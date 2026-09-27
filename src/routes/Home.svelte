@@ -14,6 +14,7 @@
   import JobCard from '../components/JobCard.svelte';
   import SessionList from './home/SessionList.svelte';
   import SessionListSkeleton from './home/SessionListSkeleton.svelte';
+  import TagFilterBar from './home/TagFilterBar.svelte';
   import { i18n } from '../i18n/index.svelte';
   import { keysStore } from '../lib/stores/keys.svelte';
   import { intakeStore } from '../lib/stores/intake.svelte';
@@ -36,6 +37,7 @@
     subscribedJobs = true;
     void jobsStore.subscribe();
     void libraryStore.load();
+    void libraryStore.loadTags();
   });
 
   onDestroy(() => {
@@ -219,9 +221,14 @@
       {#if libraryStore.reloadError}
         <p class="reload-error" role="status">{i18n.t('home.list.reloadError')}</p>
       {/if}
-      <div class="session-list-wrap">
-        <SessionList sessions={libraryStore.sessions} viewportHeight={sessionListViewportHeight} />
-      </div>
+      <TagFilterBar />
+      {#if libraryStore.sessions.length > 0 && libraryStore.filteredSessions.length === 0}
+        <p class="filter-empty" role="status">{i18n.t('home.list.filterEmpty')}</p>
+      {:else}
+        <div class="session-list-wrap">
+          <SessionList sessions={libraryStore.filteredSessions} viewportHeight={sessionListViewportHeight} />
+        </div>
+      {/if}
     {/if}
   {/if}
 </section>
@@ -412,6 +419,15 @@
     margin: 0 0 var(--space-3);
     color: var(--color-warning);
     font-size: var(--text-help-size);
+  }
+
+  .filter-empty {
+    margin: 0;
+    padding: var(--space-6);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-xl);
+    color: var(--color-text-secondary);
+    text-align: center;
   }
 
   .session-list-wrap {

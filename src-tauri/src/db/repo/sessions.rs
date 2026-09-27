@@ -1,9 +1,11 @@
 //! SQL cho bảng `sessions` — nơi duy nhất khác ngoài `db/migrations/mod.rs`
 //! được phép chứa câu SQL cho bảng này (spec Boundaries).
 
+use std::collections::HashMap;
+
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::core::id::SessionId;
+use crate::core::id::{SessionId, TagId};
 
 /// Tham số chèn một Phiên mới. `kind`/`status` là chuỗi thô khớp CHECK ở
 /// migration (`"file"`/`"live"`, `"recording"`/`"finalizing"`/`"complete"`) —
@@ -183,7 +185,9 @@ pub fn find_by_source_hash(
 /// ngày, thời lượng, badge `partial`/`recover`) mà không cần chi tiết
 /// segment. `missing_gap_count` là số Segment gap `chunk_failed` của
 /// transcript `primary` hiện tại của Phiên (`disconnected` không tính, và
-/// Phiên chưa có `primary` -> 0) — spec I/O Matrix "Partial".
+/// Phiên chưa có `primary` -> 0) — spec I/O Matrix "Partial". `tag_ids` (story
+/// 3.2) là mọi tag đang gắn với Phiên này, không thứ tự cụ thể — frontend tra
+/// tên qua `tags_list` đã tải riêng.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionListRow {
     pub id: SessionId,
@@ -193,14 +197,18 @@ pub struct SessionListRow {
     pub duration_sec: f64,
     pub recovered: bool,
     pub missing_gap_count: i64,
+    pub tag_ids: Vec<TagId>,
 }
 
 /// Đọc toàn bộ Phiên cho Home, mới nhất trước, tie-break `id` giảm dần (spec
 /// Boundaries: "Sắp `created_at` giảm dần (tie-break theo `id` giảm dần)") —
-/// UUIDv7 nên so sánh chuỗi cũng xấp xỉ thứ tự tạo. Một truy vấn duy nhất:
-/// `LEFT JOIN transcripts` (chỉ variant `primary`) rồi `LEFT JOIN` một
-/// subquery đếm `segments` gap `chunk_failed` theo `transcript_id` — không
-/// N+1 (spec Code Map). Phiên chưa có transcript `primary` khớp `NULL` ở cả
+/// UUIDv7 nên so sánh chuỗi cũng xấp xỉ thứ tự tạo. Truy vấn chính: `LEFT
+/// JOIN transcripts` (chỉ variant `primary`) rồi `LEFT JOIN` một subquery đếm
+/// `segments` gap `chunk_failed` theo `transcript_id`. Tag của mỗi Phiên (spec
+/// Boundaries: "trả kèm tag của mỗi Phiên trong cùng truy vấn/không N+1")
+/// tới từ một truy vấn thứ hai riêng — `repo::tags::list_all_links` đọc toàn
+/// bộ `session_tags` một lần rồi gom theo `session_id` ở đây, không một truy
+/// vấn tag/Phiên (N+1). Phiên chưa có transcript `primary` khớp `NULL` ở cả
 /// hai JOIN, `COALESCE` về 0.
 pub fn list_for_home(conn: &Connection) -> rusqlite::Result<Vec<SessionListRow>> {
     let mut stmt = conn.prepare(
@@ -216,19 +224,33 @@ pub fn list_for_home(conn: &Connection) -> rusqlite::Result<Vec<SessionListRow>>
          ) gap_counts ON gap_counts.transcript_id = t.id \
          ORDER BY s.created_at DESC, s.id DESC",
     )?;
-    let rows = stmt.query_map([], |row| {
-        let id: String = row.get(0)?;
-        Ok(SessionListRow {
-            id: parse_session_id(&id)?,
-            kind: row.get(1)?,
-            title: row.get(2)?,
-            created_at: row.get(3)?,
-            duration_sec: row.get(4)?,
-            recovered: row.get::<_, i64>(5)? != 0,
-            missing_gap_count: row.get(6)?,
-        })
-    })?;
-    rows.collect()
+    let mut rows: Vec<SessionListRow> = stmt
+        .query_map([], |row| {
+            let id: String = row.get(0)?;
+            Ok(SessionListRow {
+                id: parse_session_id(&id)?,
+                kind: row.get(1)?,
+                title: row.get(2)?,
+                created_at: row.get(3)?,
+                duration_sec: row.get(4)?,
+                recovered: row.get::<_, i64>(5)? != 0,
+                missing_gap_count: row.get(6)?,
+                tag_ids: Vec::new(),
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+
+    let mut tags_by_session: HashMap<String, Vec<TagId>> = HashMap::new();
+    for (session_id, tag_id) in super::tags::list_all_links(conn)? {
+        tags_by_session.entry(session_id).or_default().push(tag_id);
+    }
+    for row in &mut rows {
+        if let Some(tag_ids) = tags_by_session.remove(&row.id.to_string()) {
+            row.tag_ids = tag_ids;
+        }
+    }
+
+    Ok(rows)
 }
 
 /// Đọc `(id, proxy_ext)` của mọi Phiên — dùng bởi `library::store::reconcile`
@@ -623,6 +645,30 @@ mod tests {
         // Mới nhất trước -> id cuối cùng chèn (created_at lớn nhất) đứng đầu.
         assert_eq!(rows[0].id, *ids.last().unwrap());
         assert_eq!(rows[499].id, ids[0]);
+    }
+
+    #[test]
+    fn list_for_home_includes_tag_ids_of_each_session_without_n_plus_one() {
+        let conn = open_migrated_fk();
+        let tagged = SessionId::new();
+        let untagged = SessionId::new();
+        insert_session_at(&conn, tagged, 1_000);
+        insert_session_at(&conn, untagged, 2_000);
+        let tag = crate::db::repo::tags::upsert_by_name_key(
+            &conn,
+            crate::core::id::TagId::new(),
+            "a",
+            "a",
+            0,
+        )
+        .unwrap();
+        crate::db::repo::tags::attach(&conn, tagged, tag.id).unwrap();
+
+        let rows = list_for_home(&conn).unwrap();
+        let tagged_row = rows.iter().find(|r| r.id == tagged).unwrap();
+        let untagged_row = rows.iter().find(|r| r.id == untagged).unwrap();
+        assert_eq!(tagged_row.tag_ids, vec![tag.id]);
+        assert!(untagged_row.tag_ids.is_empty());
     }
 
     #[test]

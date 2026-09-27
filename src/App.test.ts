@@ -47,10 +47,14 @@ vi.mock('./lib/stores/jobs.svelte', () => ({
 vi.mock('./lib/stores/library.svelte', () => ({
   libraryStore: {
     sessions: [],
+    filteredSessions: [],
     status: 'ready',
     error: null,
     reloadError: false,
     load: vi.fn(() => Promise.resolve()),
+    tags: [],
+    tagFilter: { tagIds: [], untagged: false },
+    loadTags: vi.fn(() => Promise.resolve()),
   },
 }));
 // AppShell registers a webview-wide drag-drop listener (story 2.8) — the

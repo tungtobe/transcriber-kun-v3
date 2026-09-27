@@ -9,12 +9,24 @@ import type { SessionListItem } from '../../lib/bindings';
 const mocks = vi.hoisted(() => ({
   rename: vi.fn(),
   remove: vi.fn(),
+  attachTag: vi.fn(),
+  detachTag: vi.fn(),
+  createTag: vi.fn(),
+  deleteTagGlobally: vi.fn(),
+  tags: [] as Array<{ id: string; name: string; sessionCount: number }>,
 }));
 
 vi.mock('../../lib/stores/library.svelte', () => ({
   libraryStore: {
     rename: (...args: unknown[]) => mocks.rename(...args),
     remove: (...args: unknown[]) => mocks.remove(...args),
+    attachTag: (...args: unknown[]) => mocks.attachTag(...args),
+    detachTag: (...args: unknown[]) => mocks.detachTag(...args),
+    createTag: (...args: unknown[]) => mocks.createTag(...args),
+    deleteTagGlobally: (...args: unknown[]) => mocks.deleteTagGlobally(...args),
+    get tags() {
+      return mocks.tags;
+    },
   },
 }));
 
@@ -27,6 +39,7 @@ function item(overrides: Partial<SessionListItem> = {}): SessionListItem {
     durationSec: 65,
     recovered: false,
     missingGapCount: 0,
+    tagIds: [],
     ...overrides,
   };
 }
@@ -38,6 +51,11 @@ beforeEach(() => {
   i18n.applyPreference('vi');
   mocks.rename.mockReset().mockResolvedValue({ status: 'ok', title: 'tên mới' });
   mocks.remove.mockReset().mockResolvedValue({ status: 'ok', outcome: 'deleted' });
+  mocks.attachTag.mockReset().mockResolvedValue({ status: 'ok' });
+  mocks.detachTag.mockReset().mockResolvedValue({ status: 'ok' });
+  mocks.createTag.mockReset();
+  mocks.deleteTagGlobally.mockReset();
+  mocks.tags = [];
 });
 
 describe('SessionRow', () => {
@@ -197,6 +215,42 @@ describe('SessionRow', () => {
 
       expect(screen.getByText('Phiên đang có tác vụ chạy, thử lại khi xong.')).toBeTruthy();
       expect(screen.queryByRole('alertdialog')).toBeNull();
+    });
+  });
+
+  describe('tags (story 3.2)', () => {
+    it('shows chips for tags already on this session, resolved by name from libraryStore.tags', () => {
+      mocks.tags = [{ id: 't1', name: 'khách A', sessionCount: 1 }];
+      render(SessionRow, { session: item({ tagIds: ['t1'] }) });
+      expect(screen.getByText('khách A')).toBeTruthy();
+    });
+
+    it('shows no tag chips when the session has none', () => {
+      render(SessionRow, { session: item({ tagIds: [] }) });
+      expect(screen.queryByText(/^\+\d/)).toBeNull();
+    });
+
+    it('the ⋯ menu exposes Gắn tag, which opens the tag picker', async () => {
+      mocks.tags = [{ id: 't1', name: 'khách A', sessionCount: 1 }];
+      render(SessionRow, { session: item() });
+
+      await fireEvent.click(screen.getByRole('button', { name: 'Thao tác khác' }));
+      expect(screen.getByRole('menuitem', { name: 'Gắn tag' })).toBeTruthy();
+      await fireEvent.click(screen.getByRole('menuitem', { name: 'Gắn tag' }));
+
+      expect(screen.getByRole('dialog')).toBeTruthy();
+      expect(screen.getByText('khách A')).toBeTruthy();
+    });
+
+    it('checking a tag in the picker calls libraryStore.attachTag with the session id', async () => {
+      mocks.tags = [{ id: 't1', name: 'khách A', sessionCount: 0 }];
+      render(SessionRow, { session: item({ sessionId: 'abc', tagIds: [] }) });
+
+      await fireEvent.click(screen.getByRole('button', { name: 'Thao tác khác' }));
+      await fireEvent.click(screen.getByRole('menuitem', { name: 'Gắn tag' }));
+      await fireEvent.click(screen.getByRole('checkbox', { name: /khách A/ }));
+
+      expect(mocks.attachTag).toHaveBeenCalledWith('abc', 't1');
     });
   });
 });

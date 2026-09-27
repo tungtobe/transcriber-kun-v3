@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onDestroy } from 'svelte';
+  import { onDestroy, onMount } from 'svelte';
   import { link, push } from '@keenmate/svelte-spa-router';
   import { i18n } from '../i18n/index.svelte';
   import { commands, type RerunScope, type SessionDetail, type SessionLookup } from '../lib/bindings';
@@ -7,6 +7,7 @@
   import { formatTranscriptCopyText, type GapCopyLabels } from '../lib/transcript-export';
   import { cycleTranscriptMatch, findTranscriptMatches } from '../lib/transcript-search';
   import { jobsStore } from '../lib/stores/jobs.svelte';
+  import { libraryStore } from '../lib/stores/library.svelte';
   import { settingsStore } from '../lib/stores/settings.svelte';
   import SessionHeader from './session/SessionHeader.svelte';
   import PartialBanner from './session/PartialBanner.svelte';
@@ -257,6 +258,14 @@
 
   const routeId = $derived(routeParams.id ?? null);
 
+  // Story 3.2: `SessionHeader`'s "+ Tag" picker cần `libraryStore.tags` (mọi
+  // tag kèm số phiên) để hiện danh sách chọn -- tải một lần lúc mount, không
+  // phụ thuộc Home đã từng mở hay chưa (mở thẳng `/session/:id` qua deep
+  // link vẫn phải thấy tag đã tạo trước đó).
+  onMount(() => {
+    void libraryStore.loadTags();
+  });
+
   $effect(() => {
     if (routeId) void load(routeId);
   });
@@ -344,6 +353,14 @@
     void push('/home');
   }
 
+  // Story 3.2: `SessionHeader` gọi IPC gắn/gỡ/xoá tag qua `libraryStore` --
+  // hàm này chỉ ghi lại kết quả vào `view.detail.tags` (giống
+  // `handleSessionRenamed` ở trên với `title`).
+  function handleTagsChanged(tags: SessionDetail['tags']): void {
+    if (view.kind !== 'saved') return;
+    view = { ...view, detail: { ...view.detail, tags } };
+  }
+
   async function handleRelinkRequest(): Promise<void> {
     if (view.kind !== 'saved' || relinking) return;
     const sessionId = view.sessionId;
@@ -406,8 +423,10 @@
       segmentTextCount={segmentTextCount}
       recovered={detail.recovered}
       partial={transcript?.status === 'partial'}
+      tags={detail.tags}
       onRenamed={handleSessionRenamed}
       onDeleted={handleSessionDeleted}
+      onTagsChanged={handleTagsChanged}
     />
 
     {#if transcript}

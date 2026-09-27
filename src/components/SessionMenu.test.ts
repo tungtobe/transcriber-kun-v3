@@ -58,6 +58,25 @@ describe('SessionMenu', () => {
     expect(document.activeElement).toBe(trigger);
   });
 
+  it('does not show Gắn tag when onTag is not provided', async () => {
+    render(SessionMenu, { onRename: vi.fn(), onDelete: vi.fn() });
+    await fireEvent.click(screen.getByRole('button', { name: 'Thao tác khác' }));
+    expect(screen.queryByRole('menuitem', { name: 'Gắn tag' })).toBeNull();
+  });
+
+  it('shows Gắn tag first when onTag is provided, and choosing it calls onTag and closes the menu', async () => {
+    const onTag = vi.fn();
+    render(SessionMenu, { onRename: vi.fn(), onDelete: vi.fn(), onTag });
+    await fireEvent.click(screen.getByRole('button', { name: 'Thao tác khác' }));
+
+    const items = screen.getAllByRole('menuitem');
+    expect(items.map((el) => el.textContent)).toEqual(['Gắn tag', 'Đổi tên', 'Xoá']);
+
+    await fireEvent.click(screen.getByRole('menuitem', { name: 'Gắn tag' }));
+    expect(onTag).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole('menu')).toBeNull();
+  });
+
   it('ArrowDown/ArrowUp move focus between items', async () => {
     render(SessionMenu, { onRename: vi.fn(), onDelete: vi.fn() });
     await fireEvent.click(screen.getByRole('button', { name: 'Thao tác khác' }));
