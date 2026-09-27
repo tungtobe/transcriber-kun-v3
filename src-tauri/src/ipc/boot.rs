@@ -2,11 +2,13 @@
 //! thành [`AppState`] để `lib.rs::run()` `manage()`. Không nơi nào khác được
 //! gọi `Db::open`/`core::log::init_file_logging` trực tiếp trong production.
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 
 use tauri::Manager;
 
 use crate::core::error::{AppError, Code};
+use crate::core::id::SessionId;
 use crate::db::Db;
 use crate::gemini::keys::{KeyPoolHandle, KeyProvider, SystemClock};
 use crate::gemini::GeminiGateway;
@@ -33,6 +35,14 @@ pub struct AppState {
     /// initialize — `transcribe_start` surfaces that same storage error
     /// instead of ever touching a registry built on a broken foundation.
     pub jobs: Result<JobRegistryHandle, AppError>,
+    /// Story 3.1: khoá "deleting" theo session (spec Design Notes: "một
+    /// `HashSet<SessionId>` trong `AppState` -- chỉ `ipc/` đọc/ghi", AD-1).
+    /// Đánh dấu **trước** khi hỏi `JobRegistry::is_busy` trong
+    /// `decide_session_delete`, gỡ ở mọi nhánh thoát (kể cả lỗi) -- một
+    /// `transcribe_rerun`/`library_proxy_relink`/`library_transcript_export`
+    /// cho cùng session trong lúc này bị từ chối bằng `Code::Request` (spec
+    /// I/O Matrix "Race Chạy lại/relink").
+    pub deleting: Arc<Mutex<HashSet<SessionId>>>,
     // Giữ sống suốt vòng đời app — drop sớm sẽ ngắt worker ghi log không
     // đồng bộ của `tracing-appender`. Không đọc trực tiếp ở đâu khác nên
     // đặt `_` để không bị cảnh báo "chưa dùng", nhưng vẫn public để test có
@@ -140,6 +150,7 @@ pub fn boot<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
         key_pool,
         gateway,
         jobs,
+        deleting: Arc::new(Mutex::new(HashSet::new())),
         _log_guard: log_guard,
     }
 }

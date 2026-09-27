@@ -62,6 +62,8 @@ const mocks = vi.hoisted(() => ({
     error: null as null | { category: string; code: string; detailRedacted: string },
     reloadError: false,
     load: vi.fn(() => Promise.resolve()),
+    rename: vi.fn(() => Promise.resolve({ status: 'ok', title: 'renamed' })),
+    remove: vi.fn(() => Promise.resolve({ status: 'ok', outcome: 'deleted' })),
   },
 }));
 
@@ -92,6 +94,8 @@ beforeEach(() => {
   mocks.libraryStore.error = null;
   mocks.libraryStore.reloadError = false;
   mocks.libraryStore.load.mockReset().mockResolvedValue(undefined);
+  mocks.libraryStore.rename.mockReset().mockResolvedValue({ status: 'ok', title: 'renamed' });
+  mocks.libraryStore.remove.mockReset().mockResolvedValue({ status: 'ok', outcome: 'deleted' });
 });
 
 describe('Home locale rendering', () => {

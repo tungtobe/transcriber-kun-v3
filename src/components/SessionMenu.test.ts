@@ -1,0 +1,78 @@
+// @vitest-environment jsdom
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { cleanup, fireEvent, render, screen } from '@testing-library/svelte';
+import { i18n } from '../i18n/index.svelte';
+import SessionMenu from './SessionMenu.svelte';
+
+afterEach(() => cleanup());
+
+beforeEach(() => {
+  i18n.applyPreference('vi');
+});
+
+describe('SessionMenu', () => {
+  it('the trigger has an accessible label and the menu is closed initially', () => {
+    render(SessionMenu, { onRename: vi.fn(), onDelete: vi.fn() });
+    expect(screen.getByRole('button', { name: 'Thao tác khác' })).toBeTruthy();
+    expect(screen.queryByRole('menu')).toBeNull();
+  });
+
+  it('clicking the trigger opens the menu with Đổi tên and Xoá', async () => {
+    render(SessionMenu, { onRename: vi.fn(), onDelete: vi.fn() });
+    await fireEvent.click(screen.getByRole('button', { name: 'Thao tác khác' }));
+
+    expect(screen.getByRole('menu')).toBeTruthy();
+    expect(screen.getByRole('menuitem', { name: 'Đổi tên' })).toBeTruthy();
+    expect(screen.getByRole('menuitem', { name: 'Xoá' })).toBeTruthy();
+  });
+
+  it('choosing Đổi tên calls onRename and closes the menu', async () => {
+    const onRename = vi.fn();
+    render(SessionMenu, { onRename, onDelete: vi.fn() });
+    await fireEvent.click(screen.getByRole('button', { name: 'Thao tác khác' }));
+    await fireEvent.click(screen.getByRole('menuitem', { name: 'Đổi tên' }));
+
+    expect(onRename).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole('menu')).toBeNull();
+  });
+
+  it('choosing Xoá calls onDelete and closes the menu', async () => {
+    const onDelete = vi.fn();
+    render(SessionMenu, { onRename: vi.fn(), onDelete });
+    await fireEvent.click(screen.getByRole('button', { name: 'Thao tác khác' }));
+    await fireEvent.click(screen.getByRole('menuitem', { name: 'Xoá' }));
+
+    expect(onDelete).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole('menu')).toBeNull();
+  });
+
+  it('Escape closes the menu and returns focus to the trigger', async () => {
+    render(SessionMenu, { onRename: vi.fn(), onDelete: vi.fn() });
+    const trigger = screen.getByRole('button', { name: 'Thao tác khác' });
+    await fireEvent.click(trigger);
+
+    const renameItem = screen.getByRole('menuitem', { name: 'Đổi tên' });
+    await fireEvent.keyDown(renameItem, { key: 'Escape' });
+
+    expect(screen.queryByRole('menu')).toBeNull();
+    expect(document.activeElement).toBe(trigger);
+  });
+
+  it('ArrowDown/ArrowUp move focus between items', async () => {
+    render(SessionMenu, { onRename: vi.fn(), onDelete: vi.fn() });
+    await fireEvent.click(screen.getByRole('button', { name: 'Thao tác khác' }));
+
+    const renameItem = screen.getByRole('menuitem', { name: 'Đổi tên' });
+    const deleteItem = screen.getByRole('menuitem', { name: 'Xoá' });
+    expect(document.activeElement).toBe(renameItem);
+
+    await fireEvent.keyDown(renameItem, { key: 'ArrowDown' });
+    expect(document.activeElement).toBe(deleteItem);
+
+    await fireEvent.keyDown(deleteItem, { key: 'ArrowDown' });
+    expect(document.activeElement).toBe(renameItem);
+
+    await fireEvent.keyDown(renameItem, { key: 'ArrowUp' });
+    expect(document.activeElement).toBe(deleteItem);
+  });
+});

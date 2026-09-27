@@ -4,6 +4,8 @@ import { flushSync } from 'svelte';
 
 const mocks = vi.hoisted(() => ({
   librarySessionsList: vi.fn(),
+  librarySessionRename: vi.fn(),
+  librarySessionDelete: vi.fn(),
   jobsSubscribe: vi.fn(),
 }));
 
@@ -18,6 +20,8 @@ vi.mock('@tauri-apps/api/core', () => ({
 vi.mock('../bindings', () => ({
   commands: {
     librarySessionsList: (...args: unknown[]) => mocks.librarySessionsList(...args),
+    librarySessionRename: (...args: unknown[]) => mocks.librarySessionRename(...args),
+    librarySessionDelete: (...args: unknown[]) => mocks.librarySessionDelete(...args),
     jobsSubscribe: (...args: unknown[]) => mocks.jobsSubscribe(...args),
   },
 }));
@@ -41,6 +45,8 @@ describe('libraryStore', () => {
   beforeEach(() => {
     vi.resetModules();
     mocks.librarySessionsList.mockReset();
+    mocks.librarySessionRename.mockReset();
+    mocks.librarySessionDelete.mockReset();
     mocks.jobsSubscribe.mockReset();
     capturedChannel = null;
     mocks.jobsSubscribe.mockImplementation((channel: FakeChannel<unknown>) => {
@@ -178,5 +184,109 @@ describe('libraryStore', () => {
     expect(store.status).toBe('ready');
     expect(store.sessions.map((s) => s.sessionId)).toEqual(['b', 'a']);
     expect(store.reloadError).toBe(true);
+  });
+
+  // Story 3.1: `rename`/`remove`.
+
+  it('rename() updates the matching session in place on success', async () => {
+    mocks.librarySessionsList.mockResolvedValueOnce({
+      status: 'ok',
+      data: [item('a', { title: 'cũ' }), item('b')],
+    });
+    const { libraryStore: store } = await import('./library.svelte');
+    await store.load();
+
+    mocks.librarySessionRename.mockResolvedValueOnce({ status: 'ok', data: 'mới' });
+    const result = await store.rename('a', '  mới  ');
+
+    expect(mocks.librarySessionRename).toHaveBeenCalledWith('a', '  mới  ');
+    expect(result).toEqual({ status: 'ok', title: 'mới' });
+    expect(store.sessions.find((s) => s.sessionId === 'a')?.title).toBe('mới');
+    expect(store.sessions.find((s) => s.sessionId === 'b')?.title).toBe('phiên b');
+  });
+
+  it('rename() leaves the list untouched when Rust reports the session no longer exists', async () => {
+    mocks.librarySessionsList.mockResolvedValueOnce({
+      status: 'ok',
+      data: [item('a', { title: 'cũ' })],
+    });
+    const { libraryStore: store } = await import('./library.svelte');
+    await store.load();
+
+    mocks.librarySessionRename.mockResolvedValueOnce({ status: 'ok', data: null });
+    const result = await store.rename('a', 'mới');
+
+    expect(result).toEqual({ status: 'ok', title: null });
+    expect(store.sessions.find((s) => s.sessionId === 'a')?.title).toBe('cũ');
+  });
+
+  it('rename() surfaces a typed error and does not touch the list', async () => {
+    mocks.librarySessionsList.mockResolvedValueOnce({
+      status: 'ok',
+      data: [item('a', { title: 'cũ' })],
+    });
+    const { libraryStore: store } = await import('./library.svelte');
+    await store.load();
+
+    mocks.librarySessionRename.mockResolvedValueOnce({
+      status: 'error',
+      error: { category: 'model', code: 'request', detailRedacted: 'empty title' },
+    });
+    const result = await store.rename('a', '');
+
+    expect(result).toEqual({
+      status: 'error',
+      error: { category: 'model', code: 'request', detailRedacted: 'empty title' },
+    });
+    expect(store.sessions.find((s) => s.sessionId === 'a')?.title).toBe('cũ');
+  });
+
+  it('remove() reloads the list when the outcome is Deleted', async () => {
+    mocks.librarySessionsList
+      .mockResolvedValueOnce({ status: 'ok', data: [item('a'), item('b')] })
+      .mockResolvedValueOnce({ status: 'ok', data: [item('b')] });
+    const { libraryStore: store } = await import('./library.svelte');
+    await store.load();
+
+    mocks.librarySessionDelete.mockResolvedValueOnce({ status: 'ok', data: 'deleted' });
+    const result = await store.remove('a');
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(mocks.librarySessionDelete).toHaveBeenCalledWith('a');
+    expect(result).toEqual({ status: 'ok', outcome: 'deleted' });
+    expect(mocks.librarySessionsList).toHaveBeenCalledTimes(2);
+    expect(store.sessions.map((s) => s.sessionId)).toEqual(['b']);
+  });
+
+  it('remove() does not reload the list on a Busy outcome', async () => {
+    mocks.librarySessionsList.mockResolvedValueOnce({ status: 'ok', data: [item('a')] });
+    const { libraryStore: store } = await import('./library.svelte');
+    await store.load();
+
+    mocks.librarySessionDelete.mockResolvedValueOnce({ status: 'ok', data: 'busy' });
+    const result = await store.remove('a');
+
+    expect(result).toEqual({ status: 'ok', outcome: 'busy' });
+    expect(mocks.librarySessionsList).toHaveBeenCalledTimes(1);
+    expect(store.sessions.map((s) => s.sessionId)).toEqual(['a']);
+  });
+
+  it('remove() surfaces a typed error without reloading', async () => {
+    mocks.librarySessionsList.mockResolvedValueOnce({ status: 'ok', data: [item('a')] });
+    const { libraryStore: store } = await import('./library.svelte');
+    await store.load();
+
+    mocks.librarySessionDelete.mockResolvedValueOnce({
+      status: 'error',
+      error: { category: 'storage', code: 'storage', detailRedacted: 'fs failed' },
+    });
+    const result = await store.remove('a');
+
+    expect(result).toEqual({
+      status: 'error',
+      error: { category: 'storage', code: 'storage', detailRedacted: 'fs failed' },
+    });
+    expect(mocks.librarySessionsList).toHaveBeenCalledTimes(1);
   });
 });

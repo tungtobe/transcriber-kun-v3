@@ -11,7 +11,7 @@
 // that failure surfaces through `reloadError` instead, which `Home.svelte`
 // renders as a transient notice next to the (still-visible) old list.
 import { jobsStore } from './jobs.svelte';
-import { commands, type AppError, type SessionListItem } from '../bindings';
+import { commands, type AppError, type SessionDeleteOutcome, type SessionListItem } from '../bindings';
 
 export type LibraryStatus = 'loading' | 'ready' | 'error';
 
@@ -20,6 +20,26 @@ const LOAD_UNAVAILABLE_ERROR: AppError = {
   code: 'network',
   detailRedacted: 'library sessions list unavailable',
 };
+
+const RENAME_UNAVAILABLE_ERROR: AppError = {
+  category: 'network',
+  code: 'network',
+  detailRedacted: 'library session rename unavailable',
+};
+
+const DELETE_UNAVAILABLE_ERROR: AppError = {
+  category: 'network',
+  code: 'network',
+  detailRedacted: 'library session delete unavailable',
+};
+
+export type RenameResult =
+  | { status: 'ok'; title: string | null }
+  | { status: 'error'; error: AppError };
+
+export type RemoveResult =
+  | { status: 'ok'; outcome: SessionDeleteOutcome }
+  | { status: 'error'; error: AppError };
 
 export function createLibraryStore() {
   let sessions = $state<SessionListItem[]>([]);
@@ -96,6 +116,48 @@ export function createLibraryStore() {
     });
   });
 
+  // Story 3.1: đổi tên tại chỗ (spec Code Map: "rename(id, title) (cập nhật
+  // sessions tại chỗ)"). Chỉ cập nhật mảng `sessions` khi Rust trả một tên đã
+  // chuẩn hoá (`Ok(Some(title))`) — `Ok(None)` (Phiên vừa bị xoá đồng thời)
+  // không phải lỗi nhưng cũng không có gì để cập nhật, để nguyên danh sách
+  // (spec I/O Matrix: dòng đó biến mất qua đường xoá/reload bình thường).
+  async function rename(id: string, title: string): Promise<RenameResult> {
+    try {
+      const result = await commands.librarySessionRename(id, title);
+      if (result.status !== 'ok') {
+        return { status: 'error', error: result.error };
+      }
+      if (result.data !== null) {
+        const newTitle = result.data;
+        sessions = sessions.map((session) =>
+          session.sessionId === id ? { ...session, title: newTitle } : session,
+        );
+      }
+      return { status: 'ok', title: result.data };
+    } catch {
+      return { status: 'error', error: RENAME_UNAVAILABLE_ERROR };
+    }
+  }
+
+  // Story 3.1: xoá hẳn một Phiên (spec Code Map: "remove(id) (trả outcome,
+  // reload khi Deleted)"). `Busy`/lỗi không đổi gì ở đây — caller
+  // (`SessionRow`/`SessionHeader`) hiển thị giải thích inline, không mở lỗi
+  // chung (spec Always).
+  async function remove(id: string): Promise<RemoveResult> {
+    try {
+      const result = await commands.librarySessionDelete(id);
+      if (result.status !== 'ok') {
+        return { status: 'error', error: result.error };
+      }
+      if (result.data === 'deleted') {
+        void load();
+      }
+      return { status: 'ok', outcome: result.data };
+    } catch {
+      return { status: 'error', error: DELETE_UNAVAILABLE_ERROR };
+    }
+  }
+
   /** Test-only seam: resets every field without touching a live request. */
   function reset(): void {
     sessions = [];
@@ -122,6 +184,8 @@ export function createLibraryStore() {
       return reloadError;
     },
     load,
+    rename,
+    remove,
     reset,
   };
 }

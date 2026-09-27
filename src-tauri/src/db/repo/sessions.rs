@@ -132,6 +132,35 @@ pub fn set_proxy_ext(
     Ok(())
 }
 
+/// Đổi tên một Phiên (story 3.1). `title` đã được caller
+/// (`library::store::rename_session`) chuẩn hoá (trim, không rỗng, ≤ 200 ký
+/// tự Unicode scalar) -- hàm này chỉ ghi thẳng, không validate lại. Trả số
+/// dòng bị ảnh hưởng: `0` khi `id` không còn tồn tại (caller ánh xạ về
+/// `Ok(None)`).
+pub fn set_title(
+    conn: &Connection,
+    id: SessionId,
+    title: &str,
+    updated_at: i64,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        "UPDATE sessions SET title = ?1, updated_at = ?2 WHERE id = ?3",
+        params![title, updated_at, id.to_string()],
+    )
+}
+
+/// Xoá một Phiên (story 3.1, spec Approach). FK `ON DELETE CASCADE` (migration)
+/// xoá luôn mọi `transcripts`/`segments` của nó -- `Db::open` đã bật
+/// `foreign_keys` nên việc này chạy trong đúng lệnh `DELETE` này, không cần
+/// xoá tay từng bảng. Idempotent: `id` không tồn tại xoá `0` dòng, không phải
+/// lỗi (spec I/O Matrix "Xoá session không tồn tại").
+pub fn delete(conn: &Connection, id: SessionId) -> rusqlite::Result<usize> {
+    conn.execute(
+        "DELETE FROM sessions WHERE id = ?1",
+        params![id.to_string()],
+    )
+}
+
 /// Tra một Phiên theo `source_hash` chính xác (spec I/O Matrix "Trùng hash":
 /// `transcribe_start` gọi trước khi tạo Job — trùng thì trả `Existing
 /// { session_id }`, không tạo Job, không gọi Gemini). `source_hash` là
@@ -333,6 +362,71 @@ mod tests {
         let row = get(&conn, id).unwrap().unwrap();
         assert_eq!(row.proxy_ext, None);
         assert_eq!(row.updated_at, 2_000);
+    }
+
+    #[test]
+    fn set_title_updates_title_and_updated_at() {
+        let conn = open_migrated();
+        let id = SessionId::new();
+        insert(&conn, sample(id)).unwrap();
+
+        let affected = set_title(&conn, id, "Họp sprint 12", 2_000).unwrap();
+        assert_eq!(affected, 1);
+
+        let row = get(&conn, id).unwrap().unwrap();
+        assert_eq!(row.title, "Họp sprint 12");
+        assert_eq!(row.updated_at, 2_000);
+    }
+
+    #[test]
+    fn set_title_on_missing_id_affects_zero_rows() {
+        let conn = open_migrated();
+        assert_eq!(set_title(&conn, SessionId::new(), "x", 1).unwrap(), 0);
+    }
+
+    #[test]
+    fn delete_on_missing_id_affects_zero_rows() {
+        let conn = open_migrated_fk();
+        assert_eq!(delete(&conn, SessionId::new()).unwrap(), 0);
+    }
+
+    #[test]
+    fn delete_removes_the_session_row_and_cascades_to_transcripts_and_segments() {
+        let conn = open_migrated_fk();
+        let id = SessionId::new();
+        insert_session_at(&conn, id, 1_000);
+        insert_primary_with_segments(&conn, id, &[text_seg(0.0, 1.0)]);
+
+        let affected = delete(&conn, id).unwrap();
+        assert_eq!(affected, 1);
+
+        assert!(get(&conn, id).unwrap().is_none());
+        let transcript_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM transcripts WHERE session_id = ?1",
+                params![id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(transcript_count, 0, "cascade phải xoá transcript");
+        let segment_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM segments", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(segment_count, 0, "cascade phải xoá segment");
+    }
+
+    #[test]
+    fn delete_does_not_touch_other_sessions() {
+        let conn = open_migrated_fk();
+        let kept = SessionId::new();
+        let removed = SessionId::new();
+        insert_session_at(&conn, kept, 1_000);
+        insert_session_at(&conn, removed, 2_000);
+
+        delete(&conn, removed).unwrap();
+
+        assert!(get(&conn, kept).unwrap().is_some());
+        assert!(get(&conn, removed).unwrap().is_none());
     }
 
     #[test]

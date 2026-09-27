@@ -36,6 +36,29 @@ use boot::AppState;
 #[derive(Debug, Clone, Serialize, Deserialize, Type, tauri_specta::Event)]
 pub struct CloseRequested;
 
+/// Story 3.1: `true` khi `session_id` đang bị `library_session_delete` đánh
+/// dấu "deleting" (spec Design Notes AD-1: chỉ `ipc/` đọc/ghi
+/// `AppState::deleting`). Nhận thẳng `&Mutex<HashSet<SessionId>>` (không phải
+/// `&AppState`) để test được trực tiếp không cần dựng một `AppState` thật.
+/// Mutex bị poison đọc như "không đang xoá" thay vì panic -- một panic ở nơi
+/// khác giữ lock không được phép chặn mọi command khác vĩnh viễn.
+fn is_session_deleting(
+    deleting: &std::sync::Mutex<std::collections::HashSet<SessionId>>,
+    session_id: SessionId,
+) -> bool {
+    deleting
+        .lock()
+        .map(|set| set.contains(&session_id))
+        .unwrap_or(false)
+}
+
+/// Lỗi từ chối dùng chung cho `transcribe_rerun`/`library_proxy_relink`/
+/// `library_transcript_export` khi session đích đang bị xoá (spec I/O Matrix
+/// "Race Chạy lại/relink": "Lệnh kia trả lỗi `Request` 'đang xoá'").
+fn session_deleting_error() -> AppError {
+    AppError::new(Code::Request, "Phiên đang được xoá")
+}
+
 /// Chạy một closure blocking trên `spawn_blocking`, gộp lỗi join thành
 /// `AppError` category `storage` — dùng cho những command story 2.4 có
 /// nhiều bước chạm DB/OS tuần tự (Code Map: mọi I/O chặn chỉ qua
@@ -878,6 +901,9 @@ async fn transcribe_rerun_inner(
     transcript_id: TranscriptId,
     scope: RerunScope,
 ) -> Result<TranscribeRerunOutcome, AppError> {
+    if is_session_deleting(&state.deleting, session_id) {
+        return Err(session_deleting_error());
+    }
     let db = state.db.clone()?;
     let data_dir = state.data_dir.clone()?;
     let settings = blocking({
@@ -1136,6 +1162,10 @@ async fn library_transcript_export(
     offset_sec: f64,
     gap_labels: library::export::GapLabels,
 ) -> Result<library::export::TranscriptExportOutcome, AppError> {
+    if is_session_deleting(&state.deleting, session_id) {
+        let result = Err(session_deleting_error());
+        return track_ipc_error(&state.db, result).await;
+    }
     let result = async {
         let db = state.db.clone()?;
         let rendered = blocking(move || {
@@ -1290,6 +1320,9 @@ async fn library_proxy_relink_inner(
     state: &AppState,
     session_id: SessionId,
 ) -> Result<ProxyRelinkOutcome, AppError> {
+    if is_session_deleting(&state.deleting, session_id) {
+        return Err(session_deleting_error());
+    }
     let db = state.db.clone()?;
     let root = state.data_dir.clone()?;
     let load_db = db.clone();
@@ -1328,6 +1361,104 @@ async fn library_proxy_relink(
     session_id: SessionId,
 ) -> Result<ProxyRelinkOutcome, AppError> {
     let result = library_proxy_relink_inner(&app, &state, session_id).await;
+    track_ipc_error(&state.db, result).await
+}
+
+/// Đổi tên một Phiên đã lưu (story 3.1, spec Approach "đổi tên inline") — xem
+/// [`library::store::rename_session`] cho validate/ghi thật. `Ok(None)` khi
+/// Phiên không còn tồn tại (đã bị xoá đồng thời) — frontend coi như không có
+/// gì để cập nhật, không phải lỗi.
+#[tauri::command]
+#[specta::specta]
+async fn library_session_rename(
+    state: tauri::State<'_, AppState>,
+    session_id: SessionId,
+    title: String,
+) -> Result<Option<String>, AppError> {
+    let result = async {
+        let db = state.db.clone()?;
+        blocking(move || library::store::rename_session(&db, session_id, &title)).await
+    }
+    .await;
+    track_ipc_error(&state.db, result).await
+}
+
+/// Kết quả `library_session_delete` (spec I/O Matrix "Xoá phiên rảnh", "Xoá
+/// khi có Job").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub enum SessionDeleteOutcome {
+    Deleted,
+    Busy,
+}
+
+/// Pure gate-order decision for `library_session_delete` (spec Design Notes:
+/// "Đánh dấu **trước** khi hỏi `is_busy`, nên một Chạy lại bắt đầu sau lần
+/// hỏi đó sẽ thấy guard và bị từ chối"; Tasks: "`decide_session_delete` +
+/// test (busy, deleted, unmark khi lỗi)"). `unmark_deleting` runs on every
+/// exit path — whether `is_busy` returns `Busy`, an error, or `do_delete`
+/// itself errors — so a session marked "deleting" is never left stuck that
+/// way (spec Design Notes: "gỡ ở mọi nhánh thoát, kể cả lỗi").
+async fn decide_session_delete<BusyFut, DeleteFut>(
+    mark_deleting: impl FnOnce(),
+    is_busy: impl FnOnce() -> BusyFut,
+    do_delete: impl FnOnce() -> DeleteFut,
+    unmark_deleting: impl FnOnce(),
+) -> Result<SessionDeleteOutcome, AppError>
+where
+    BusyFut: std::future::Future<Output = Result<bool, AppError>>,
+    DeleteFut: std::future::Future<Output = Result<(), AppError>>,
+{
+    mark_deleting();
+
+    let outcome = match is_busy().await {
+        Ok(true) => Ok(SessionDeleteOutcome::Busy),
+        Ok(false) => do_delete().await.map(|()| SessionDeleteOutcome::Deleted),
+        Err(err) => Err(err),
+    };
+
+    unmark_deleting();
+    outcome
+}
+
+async fn library_session_delete_inner(
+    state: &AppState,
+    session_id: SessionId,
+) -> Result<SessionDeleteOutcome, AppError> {
+    let db = state.db.clone()?;
+    let root = state.data_dir.clone()?;
+    let jobs = state.jobs.clone()?;
+    let mark_set = state.deleting.clone();
+    let unmark_set = state.deleting.clone();
+
+    decide_session_delete(
+        move || {
+            if let Ok(mut set) = mark_set.lock() {
+                set.insert(session_id);
+            }
+        },
+        move || async move { jobs.is_busy(session_id).await },
+        move || blocking(move || library::store::delete_session(&db, &root, session_id)),
+        move || {
+            if let Ok(mut set) = unmark_set.lock() {
+                set.remove(&session_id);
+            }
+        },
+    )
+    .await
+}
+
+/// Xoá hẳn một Phiên đã lưu (story 3.1, spec Approach): chặn khi
+/// `JobRegistry.is_busy(session_id)` (outcome `Busy`, không xoá gì) — xem
+/// [`decide_session_delete`] cho thứ tự gate thật và
+/// [`library::store::delete_session`] cho logic xoá DB/media.
+#[tauri::command]
+#[specta::specta]
+async fn library_session_delete(
+    state: tauri::State<'_, AppState>,
+    session_id: SessionId,
+) -> Result<SessionDeleteOutcome, AppError> {
+    let result = library_session_delete_inner(&state, session_id).await;
     track_ipc_error(&state.db, result).await
 }
 
@@ -1397,6 +1528,8 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             library_transcript_export,
             library_sessions_list,
             library_proxy_relink,
+            library_session_rename,
+            library_session_delete,
             app_close_confirm
         ])
         .events(collect_events![SettingsChanged, CloseRequested])
@@ -2612,5 +2745,154 @@ mod tests {
             .unwrap();
             assert_eq!(result, expected);
         }
+    }
+
+    // `decide_session_delete` (story 3.1) — spec Design Notes gate order
+    // "Đánh dấu trước khi hỏi `is_busy`" and "gỡ ở mọi nhánh thoát, kể cả
+    // lỗi".
+
+    fn counting_busy(
+        count: std::sync::Arc<std::sync::atomic::AtomicU32>,
+        busy: bool,
+    ) -> impl FnOnce() -> std::future::Ready<Result<bool, AppError>> {
+        move || {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(Ok(busy))
+        }
+    }
+
+    fn erroring_busy(
+        count: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    ) -> impl FnOnce() -> std::future::Ready<Result<bool, AppError>> {
+        move || {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(Err(AppError::new(
+                Code::Storage,
+                "injected: is_busy failure",
+            )))
+        }
+    }
+
+    fn counting_delete(
+        count: std::sync::Arc<std::sync::atomic::AtomicU32>,
+        result: Result<(), AppError>,
+    ) -> impl FnOnce() -> std::future::Ready<Result<(), AppError>> {
+        move || {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(result)
+        }
+    }
+
+    fn flagging(flag: std::sync::Arc<std::sync::atomic::AtomicBool>) -> impl FnOnce() {
+        move || {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn decide_session_delete_marks_before_checking_busy_and_unmarks_on_busy() {
+        let marked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let unmarked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let delete_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+        let result = decide_session_delete(
+            flagging(marked.clone()),
+            counting_busy(
+                std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                true,
+            ),
+            counting_delete(delete_calls.clone(), Ok(())),
+            flagging(unmarked.clone()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, SessionDeleteOutcome::Busy);
+        assert!(marked.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(unmarked.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            delete_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "bận -> không được xoá gì"
+        );
+    }
+
+    #[tokio::test]
+    async fn decide_session_delete_deletes_and_unmarks_when_not_busy() {
+        let marked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let unmarked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let busy_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let delete_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+        let result = decide_session_delete(
+            flagging(marked.clone()),
+            counting_busy(busy_calls.clone(), false),
+            counting_delete(delete_calls.clone(), Ok(())),
+            flagging(unmarked.clone()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, SessionDeleteOutcome::Deleted);
+        assert!(marked.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(unmarked.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(busy_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(delete_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn decide_session_delete_unmarks_when_is_busy_itself_errors() {
+        let unmarked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let delete_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+        let err = decide_session_delete(
+            flagging(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            ))),
+            erroring_busy(std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0))),
+            counting_delete(delete_calls.clone(), Ok(())),
+            flagging(unmarked.clone()),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.category, crate::core::error::Category::Storage);
+        assert!(unmarked.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(delete_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn decide_session_delete_unmarks_when_delete_itself_errors() {
+        let unmarked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let err = decide_session_delete(
+            flagging(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            ))),
+            counting_busy(
+                std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                false,
+            ),
+            counting_delete(
+                std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                Err(AppError::new(Code::Storage, "injected: delete failure")),
+            ),
+            flagging(unmarked.clone()),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.category, crate::core::error::Category::Storage);
+        assert!(unmarked.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn is_session_deleting_reflects_the_deleting_set() {
+        let session_id = SessionId::new();
+        let deleting = std::sync::Mutex::new(std::collections::HashSet::new());
+        deleting.lock().unwrap().insert(session_id);
+
+        assert!(is_session_deleting(&deleting, session_id));
+        assert!(!is_session_deleting(&deleting, SessionId::new()));
     }
 }
