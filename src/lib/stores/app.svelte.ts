@@ -28,17 +28,22 @@ function createAppStore() {
   }
 
   /**
-   * Story 2.4: `CloseRequested` fires when the OS close was intercepted
-   * because the Job registry is busy (spec Design Notes). `CloseConfirm`
-   * calls this once on mount; the returned unlisten function must be called
-   * on unmount.
+   * Story 3.5 (trước đó story 2.4): `CloseRequested` giờ phát mỗi lần cửa sổ
+   * chính bị yêu cầu đóng, kèm `busy` (spec Code Map: "luôn emit (thêm cờ
+   * `busy`) ... frontend quyết định") — trước đây Rust chỉ emit khi registry
+   * bận và tự thoát thẳng ở nhánh rảnh, nên không có chỗ nào chắc chắn chạy
+   * để flush ghi chú trước khi đóng. `CloseConfirm` gọi hàm này một lần lúc
+   * mount; hàm unlisten trả về phải được gọi lúc unmount.
    */
-  function listenForCloseRequested(callback: () => void): Promise<() => void> {
-    return events.closeRequested.listen(() => callback());
+  function listenForCloseRequested(callback: (busy: boolean) => void): Promise<() => void> {
+    return events.closeRequested.listen((event) => callback(event.payload.busy));
   }
 
-  /** The user confirmed closing while Jobs were running — cancel everything
-   * and exit (spec Design Notes: "đồng ý → huỷ sạch rồi thoát"). */
+  /** Thật sự thoát: huỷ mọi Job hiện có rồi thoát (spec Design Notes: "đồng ý
+   * → huỷ sạch rồi thoát" — không đổi hành vi Rust ở story 3.5). `CloseConfirm`
+   * gọi hàm này sau khi flush ghi chú xong, dù rảnh (flush ok, tự thoát,
+   * không dialog thừa) hay bận (người dùng đã bấm "Huỷ và thoát") hay flush
+   * lỗi mà người dùng chọn "Vẫn thoát". */
   async function confirmClose(): Promise<void> {
     await commands.appCloseConfirm();
   }

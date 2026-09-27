@@ -1,19 +1,40 @@
 <script lang="ts">
-  // Story 2.4 Design Notes: "Đóng app: luôn `prevent_close`, hỏi registry
-  // async; rảnh → thoát, bận → emit `CloseRequested`". This component only
-  // reacts to that one event — it never polls the job registry itself.
+  // Story 3.5 (trước đó story 2.4 Design Notes): "Đóng app: luôn
+  // `prevent_close`, hỏi registry async" — Rust giờ LUÔN emit
+  // `CloseRequested { busy }` (không còn tự thoát thẳng ở nhánh rảnh), và
+  // component này quyết định: rảnh → flush ghi chú rồi tự gọi
+  // `appCloseConfirm` (không dialog nếu flush thành công — spec Acceptance:
+  // "không có dialog thừa"); bận → dialog Job hiện có (flush trước khi xác
+  // nhận, không chặn dialog nếu flush lỗi); flush lỗi ở nhánh rảnh → dialog
+  // "Ở lại"/"Vẫn thoát" riêng (`ConfirmDialog`, mặc định focus "Ở lại").
   import { appStore } from '../lib/stores/app.svelte';
+  import { notesStore } from '../lib/stores/notes.svelte';
   import { i18n } from '../i18n/index.svelte';
+  import ConfirmDialog from './ConfirmDialog.svelte';
 
-  let visible = $state(false);
+  let jobDialogVisible = $state(false);
+  let flushErrorVisible = $state(false);
   let closing = $state(false);
+
+  async function handleCloseRequested(busy: boolean): Promise<void> {
+    if (busy) {
+      jobDialogVisible = true;
+      return;
+    }
+    const flushedOk = await notesStore.flushAll();
+    if (flushedOk) {
+      await appStore.confirmClose();
+    } else {
+      flushErrorVisible = true;
+    }
+  }
 
   $effect(() => {
     let active = true;
     let unlisten: (() => void) | null = null;
     void appStore
-      .listenForCloseRequested(() => {
-        visible = true;
+      .listenForCloseRequested((busy) => {
+        void handleCloseRequested(busy);
       })
       .then((fn) => {
         if (!active) {
@@ -28,36 +49,65 @@
     };
   });
 
-  function stay(): void {
-    visible = false;
+  function stayJobDialog(): void {
+    jobDialogVisible = false;
   }
 
-  async function confirmClose(): Promise<void> {
+  // Job hiện có: flush ghi chú trước khi xác nhận (spec Code Map) -- kết quả
+  // flush không chặn gì ở đây, người dùng đã đồng ý đóng dù có Job đang chạy.
+  async function confirmJobDialog(): Promise<void> {
+    closing = true;
+    try {
+      await notesStore.flushAll();
+      await appStore.confirmClose();
+    } finally {
+      closing = false;
+      jobDialogVisible = false;
+    }
+  }
+
+  function stayFlushError(): void {
+    flushErrorVisible = false;
+  }
+
+  async function exitAnywayAfterFlushError(): Promise<void> {
     closing = true;
     try {
       await appStore.confirmClose();
     } finally {
       closing = false;
-      visible = false;
+      flushErrorVisible = false;
     }
   }
 </script>
 
-{#if visible}
+{#if jobDialogVisible}
   <div class="close-confirm-backdrop" role="presentation">
     <div class="close-confirm" role="alertdialog" aria-modal="true" aria-labelledby="close-confirm-title">
       <h2 id="close-confirm-title">{i18n.t('closeConfirm.dialog.title')}</h2>
       <p>{i18n.t('closeConfirm.dialog.body')}</p>
       <div class="close-confirm-actions">
-        <button type="button" class="button button-secondary" disabled={closing} onclick={stay}>
+        <button type="button" class="button button-secondary" disabled={closing} onclick={stayJobDialog}>
           {i18n.t('closeConfirm.dialog.stay')}
         </button>
-        <button type="button" class="button button-danger" disabled={closing} onclick={confirmClose}>
+        <button type="button" class="button button-danger" disabled={closing} onclick={confirmJobDialog}>
           {closing ? i18n.t('closeConfirm.dialog.closing') : i18n.t('closeConfirm.dialog.confirm')}
         </button>
       </div>
     </div>
   </div>
+{/if}
+
+{#if flushErrorVisible}
+  <ConfirmDialog
+    title={i18n.t('closeConfirm.flushError.title')}
+    body={i18n.t('closeConfirm.flushError.body')}
+    cancelLabel={i18n.t('closeConfirm.flushError.stay')}
+    confirmLabel={i18n.t('closeConfirm.flushError.exit')}
+    confirming={closing}
+    onCancel={stayFlushError}
+    onConfirm={exitAnywayAfterFlushError}
+  />
 {/if}
 
 <style>

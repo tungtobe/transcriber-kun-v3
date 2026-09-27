@@ -396,5 +396,19 @@
   "intake.notice.dismissLabel": "通知を閉じる",
   "intake.error.wrongFormat": "非対応の形式です。mp4、m4a、mp3 のいずれかに変換してください。",
   "intake.error.noAudio": "再生可能な音声がないファイルです。",
-  "session.job.queuedCount": "{count} 件のファイルが待機中"
+  "session.job.queuedCount": "{count} 件のファイルが待機中",
+  "closeConfirm.flushError.title": "メモを保存できませんでした",
+  "closeConfirm.flushError.body": "現在のセッションのメモの保存に失敗しました。とどまって再試行するか、保存せずに終了できます。",
+  "closeConfirm.flushError.stay": "とどまる",
+  "closeConfirm.flushError.exit": "そのまま終了",
+  "session.aside.tabInfo": "情報",
+  "session.aside.tabNotes": "メモ",
+  "notesPanel.field.label": "メモ",
+  "notesPanel.field.placeholder": "このセッション専用のメモ…",
+  "notesPanel.status.saving": "保存中…",
+  "notesPanel.status.saved": "{time} に保存済み",
+  "notesPanel.status.unsaved": "未保存",
+  "notesPanel.status.retry": "再試行",
+  "notesPanel.status.loadError": "メモを読み込めませんでした。",
+  "notesPanel.status.reload": "再読み込み"
 }

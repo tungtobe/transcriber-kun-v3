@@ -35,11 +35,16 @@ pub fn run() {
             app.manage(state);
             Ok(())
         })
-        // Story 2.4 Design Notes: "Đóng app: luôn `prevent_close`, hỏi
-        // registry async; rảnh → thoát, bận → emit `CloseRequested`" — the OS
-        // close request always arrives synchronously, but whether a Job is
-        // running is only knowable by asking the registry actor, which is
-        // async; `prevent_close` buys the time for that async check.
+        // Story 2.4 Design Notes (đổi ở story 3.5): "Đóng app: luôn
+        // `prevent_close`, hỏi registry async" — the OS close request always
+        // arrives synchronously, but whether a Job is running is only
+        // knowable by asking the registry actor, which is async;
+        // `prevent_close` buys the time for that async check. Story 3.5 spec
+        // Code Map: sự kiện đóng cửa sổ giờ LUÔN đi qua frontend (kể cả khi
+        // không có Job) để flush ghi chú trước khi thoát -- Rust không còn tự
+        // `exit(0)` ở nhánh rảnh, chỉ luôn emit `CloseRequested { busy }` và
+        // để `appStore`/`CloseConfirm` quyết định (flush rồi gọi
+        // `app_close_confirm`, hoặc mở dialog Job hiện có khi `busy`).
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
@@ -48,9 +53,8 @@ pub fn run() {
                     let state = window.state::<ipc::boot::AppState>();
                     // P0 review fix: when the registry actor is unreachable
                     // (`snapshot()` returns `Err`), fail closed -- treat it as
-                    // busy and emit `CloseRequested` instead of silently
-                    // exiting mid-Job (spec Boundaries Always: "khi
-                    // `jobs.snapshot()` trả `Err`, coi là bận").
+                    // busy (spec Boundaries Always: "khi `jobs.snapshot()`
+                    // trả `Err`, coi là bận").
                     let busy = match &state.jobs {
                         Ok(jobs) => jobs
                             .snapshot()
@@ -59,12 +63,8 @@ pub fn run() {
                             .unwrap_or(true),
                         Err(_) => false,
                     };
-                    if busy {
-                        if let Err(err) = ipc::CloseRequested.emit(&window) {
-                            tracing::warn!(error = %err, "phát event CloseRequested thất bại");
-                        }
-                    } else {
-                        window.app_handle().exit(0);
+                    if let Err(err) = (ipc::CloseRequested { busy }).emit(&window) {
+                        tracing::warn!(error = %err, "phát event CloseRequested thất bại");
                     }
                 });
             }

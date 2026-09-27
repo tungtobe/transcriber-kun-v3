@@ -396,5 +396,19 @@
   "intake.notice.dismissLabel": "Dismiss notice",
   "intake.error.wrongFormat": "Unsupported format. Convert to mp4, m4a, or mp3.",
   "intake.error.noAudio": "The file has no playable audio.",
-  "session.job.queuedCount": "{count} files waiting"
+  "session.job.queuedCount": "{count} files waiting",
+  "closeConfirm.flushError.title": "Notes could not be saved",
+  "closeConfirm.flushError.body": "The current session's notes failed to save. Stay to try saving again, or quit without saving.",
+  "closeConfirm.flushError.stay": "Stay",
+  "closeConfirm.flushError.exit": "Quit anyway",
+  "session.aside.tabInfo": "Info",
+  "session.aside.tabNotes": "Notes",
+  "notesPanel.field.label": "Notes",
+  "notesPanel.field.placeholder": "Private notes for this session…",
+  "notesPanel.status.saving": "Saving…",
+  "notesPanel.status.saved": "Saved {time}",
+  "notesPanel.status.unsaved": "Not saved",
+  "notesPanel.status.retry": "Retry",
+  "notesPanel.status.loadError": "Couldn't load notes.",
+  "notesPanel.status.reload": "Reload"
 }

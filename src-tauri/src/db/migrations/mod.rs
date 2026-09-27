@@ -32,7 +32,14 @@ use rusqlite_migration::{Migrations, M};
 /// CASCADE`: xoá một Phiên gỡ mọi liên kết của nó (tag vẫn còn), xoá một tag
 /// gỡ liên kết của nó khỏi mọi Phiên (Phiên vẫn còn) — đúng hai chiều "Xoá
 /// Phiên"/"Xoá tag toàn cục" ở spec I/O Matrix.
-static MIGRATIONS: [M; 4] = [
+/// `notes` (story 3.5, spec Boundaries Always): một dòng tối đa mỗi Phiên
+/// (`session_id` vừa là PK vừa là FK `ON DELETE CASCADE` — xoá Phiên/xoá toàn
+/// bộ dọn ghi chú theo, Chạy lại/Transcribe lại giữ nguyên vì chúng không
+/// đụng `sessions.id`). `revision` do frontend cấp, tăng dần — `library::
+/// notes::save` chỉ ghi khi `revision` mới lớn hơn revision đang lưu (upsert
+/// có điều kiện ở `db::repo::notes::save_if_newer`), nên ACK/lệnh về sai thứ
+/// tự không thể ghi đè bản mới hơn.
+static MIGRATIONS: [M; 5] = [
     M::up(
         "CREATE TABLE settings (\n\
              key TEXT PRIMARY KEY,\n\
@@ -98,6 +105,14 @@ static MIGRATIONS: [M; 4] = [
              PRIMARY KEY (session_id, tag_id)\n\
          );",
     ),
+    M::up(
+        "CREATE TABLE notes (\n\
+             session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,\n\
+             body TEXT NOT NULL,\n\
+             revision INTEGER NOT NULL,\n\
+             updated_at INTEGER NOT NULL\n\
+         );",
+    ),
 ];
 
 fn runner() -> Migrations<'static> {
@@ -131,8 +146,8 @@ mod tests {
         let version_after_second: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version_after_first, 4);
-        assert_eq!(version_after_second, 4);
+        assert_eq!(version_after_first, 5);
+        assert_eq!(version_after_second, 5);
     }
 
     #[test]
@@ -307,7 +322,7 @@ mod tests {
         let version_after: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version_after, 4);
+        assert_eq!(version_after, 5);
         assert!(table_exists(&conn, "tags"));
         assert!(table_exists(&conn, "session_tags"));
         let title: String = conn
@@ -426,5 +441,67 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn creates_notes_table() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run(&mut conn).unwrap();
+        assert!(table_exists(&conn, "notes"));
+    }
+
+    /// Story 3.5 spec Boundaries Always: "xoá Phiên/xoá toàn bộ dọn ghi chú
+    /// qua cascade".
+    #[test]
+    fn deleting_a_session_cascades_to_its_note() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        run(&mut conn).unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id, kind, title, status, duration_sec, created_at, updated_at) \
+             VALUES ('s1', 'file', 't', 'complete', 1.0, 0, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO notes (session_id, body, revision, updated_at) VALUES ('s1', 'ghi chú', 1, 0)",
+            [],
+        )
+        .unwrap();
+
+        conn.execute("DELETE FROM sessions WHERE id = 's1'", [])
+            .unwrap();
+
+        let note_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM notes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(note_count, 0, "xoá Phiên phải xoá theo ghi chú của nó");
+    }
+
+    /// Story 3.5 spec Boundaries Always: `notes.session_id` là PK -- một
+    /// Phiên tối đa một dòng ghi chú.
+    #[test]
+    fn notes_session_id_is_primary_key_and_rejects_a_second_row() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        run(&mut conn).unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id, kind, title, status, duration_sec, created_at, updated_at) \
+             VALUES ('s1', 'file', 't', 'complete', 1.0, 0, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO notes (session_id, body, revision, updated_at) VALUES ('s1', 'a', 1, 0)",
+            [],
+        )
+        .unwrap();
+        let err = conn
+            .execute(
+                "INSERT INTO notes (session_id, body, revision, updated_at) VALUES ('s1', 'b', 2, 1)",
+                [],
+            )
+            .unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("unique"));
     }
 }

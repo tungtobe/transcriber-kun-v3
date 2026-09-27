@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 09-22-2026 06:12
-last_updated: 09-27-2026 16:00
+last_updated: 09-27-2026 17:00
 project: transcriber_kun
 project_key: NOKEY
 tracking_system: file-system
@@ -68,7 +68,7 @@ development_status:
   3-2-tag-gắn-lọc-và-quản-lý: review
   3-3-tìm-phiên-theo-tên-kết-hợp-lọc-tag: review
   3-4-settings-lưu-trữ-trong-container: review
-  3-5-ghi-chú-tự-lưu: backlog
+  3-5-ghi-chú-tự-lưu: review
   3-6-template-memo-quản-lý-trong-settings: backlog
   3-7-sinh-cache-và-sinh-lại-memo: backlog
   epic-3-retrospective: optional

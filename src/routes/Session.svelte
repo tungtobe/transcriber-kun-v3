@@ -15,6 +15,7 @@
   import Player from './session/Player.svelte';
   import JobProgress from './session/JobProgress.svelte';
   import IntakeNotices from '../components/IntakeNotices.svelte';
+  import NotesPanel from '../components/NotesPanel.svelte';
 
   type RouteParams = { id?: string };
   let { routeParams = {} }: { routeParams?: RouteParams } = $props();
@@ -59,6 +60,20 @@
   let currentTime = $state(0);
   let duration = $state(0);
   let playing = $state(false);
+
+  // Story 3.5: tab "Thông tin"/"Ghi chú" trong aside (spec Boundaries Always:
+  // "Panel là tab 'Ghi chú' trong aside 360 px ... tab còn lại giữ thông tin
+  // hiện có"). `NotesPanel` không unmount khi đổi tab (ẩn/hiện bằng CSS) --
+  // vẫn cần flush() tường minh lúc đổi tab (spec Always: "Flush ... khi đổi
+  // tab panel"), vì `$effect` cleanup của nó chỉ chạy lúc unmount/đổi Phiên.
+  let asideTab = $state<'info' | 'notes'>('info');
+  let notesPanelRef = $state<{ flush: () => Promise<boolean> } | null>(null);
+
+  function switchAsideTab(tab: 'info' | 'notes'): void {
+    if (tab === asideTab) return;
+    if (asideTab === 'notes') void notesPanelRef?.flush();
+    asideTab = tab;
+  }
 
   const searchMatches = $derived.by(() => {
     const segments = view.kind === 'saved' ? (view.detail.transcript?.segments ?? []) : [];
@@ -508,15 +523,41 @@
         />
       </div>
       <aside class="session-aside">
-        <h2>{i18n.t('session.aside.title')}</h2>
-        <dl>
-          <dt>{i18n.t('session.aside.source')}</dt>
-          <dd>{detail.sourceName ?? i18n.t('session.aside.unknown')}</dd>
-          <dt>{i18n.t('session.aside.model')}</dt>
-          <dd>{transcript?.model ?? i18n.t('session.aside.unknown')}</dd>
-          <dt>{i18n.t('session.aside.language')}</dt>
-          <dd>{transcript?.language ?? i18n.t('session.aside.languageAuto')}</dd>
-        </dl>
+        <div class="session-aside-tabs" role="tablist" aria-label={i18n.t('session.aside.title')}>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={asideTab === 'info'}
+            class="session-aside-tab"
+            class:active={asideTab === 'info'}
+            onclick={() => switchAsideTab('info')}
+          >
+            {i18n.t('session.aside.tabInfo')}
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={asideTab === 'notes'}
+            class="session-aside-tab"
+            class:active={asideTab === 'notes'}
+            onclick={() => switchAsideTab('notes')}
+          >
+            {i18n.t('session.aside.tabNotes')}
+          </button>
+        </div>
+        <div class="session-aside-panel" class:hidden-panel={asideTab !== 'info'}>
+          <dl>
+            <dt>{i18n.t('session.aside.source')}</dt>
+            <dd>{detail.sourceName ?? i18n.t('session.aside.unknown')}</dd>
+            <dt>{i18n.t('session.aside.model')}</dt>
+            <dd>{transcript?.model ?? i18n.t('session.aside.unknown')}</dd>
+            <dt>{i18n.t('session.aside.language')}</dt>
+            <dd>{transcript?.language ?? i18n.t('session.aside.languageAuto')}</dd>
+          </dl>
+        </div>
+        <div class="session-aside-panel session-aside-notes" class:hidden-panel={asideTab !== 'notes'}>
+          <NotesPanel bind:this={notesPanelRef} {sessionId} />
+        </div>
       </aside>
     </div>
 
@@ -718,16 +759,53 @@
   }
 
   .session-aside {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
     overflow-y: auto;
     padding: var(--space-4);
     border-left: 1px solid var(--color-border);
     background: var(--color-surface);
   }
 
-  .session-aside h2 {
-    margin: 0 0 var(--space-3);
-    font-size: var(--text-label-size);
+  .session-aside-tabs {
+    display: flex;
+    gap: var(--space-2);
+    margin-bottom: var(--space-3);
+    border-bottom: 1px solid var(--color-border);
+  }
+
+  .session-aside-tab {
+    padding: var(--space-2) var(--space-1);
+    border: none;
+    border-bottom: 2px solid transparent;
+    background: none;
     color: var(--color-text-secondary);
+    font: inherit;
+    font-size: var(--text-label-size);
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  .session-aside-tab.active {
+    border-bottom-color: var(--color-accent);
+    color: var(--color-text);
+  }
+
+  .session-aside-tab:focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 2px;
+  }
+
+  .session-aside-panel.hidden-panel {
+    display: none;
+  }
+
+  .session-aside-notes {
+    display: flex;
+    flex: 1;
+    min-height: 0;
+    flex-direction: column;
   }
 
   .session-aside dl {

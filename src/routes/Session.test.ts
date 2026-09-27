@@ -20,6 +20,13 @@ const mocks = vi.hoisted(() => {
     jobsCancel: vi.fn(),
     transcribeRerun: vi.fn(),
     tagsList: vi.fn(),
+    // Story 3.5: `NotesPanel` mounts inside the aside for every `saved` view
+    // -- default (set in `beforeEach`) to "no note yet, loaded fine" so it
+    // never renders its own `role="alert"` load-error message and collides
+    // with this suite's unrelated `queryByRole('alert')` assertions
+    // (relink/export errors).
+    notesGet: vi.fn(),
+    notesSave: vi.fn(),
     clipboardWriteText: vi.fn(),
     settingsStore: { timestampOffsetSec: 0 },
     push: vi.fn(),
@@ -63,6 +70,8 @@ vi.mock('../lib/bindings', () => ({
     jobsCancel: (...args: unknown[]) => mocks.jobsCancel(...args),
     transcribeRerun: (...args: unknown[]) => mocks.transcribeRerun(...args),
     tagsList: (...args: unknown[]) => mocks.tagsList(...args),
+    notesGet: (...args: unknown[]) => mocks.notesGet(...args),
+    notesSave: (...args: unknown[]) => mocks.notesSave(...args),
   },
 }));
 
@@ -99,6 +108,8 @@ beforeEach(async () => {
   mocks.libraryProxyRelink.mockReset();
   mocks.libraryTranscriptExport.mockReset();
   mocks.tagsList.mockReset().mockResolvedValue({ status: 'ok', data: [] });
+  mocks.notesGet.mockReset().mockResolvedValue({ status: 'ok', data: null });
+  mocks.notesSave.mockReset();
   mocks.clipboardWriteText.mockReset();
   mocks.settingsStore.timestampOffsetSec = 0;
   mocks.libraryTranscriptExport.mockResolvedValue({ status: 'ok', data: { saved: false, hasGaps: false } });
@@ -186,6 +197,31 @@ describe('Session route', () => {
     expect(screen.getByText('xin chào')).toBeTruthy();
     expect(screen.getByText('các bạn')).toBeTruthy();
     expect(mocks.jobsSubscribe).not.toHaveBeenCalled();
+  });
+
+  // Story 3.5 spec Boundaries Always: "Panel là tab 'Ghi chú' trong aside 360
+  // px ... tab còn lại giữ thông tin hiện có" + "Flush ... khi đổi tab
+  // panel".
+  it('switches between the Thông tin and Ghi chú aside tabs, flushing notes when leaving Ghi chú', async () => {
+    mocks.librarySessionGet.mockResolvedValue({
+      status: 'ok',
+      data: { kind: 'session', sessionId: 's1', title: 'cuộc họp', durationSec: 120, status: 'complete', partial: false, transcriptId: 't1' },
+    });
+    mocks.librarySessionDetail.mockResolvedValue({ status: 'ok', data: detail() });
+    mocks.notesSave.mockResolvedValue({ status: 'ok', data: { kind: 'saved', revision: 1, updatedAt: 1_000 } });
+    render(Session, { routeParams: { id: 's1' } });
+    await screen.findByRole('heading', { name: 'cuộc họp' });
+
+    // "Thông tin" hiện sẵn theo mặc định.
+    expect(screen.getByText('meeting.wav')).toBeTruthy();
+
+    await fireEvent.click(screen.getByRole('tab', { name: 'Ghi chú' }));
+    const textarea = await screen.findByPlaceholderText('Ghi chú riêng cho phiên này…');
+    await fireEvent.input(textarea, { target: { value: 'ghi chú mới' } });
+
+    await fireEvent.click(screen.getByRole('tab', { name: 'Thông tin' }));
+
+    await waitFor(() => expect(mocks.notesSave).toHaveBeenCalledWith('s1', 'ghi chú mới', 1));
   });
 
   it('searches the selected transcript, highlights matches, and cycles forward and backward', async () => {
