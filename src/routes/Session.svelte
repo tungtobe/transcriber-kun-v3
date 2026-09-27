@@ -16,6 +16,7 @@
   import JobProgress from './session/JobProgress.svelte';
   import IntakeNotices from '../components/IntakeNotices.svelte';
   import NotesPanel from '../components/NotesPanel.svelte';
+  import MemoPanel from '../components/MemoPanel.svelte';
 
   type RouteParams = { id?: string };
   let { routeParams = {} }: { routeParams?: RouteParams } = $props();
@@ -66,10 +67,12 @@
   // hiện có"). `NotesPanel` không unmount khi đổi tab (ẩn/hiện bằng CSS) --
   // vẫn cần flush() tường minh lúc đổi tab (spec Always: "Flush ... khi đổi
   // tab panel"), vì `$effect` cleanup của nó chỉ chạy lúc unmount/đổi Phiên.
-  let asideTab = $state<'info' | 'notes'>('info');
+  // Story 3.7: thêm tab thứ ba "Memo" cùng mẫu (panel luôn mount, ẩn bằng
+  // CSS -- spec Code Map: "thêm tab `memo` cùng mẫu").
+  let asideTab = $state<'info' | 'notes' | 'memo'>('info');
   let notesPanelRef = $state<{ flush: () => Promise<boolean> } | null>(null);
 
-  function switchAsideTab(tab: 'info' | 'notes'): void {
+  function switchAsideTab(tab: 'info' | 'notes' | 'memo'): void {
     if (tab === asideTab) return;
     if (asideTab === 'notes') void notesPanelRef?.flush();
     asideTab = tab;
@@ -376,6 +379,15 @@
     view = { ...view, detail: { ...view.detail, tags } };
   }
 
+  // Story 3.7: `MemoPanel` báo ngay khi có một memo hiện trên màn hình (đã
+  // cache hoặc vừa sinh) -- cập nhật badge `memo` tại chỗ, không cần tải lại
+  // `librarySessionDetail`.
+  function handleMemoAvailable(): void {
+    if (view.kind === 'saved' && !view.detail.hasMemo) {
+      view = { ...view, detail: { ...view.detail, hasMemo: true } };
+    }
+  }
+
   async function handleRelinkRequest(): Promise<void> {
     if (view.kind !== 'saved' || relinking) return;
     const sessionId = view.sessionId;
@@ -438,6 +450,7 @@
       segmentTextCount={segmentTextCount}
       recovered={detail.recovered}
       partial={transcript?.status === 'partial'}
+      hasMemo={detail.hasMemo}
       tags={detail.tags}
       onRenamed={handleSessionRenamed}
       onDeleted={handleSessionDeleted}
@@ -544,6 +557,16 @@
           >
             {i18n.t('session.aside.tabNotes')}
           </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={asideTab === 'memo'}
+            class="session-aside-tab"
+            class:active={asideTab === 'memo'}
+            onclick={() => switchAsideTab('memo')}
+          >
+            {i18n.t('session.aside.tabMemo')}
+          </button>
         </div>
         <div class="session-aside-panel" class:hidden-panel={asideTab !== 'info'}>
           <dl>
@@ -557,6 +580,15 @@
         </div>
         <div class="session-aside-panel session-aside-notes" class:hidden-panel={asideTab !== 'notes'}>
           <NotesPanel bind:this={notesPanelRef} {sessionId} />
+        </div>
+        <div class="session-aside-panel session-aside-memo" class:hidden-panel={asideTab !== 'memo'}>
+          <MemoPanel
+            {sessionId}
+            active={asideTab === 'memo'}
+            hasTranscript={transcript != null}
+            {segmentTextCount}
+            onMemoAvailable={handleMemoAvailable}
+          />
         </div>
       </aside>
     </div>
@@ -801,7 +833,8 @@
     display: none;
   }
 
-  .session-aside-notes {
+  .session-aside-notes,
+  .session-aside-memo {
     display: flex;
     flex: 1;
     min-height: 0;

@@ -81,6 +81,44 @@ fn wiping_error() -> AppError {
     AppError::new(Code::Request, "Đang xoá toàn bộ dữ liệu")
 }
 
+/// Story 3.7: huỷ mọi request `memo_generate` đang bay cho một Phiên --
+/// gọi từ `library_session_delete`'s `mark_deleting` closure, ngay sau khi
+/// đánh dấu "deleting" (spec Boundaries Always: "xoá Phiên ... huỷ toàn bộ
+/// các request memo đang chạy của Phiên liên quan"). Không tự gỡ khoá khỏi
+/// registry -- `memo_generate` (đang chờ ở `await`) tự gỡ khi tỉnh dậy, dù
+/// nó thức dậy với `Cancelled` hay với `UpsertOutcome::SessionGone` (Phiên
+/// đã biến mất khỏi `sessions` lúc commit).
+fn cancel_memo_requests_for_session(
+    memo_running: &std::sync::Mutex<
+        std::collections::HashMap<(SessionId, MemoTemplateId), CancellationToken>,
+    >,
+    session_id: SessionId,
+) {
+    if let Ok(running) = memo_running.lock() {
+        for (key, token) in running.iter() {
+            if key.0 == session_id {
+                token.cancel();
+            }
+        }
+    }
+}
+
+/// Cùng vai trò [`cancel_memo_requests_for_session`] nhưng cho toàn bộ
+/// registry -- gọi từ `library_wipe_all`'s `mark_wiping` closure (spec
+/// Boundaries Always: cùng khuôn "huỷ toàn bộ ... liên quan" áp dụng cho mọi
+/// Phiên khi xoá sạch dữ liệu).
+fn cancel_all_memo_requests(
+    memo_running: &std::sync::Mutex<
+        std::collections::HashMap<(SessionId, MemoTemplateId), CancellationToken>,
+    >,
+) {
+    if let Ok(running) = memo_running.lock() {
+        for token in running.values() {
+            token.cancel();
+        }
+    }
+}
+
 /// Chạy một closure blocking trên `spawn_blocking`, gộp lỗi join thành
 /// `AppError` category `storage` — dùng cho những command story 2.4 có
 /// nhiều bước chạm DB/OS tuần tự (Code Map: mọi I/O chặn chỉ qua
@@ -1477,11 +1515,18 @@ async fn library_session_delete_inner(
     let mark_set = state.deleting.clone();
     let unmark_set = state.deleting.clone();
 
+    let memo_running_for_mark = state.memo_running.clone();
+
     decide_session_delete(
         move || {
             if let Ok(mut set) = mark_set.lock() {
                 set.insert(session_id);
             }
+            // Story 3.7 spec Boundaries Always: "xoá Phiên ... huỷ toàn bộ
+            // các request memo đang chạy của Phiên liên quan" -- huỷ ngay
+            // sau khi đánh dấu "deleting" (cùng thời điểm `is_session_deleting`
+            // bắt đầu chặn `memo_generate` mới), trước khi kiểm `is_busy`.
+            cancel_memo_requests_for_session(&memo_running_for_mark, session_id);
         },
         move || async move { jobs.is_busy(session_id).await },
         move || blocking(move || library::store::delete_session(&db, &root, session_id)),
@@ -1748,6 +1793,272 @@ async fn memo_templates_restore_defaults(
     track_ipc_error(&state.db, result).await
 }
 
+/// Kết quả `memo_generate` (story 3.7, spec Boundaries Always: "Kết quả
+/// lệnh: `Generated(Memo) | Cancelled | AlreadyRunning`; lỗi trả `AppError`
+/// đúng category"). `AlreadyRunning` chỉ quyết định được ở đây (registry của
+/// `ipc::`), không ở `memo::generate::run` (spec: "registry ... chỉ `ipc/`
+/// điều phối") -- đó là lý do nó không nằm trong `memo::generate::GenerateOutcome`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum MemoGenerateOutcome {
+    Generated { memo: memo::generate::MemoView },
+    Cancelled,
+    AlreadyRunning,
+}
+
+async fn memo_generate_inner(
+    state: &AppState,
+    session_id: SessionId,
+    template_id: MemoTemplateId,
+    locale: String,
+) -> Result<MemoGenerateOutcome, AppError> {
+    if is_session_deleting(&state.deleting, session_id) {
+        return Err(session_deleting_error());
+    }
+    if is_wiping(&state.wiping) {
+        return Err(wiping_error());
+    }
+    let db = state.db.clone()?;
+    let gateway = state.gateway.clone()?;
+    let consent_db = db.clone();
+    let consent = tauri::async_runtime::spawn_blocking(move || get_gemini_consent(&Ok(consent_db)))
+        .await
+        .map_err(|err| AppError::new(Code::Storage, err.to_string()))
+        .and_then(|inner| inner)?;
+
+    // Story 3.7 spec Boundaries Always: "mỗi cặp (Phiên, Template) tối đa
+    // một request đang chạy ... gọi trùng trả `AlreadyRunning` không tạo
+    // request mới" -- khoá/mở registry quanh đúng một lần gọi
+    // `memo::generate::run`, không giữ lock qua await đó (chỉ giữ lúc kiểm
+    // tra + chèn/gỡ khoá).
+    let key = (session_id, template_id);
+    let cancellation = {
+        let mut running = state
+            .memo_running
+            .lock()
+            .map_err(|_| AppError::new(Code::Storage, "memo registry mutex poisoned"))?;
+        if running.contains_key(&key) {
+            return Ok(MemoGenerateOutcome::AlreadyRunning);
+        }
+        let token = CancellationToken::new();
+        running.insert(key, token.clone());
+        token
+    };
+
+    let outcome = memo::generate::run(
+        &db,
+        &gateway,
+        session_id,
+        template_id,
+        &locale,
+        consent,
+        cancellation,
+    )
+    .await;
+
+    // Gỡ khoá ở mọi nhánh thoát (kể cả lỗi) trước khi trả kết quả -- cùng
+    // khuôn `decide_session_delete`'s `unmark_deleting`.
+    if let Ok(mut running) = state.memo_running.lock() {
+        running.remove(&key);
+    }
+
+    Ok(match outcome? {
+        memo::generate::GenerateOutcome::Generated(memo) => MemoGenerateOutcome::Generated { memo },
+        memo::generate::GenerateOutcome::Cancelled => MemoGenerateOutcome::Cancelled,
+    })
+}
+
+/// Sinh (hoặc sinh lại) memo của một cặp (Phiên, Template) -- xem
+/// [`memo_generate_inner`] cho gate/registry thật và [`memo::generate::run`]
+/// cho luồng gọi Gemini/commit thật. Await tới khi xong (≤ 90 s + chờ key,
+/// spec Design Notes) -- frontend là một store singleton nên promise vẫn
+/// được xử lý sau khi panel Memo unmount (toast thay vì cập nhật UI trực
+/// tiếp).
+#[tauri::command]
+#[specta::specta]
+async fn memo_generate(
+    state: tauri::State<'_, AppState>,
+    session_id: SessionId,
+    template_id: MemoTemplateId,
+    locale: String,
+) -> Result<MemoGenerateOutcome, AppError> {
+    let result = memo_generate_inner(&state, session_id, template_id, locale).await;
+    track_ipc_error(&state.db, result).await
+}
+
+/// Đọc memo đã cache của một cặp (Phiên, Template), không bao giờ gọi
+/// Gemini (spec Boundaries Always: "Mở lại memo chỉ đọc DB") — xem
+/// [`memo::generate::view`] cho logic đọc + suy hai cờ provenance thật.
+#[tauri::command]
+#[specta::specta]
+async fn memo_get(
+    state: tauri::State<'_, AppState>,
+    session_id: SessionId,
+    template_id: MemoTemplateId,
+) -> Result<Option<memo::generate::MemoView>, AppError> {
+    let db = state.db.clone();
+    let result = async {
+        let db = db?;
+        blocking(move || memo::generate::view(&db, session_id, template_id)).await
+    }
+    .await;
+    track_ipc_error(&state.db, result).await
+}
+
+/// Huỷ request `memo_generate` đang chạy của một cặp (Phiên, Template) nếu
+/// có -- không lỗi khi không có gì đang chạy (idempotent, spec I/O Matrix
+/// "Huỷ": "đang chạy, `memo_cancel` → `Cancelled`, memo cũ giữ"; gọi khi
+/// không có gì đang chạy chỉ là no-op vô hại).
+#[tauri::command]
+#[specta::specta]
+async fn memo_cancel(
+    state: tauri::State<'_, AppState>,
+    session_id: SessionId,
+    template_id: MemoTemplateId,
+) -> Result<(), AppError> {
+    if let Ok(running) = state.memo_running.lock() {
+        if let Some(token) = running.get(&(session_id, template_id)) {
+            token.cancel();
+        }
+    }
+    let result: Result<(), AppError> = Ok(());
+    track_ipc_error(&state.db, result).await
+}
+
+/// Đường dẫn mặc định để xuất memo `.md` -- tên Phiên đã làm sạch (spec
+/// Boundaries Always: "tên file mặc định từ tên Phiên đã làm sạch + `.md`").
+/// Chỉ là một gợi ý tên file cho dialog lưu hệ thống, không bao giờ dùng làm
+/// đường dẫn thật trong Container (spec Never) -- đó là lý do hàm này khác
+/// hẳn `library_transcript_export`'s tên file dựa trên `transcript_id` đối
+/// (opaque, không cần làm sạch).
+fn sanitize_file_name_component(raw: &str) -> String {
+    let cleaned: String = raw
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_control() || "/\\:*?\"<>|".contains(ch) {
+                '_'
+            } else {
+                ch
+            }
+        })
+        .collect();
+    let truncated: String = cleaned.trim().chars().take(150).collect();
+    if truncated.is_empty() {
+        "memo".to_string()
+    } else {
+        truncated
+    }
+}
+
+/// Cùng kỹ thuật `save_transcript_export` (dialog trên main thread qua
+/// `run_on_main_thread` + kênh `std::sync::mpsc`) -- xem doc của nó cho lý
+/// do. Ghi bằng [`write_transcript_export`] (tên lịch sử, hàm chỉ là
+/// `std::fs::write` -- dùng lại được cho bất kỳ nội dung text nào, không chỉ
+/// transcript).
+fn save_memo_export(
+    app: &tauri::AppHandle,
+    default_file_name: String,
+    content: String,
+) -> Result<bool, AppError> {
+    let (tx, rx) = std::sync::mpsc::channel::<Option<std::path::PathBuf>>();
+    app.run_on_main_thread(move || {
+        let picked = rfd::FileDialog::new()
+            .set_file_name(&default_file_name)
+            .add_filter("Markdown", &["md"])
+            .save_file();
+        let _ = tx.send(picked);
+    })
+    .map_err(|err| AppError::new(Code::Storage, err.to_string()))?;
+    let picked = rx
+        .recv()
+        .map_err(|err| AppError::new(Code::Storage, err.to_string()))?;
+    let Some(path) = picked else {
+        return Ok(false);
+    };
+    write_transcript_export(&path, &content)?;
+    Ok(true)
+}
+
+async fn memo_export_inner(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    session_id: SessionId,
+    template_id: MemoTemplateId,
+) -> Result<bool, AppError> {
+    if is_session_deleting(&state.deleting, session_id) {
+        return Err(session_deleting_error());
+    }
+    if is_wiping(&state.wiping) {
+        return Err(wiping_error());
+    }
+    let db = state.db.clone()?;
+    let (content, default_file_name) = blocking(move || {
+        let memo = memo::generate::view(&db, session_id, template_id)?
+            .ok_or_else(|| AppError::new(Code::Request, "Memo chưa tồn tại"))?;
+        let title = db
+            .with_connection(|conn| Ok(repo::sessions::get(conn, session_id)?))?
+            .map(|row| row.title)
+            .unwrap_or_default();
+        Ok((
+            memo.body,
+            format!("{}.md", sanitize_file_name_component(&title)),
+        ))
+    })
+    .await?;
+
+    let app_for_dialog = app.clone();
+    blocking(move || save_memo_export(&app_for_dialog, default_file_name, content)).await
+}
+
+/// Tải Copy/Tải `.md` của một memo -- xem [`memo_export_inner`] cho luồng
+/// đọc + dialog + ghi thật, cùng mẫu `library_transcript_export`.
+#[tauri::command]
+#[specta::specta]
+async fn memo_export(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    session_id: SessionId,
+    template_id: MemoTemplateId,
+) -> Result<bool, AppError> {
+    let result = memo_export_inner(&app, &state, session_id, template_id).await;
+    track_ipc_error(&state.db, result).await
+}
+
+/// Mở một URL `http(s)` bằng trình mở mặc định của OS (spec Boundaries
+/// Always: "chỉ mở URL `http(s)` qua lệnh Rust `open_external_url` dùng
+/// opener từ Rust (không nới capability frontend)"; spec Never: "Không nới
+/// `opener:allow-open-url` trong capability" -- lệnh này gọi thẳng
+/// `OpenerExt::open_url` từ Rust, frontend không bao giờ có quyền
+/// `opener:allow-open-url` của riêng nó). Từ chối bất kỳ scheme nào khác
+/// `http`/`https` (spec: link trong Markdown chỉ được phép mở URL đó) trước
+/// khi chạm opener.
+#[tauri::command]
+#[specta::specta]
+async fn open_external_url(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    url: String,
+) -> Result<(), AppError> {
+    let result = blocking(move || {
+        let parsed = reqwest::Url::parse(&url)
+            .map_err(|_| AppError::new(Code::Request, "URL không hợp lệ"))?;
+        if parsed.scheme() != "http" && parsed.scheme() != "https" {
+            return Err(AppError::new(Code::Request, "Chỉ mở được URL http(s)"));
+        }
+        use tauri_plugin_opener::OpenerExt;
+        app.opener()
+            .open_url(url, None::<&str>)
+            .map_err(|err| AppError::new(Code::Storage, err.to_string()))
+    })
+    .await;
+    track_ipc_error(&state.db, result).await
+}
+
 /// Số liệu Settings → Lưu trữ (story 3.4) — xem [`library::store::storage_stats`]
 /// cho logic đo thật (Media đệ quy dưới `media/`, DB = `app.db` +
 /// `-wal`/`-shm`, số Phiên = số dòng `sessions`).
@@ -1833,9 +2144,13 @@ async fn library_wipe_all_inner(state: &AppState) -> Result<WipeAllOutcome, AppE
     let jobs = state.jobs.clone()?;
     let mark_wiping = state.wiping.clone();
     let unmark_wiping = state.wiping.clone();
+    let memo_running_for_mark = state.memo_running.clone();
 
     decide_wipe_all(
-        move || mark_wiping.store(true, std::sync::atomic::Ordering::SeqCst),
+        move || {
+            mark_wiping.store(true, std::sync::atomic::Ordering::SeqCst);
+            cancel_all_memo_requests(&memo_running_for_mark);
+        },
         move || async move {
             let snapshot = jobs.snapshot().await?;
             Ok(!snapshot.is_empty())
@@ -1936,6 +2251,11 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             memo_template_update,
             memo_template_delete,
             memo_templates_restore_defaults,
+            memo_generate,
+            memo_get,
+            memo_cancel,
+            memo_export,
+            open_external_url,
             library_storage_stats,
             library_open_data_dir,
             library_wipe_all,

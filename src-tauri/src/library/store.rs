@@ -450,6 +450,10 @@ pub struct SessionDetail {
     /// tên/transcript: đổi tên hay Chạy lại không đụng tới danh sách này
     /// (spec Boundaries Always).
     pub tags: Vec<crate::library::tags::TagSummary>,
+    /// `true` khi Phiên có ít nhất một memo đã sinh (story 3.7, spec
+    /// Boundaries Always: "Badge `memo` trong meta `SessionHeader` khi Phiên
+    /// có ít nhất một memo") — nguồn cho `SessionHeader`'s badge `memo`.
+    pub has_memo: bool,
 }
 
 fn segment_row_to_detail(row: repo::segments::SegmentRow) -> SegmentDetail {
@@ -514,6 +518,8 @@ pub fn get_detail(
     })?;
 
     let tags = crate::library::tags::list_for_session(db, session_id)?;
+    let has_memo =
+        db.with_connection(|conn| Ok(repo::memos::exists_for_session(conn, session_id)?))?;
 
     Ok(Some(SessionDetail {
         session_id: session.id,
@@ -526,6 +532,7 @@ pub fn get_detail(
         proxy_path,
         transcript,
         tags,
+        has_memo,
     }))
 }
 
@@ -2253,6 +2260,59 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(other_detail.tags.is_empty());
+    }
+
+    /// Story 3.7 spec Boundaries Always: "Badge `memo` ... khi Phiên có ít
+    /// nhất một memo" -- `has_memo` phản ánh đúng `repo::memos`, không phụ
+    /// thuộc gì khác.
+    #[test]
+    fn get_detail_has_memo_reflects_whether_a_memo_row_exists_for_the_session() {
+        let root = tempdir().unwrap();
+        let db = open_db(root.path());
+        let outcome = commit_file_session(
+            &db,
+            root.path(),
+            JobId::new(),
+            SessionId::new(),
+            sample_draft(None),
+            Err(storage_error("no proxy in has_memo test")),
+        )
+        .unwrap();
+
+        assert!(
+            !get_detail(&db, root.path(), outcome.session_id)
+                .unwrap()
+                .unwrap()
+                .has_memo
+        );
+
+        let body = crate::core::sensitive::Sensitive::new("# Memo".to_string());
+        let prompt = crate::core::sensitive::Sensitive::new("{transcript}".to_string());
+        db.with_connection(|conn| {
+            let transcript_id = repo::transcripts::primary_for_session(conn, outcome.session_id)?
+                .expect("commit_file_session luôn tạo transcript primary");
+            Ok(repo::memos::upsert(
+                conn,
+                outcome.session_id,
+                crate::core::id::MemoTemplateId::new(),
+                &body,
+                0,
+                transcript_id,
+                "complete",
+                None,
+                "Tên",
+                &prompt,
+                "m",
+            )?)
+        })
+        .unwrap();
+
+        assert!(
+            get_detail(&db, root.path(), outcome.session_id)
+                .unwrap()
+                .unwrap()
+                .has_memo
+        );
     }
 
     #[test]

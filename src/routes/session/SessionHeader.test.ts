@@ -53,6 +53,7 @@ function props(overrides: Partial<Record<string, unknown>> = {}) {
     segmentTextCount: 42,
     recovered: false,
     partial: false,
+    hasMemo: false,
     tags: [],
     onRenamed: vi.fn(),
     onDeleted: vi.fn(),
@@ -97,6 +98,16 @@ describe('SessionHeader', () => {
 
     expect(screen.getByText('Đã phục hồi')).toBeTruthy();
     expect(screen.getByText('Chưa đầy đủ')).toBeTruthy();
+  });
+
+  // Story 3.7 spec Boundaries Always: "Badge `memo` ... khi Phiên có ít
+  // nhất một memo".
+  it('shows the memo badge only when hasMemo is true', () => {
+    render(SessionHeader, props({ hasMemo: false }));
+    expect(screen.queryByText('Memo')).toBeNull();
+
+    render(SessionHeader, props({ sessionId: 'session-2', hasMemo: true }));
+    expect(screen.getByText('Memo')).toBeTruthy();
   });
 
   it('links back to Home', () => {

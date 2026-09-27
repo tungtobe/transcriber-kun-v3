@@ -137,6 +137,14 @@ pub fn list(db: &Db, locale: &str) -> Result<Vec<MemoTemplate>, AppError> {
     })
 }
 
+/// Đọc một mẫu theo `id` -- dùng bởi `memo::generate` (story 3.7) để chụp
+/// snapshot tên/prompt lúc sinh, không cần đi qua `list`/seed (một `id` đã
+/// biết trước không cần seed lại cả locale). `None` khi mẫu không còn tồn
+/// tại (đã bị xoá) -- caller quyết định lỗi phù hợp cho tình huống đó.
+pub fn get(db: &Db, id: MemoTemplateId) -> Result<Option<MemoTemplate>, AppError> {
+    db.with_connection(|conn| Ok(repo::memo_templates::get(conn, id)?.map(to_public)))
+}
+
 /// Tạo một mẫu người dùng mới -- validate tên/prompt trước khi chạm DB (spec
 /// I/O Matrix: một tên/prompt không hợp lệ không bao giờ tạo giao dịch DB).
 pub fn create(db: &Db, name: String, prompt: String) -> Result<MemoTemplate, AppError> {
@@ -317,6 +325,19 @@ mod tests {
         assert!(rows
             .iter()
             .any(|row| row.id == created.id && row.name == "Tên mẫu"));
+    }
+
+    #[test]
+    fn get_returns_none_for_an_unknown_id() {
+        let (_dir, db) = open_db();
+        assert_eq!(get(&db, MemoTemplateId::new()).unwrap(), None);
+    }
+
+    #[test]
+    fn get_reads_back_a_created_template() {
+        let (_dir, db) = open_db();
+        let created = create(&db, "Của tôi".to_string(), "{transcript}".to_string()).unwrap();
+        assert_eq!(get(&db, created.id).unwrap(), Some(created));
     }
 
     #[test]

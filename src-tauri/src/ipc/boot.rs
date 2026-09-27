@@ -2,17 +2,17 @@
 //! thành [`AppState`] để `lib.rs::run()` `manage()`. Không nơi nào khác được
 //! gọi `Db::open`/`core::log::init_file_logging` trực tiếp trong production.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use tauri::Manager;
 
 use crate::core::error::{AppError, Code};
-use crate::core::id::SessionId;
+use crate::core::id::{MemoTemplateId, SessionId};
 use crate::db::Db;
 use crate::gemini::keys::{KeyPoolHandle, KeyProvider, SystemClock};
-use crate::gemini::GeminiGateway;
+use crate::gemini::{CancellationToken, GeminiGateway};
 use crate::secrets::{NativeCredentialStore, SecretService};
 use crate::transcribe::registry::{self, GatewayTranscriber, JobRegistryHandle};
 
@@ -50,6 +50,16 @@ pub struct AppState {
     /// gỡ ở mọi nhánh thoát -- cùng khuôn với `deleting` ở trên nhưng không
     /// theo từng session vì `library_wipe_all` chạm mọi Phiên cùng lúc.
     pub wiping: Arc<AtomicBool>,
+    /// Story 3.7: registry "đang sinh memo" theo cặp (Phiên, Template) --
+    /// chỉ `ipc::` đọc/ghi (spec Boundaries Always: "registry trong
+    /// `AppState`, chỉ `ipc/` điều phối"). Một khoá có mặt nghĩa là đúng một
+    /// request `memo_generate` đang bay cho cặp đó -- gọi trùng thấy khoá
+    /// này trả `AlreadyRunning` mà không tạo `CancellationToken` mới;
+    /// `memo_cancel` gọi `.cancel()` trên token đang giữ ở đây. Gỡ khoá luôn
+    /// nằm ở chính `memo_generate` (nhánh kết thúc, mọi ngả) -- không đâu
+    /// khác được phép xoá khooản này ngoại trừ khi Phiên bị xoá/wipe (huỷ
+    /// token trước, để `memo_generate` tự gỡ khoá khi tỉnh dậy).
+    pub memo_running: Arc<Mutex<HashMap<(SessionId, MemoTemplateId), CancellationToken>>>,
     // Giữ sống suốt vòng đời app — drop sớm sẽ ngắt worker ghi log không
     // đồng bộ của `tracing-appender`. Không đọc trực tiếp ở đâu khác nên
     // đặt `_` để không bị cảnh báo "chưa dùng", nhưng vẫn public để test có
@@ -159,6 +169,7 @@ pub fn boot<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
         jobs,
         deleting: Arc::new(Mutex::new(HashSet::new())),
         wiping: Arc::new(AtomicBool::new(false)),
+        memo_running: Arc::new(Mutex::new(HashMap::new())),
         _log_guard: log_guard,
     }
 }

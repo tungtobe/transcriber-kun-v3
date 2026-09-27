@@ -633,9 +633,41 @@ impl GeminiGateway {
 
     /// Same contract as [`Self::post_job`], plus optional progress signals
     /// for a transcribe Job (story 2.4 Tasks). `observer: None` behaves
-    /// exactly like [`Self::post_job`].
+    /// exactly like [`Self::post_job`]. Thin wrapper over
+    /// [`Self::post_job_observed_for`] fixed at [`ModelKind::Transcribe`] —
+    /// same `Priority::Job` + [`TRANSCRIBE_CHUNK_TIMEOUT`] as before this
+    /// method existed (story 3.7 Code Map: refactored to share the retry/
+    /// backoff/cancellation core with Memo's request, which needs
+    /// `Priority::Memo` + [`params::MEMO_DEADLINE`] instead).
     pub async fn post_job_observed(
         &self,
+        path: &str,
+        body: String,
+        consent: ConsentSnapshot,
+        cancellation: CancellationToken,
+        observer: Option<Arc<dyn JobObserver>>,
+    ) -> Result<TransportResponse, AppError> {
+        self.post_job_observed_for(
+            ModelKind::Transcribe,
+            path,
+            body,
+            consent,
+            cancellation,
+            observer,
+        )
+        .await
+    }
+
+    /// Same contract as [`Self::post_job_observed`], parameterized by
+    /// [`ModelKind`] so a caller other than file transcription (story 3.7:
+    /// `memo::generate`) gets its own priority/deadline through the exact
+    /// same retry/backoff/cancellation/observer path — never a second copy
+    /// of that logic (spec Boundaries Always: "gọi `GeminiGateway::
+    /// post_job_observed` với `ModelKind::Memo` (Priority `Memo`, hạn 90 s
+    /// sẵn có)").
+    pub async fn post_job_observed_for(
+        &self,
+        kind: ModelKind,
         path: &str,
         body: String,
         consent: ConsentSnapshot,
@@ -652,13 +684,15 @@ impl GeminiGateway {
         }
 
         let body = Sensitive::new(body);
-        let deadline = Instant::now() + TRANSCRIBE_CHUNK_TIMEOUT;
+        let deadline = Instant::now() + deadline_for(kind);
         let mut lease = {
             let budget = remaining(deadline)?;
             if let Some(observer) = &observer {
                 observer.waiting_quota(true);
             }
-            let acquire = self.key_pool.acquire_with_budget(Priority::Job, budget);
+            let acquire = self
+                .key_pool
+                .acquire_with_budget(priority_for(kind), budget);
             tokio::pin!(acquire);
             let result = tokio::select! {
                 result = &mut acquire => result,
@@ -824,6 +858,18 @@ fn priority_for(kind: ModelKind) -> Priority {
         ModelKind::Live => Priority::Live,
         ModelKind::Transcribe => Priority::Job,
         ModelKind::Memo => Priority::Memo,
+    }
+}
+
+/// Single-operation deadline for [`GeminiGateway::post_job_observed_for`],
+/// including key-pool wait — mirrors [`priority_for`]'s per-kind mapping.
+/// `Live` never calls a `post_job*` method (its own WebSocket pipeline owns
+/// timing), so it falls back to the transcribe deadline rather than adding a
+/// third, unused constant.
+fn deadline_for(kind: ModelKind) -> Duration {
+    match kind {
+        ModelKind::Memo => params::MEMO_DEADLINE,
+        ModelKind::Transcribe | ModelKind::Live => TRANSCRIBE_CHUNK_TIMEOUT,
     }
 }
 
@@ -1591,6 +1637,50 @@ mod tests {
         assert_eq!(error.code, Code::Timeout);
         assert_eq!(transport.requests().len(), 1);
         assert!(!format!("{:?}", transport.requests()[0]).contains(body));
+    }
+
+    // Story 3.7: `post_job_observed_for(ModelKind::Memo, ...)` goes through
+    // the exact same retry/success path as `post_job_observed` (proved by
+    // reusing the same 503-then-200 fixture as
+    // `post_job_retries_5xx_serially_and_locks_request_contract`), with the
+    // priority/deadline mapping locked by `http_statuses_and_default_models_are_stable`.
+    #[tokio::test]
+    async fn post_job_observed_for_memo_retries_and_succeeds_like_transcribe() {
+        let transport = FakeTransport::new(vec![
+            Ok(TransportResponse {
+                status: 503,
+                body: "temporary failure".to_string(),
+            }),
+            Ok(TransportResponse {
+                status: 200,
+                body: "{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"# Memo\"}]}}]}"
+                    .to_string(),
+            }),
+        ]);
+        let gateway = gateway_with(vec![key("a", "AIzaA123456789")], transport.clone()).await;
+        let response = gateway
+            .post_job_observed_for(
+                ModelKind::Memo,
+                "/v1beta/models/models/opaque:generateContent",
+                "{}".to_string(),
+                ConsentSnapshot::new(1, false),
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(transport.requests().len(), 2);
+    }
+
+    #[test]
+    fn deadline_for_maps_memo_to_the_shorter_deadline() {
+        assert_eq!(deadline_for(ModelKind::Memo), params::MEMO_DEADLINE);
+        assert_eq!(
+            deadline_for(ModelKind::Transcribe),
+            TRANSCRIBE_CHUNK_TIMEOUT
+        );
+        assert_eq!(priority_for(ModelKind::Memo), Priority::Memo);
     }
 
     #[tokio::test]
