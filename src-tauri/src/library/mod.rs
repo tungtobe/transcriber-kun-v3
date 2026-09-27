@@ -3,5 +3,6 @@
 //! without granting file access to the WebView.
 
 pub mod export;
+pub mod notes;
 pub mod store;
 pub mod tags;

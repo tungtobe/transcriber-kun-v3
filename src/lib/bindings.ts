@@ -193,6 +193,35 @@ export const commands = {
 	 */
 	tagsDelete: (tagId: string) => typedError<null, AppError>(__TAURI_INVOKE("tags_delete", { tagId })),
 	/**
+	 *  Đọc ghi chú đã lưu của một Phiên (story 3.5) — `Ok(None)` khi Phiên chưa
+	 *  từng có ghi chú (không phải lỗi). Không có guard `is_wiping`/
+	 *  `is_session_deleting` -- đọc không xung đột với xoá/wipe (spec Boundaries
+	 *  Always chỉ nói `notes_save` bị từ chối).
+	 */
+	notesGet: (sessionId: string) => typedError<{
+	body: string,
+	/**
+	 *  `i32` không phải `i64` -- cùng lý do `TagWithCount::session_count`:
+	 *  specta-typescript cấm xuất kiểu BigInt, và revision (tăng dần theo
+	 *  lần gõ dừng của một Phiên) không bao giờ tới gần `i32::MAX`.
+	 */
+	revision: number,
+	/**
+	 *  Mili-giây kể từ Unix epoch (UTC), giữ dạng `f64` -- cùng quy ước
+	 *  `SessionDetail::created_at` (một mốc thời gian có thể vượt
+	 *  `i32::MAX` nhưng vẫn nguyên trong dải số nguyên chính xác của `f64`).
+	 */
+	updatedAt: number | null,
+} | null, AppError>(__TAURI_INVOKE("notes_get", { sessionId })),
+	/**
+	 *  Lưu ghi chú của một Phiên nếu `revision` mới lớn hơn revision đang lưu
+	 *  (story 3.5, spec Boundaries Always) — từ chối khi Phiên đang bị
+	 *  `library_session_delete` xoá hoặc đang `library_wipe_all` (cùng khuôn với
+	 *  `session_tags_attach`/`tags_create`). Xem [`library::notes::save`] cho
+	 *  validate độ dài/upsert có điều kiện thật.
+	 */
+	notesSave: (sessionId: string, body: string, revision: number) => typedError<NotesSaveOutcome, AppError>(__TAURI_INVOKE("notes_save", { sessionId, body, revision })),
+	/**
 	 *  Số liệu Settings → Lưu trữ (story 3.4) — xem [`library::store::storage_stats`]
 	 *  cho logic đo thật (Media đệ quy dưới `media/`, DB = `app.db` +
 	 *  `-wal`/`-shm`, số Phiên = số dòng `sessions`).
@@ -249,11 +278,18 @@ export type CancelOutcome = "cancelling" | "alreadyFinished";
 export type Category = "quota" | "auth" | "model" | "network" | "format" | "permission" | "storage" | "blocked";
 
 /**
- *  Phát khi cửa sổ chính bị yêu cầu đóng trong lúc registry bận (spec Design
- *  Notes: "bận → emit `CloseRequested`") — UI hỏi xác nhận, gọi
- *  `app_close_confirm` nếu người dùng đồng ý huỷ sạch rồi thoát.
+ *  Phát mỗi khi cửa sổ chính bị yêu cầu đóng (story 3.5, spec Code Map: "đổi
+ *  để luôn emit (thêm cờ `busy` vào payload event) và frontend quyết định" --
+ *  trước đây chỉ emit khi registry bận, nhánh rảnh thoát thẳng từ Rust, nên
+ *  không có chỗ nào chắc chắn chạy để flush ghi chú trước khi đóng). `busy`
+ *  phản ánh đúng kết quả `JobRegistryHandle::snapshot` tại thời điểm nhận yêu
+ *  cầu đóng: `true` mở dialog Job hiện có (`CloseConfirm`), `false` là tín
+ *  hiệu để `appStore` tự flush ghi chú rồi gọi `appCloseConfirm` nếu flush
+ *  thành công.
  */
-export type CloseRequested = null;
+export type CloseRequested = {
+	busy: boolean,
+};
 
 /**
  *  Mã lỗi kỹ thuật — 12 biến thể, người dùng chốt 2026-09-22. Ánh xạ
@@ -414,6 +450,34 @@ export type ModelInfo = {
  *  performed from API capability metadata, never from a model alias/name.
  */
 export type ModelKind = "transcribe" | "live" | "memo";
+
+/**
+ *  Ghi chú tại ACK gần nhất -- `body` là `String` công khai qua IPC (spec
+ *  Always: "payload IPC là `String`"); `Sensitive<String>` chỉ tồn tại trong
+ *  Rust nội bộ (`repo::notes`), không lộ ra kiểu này.
+ */
+export type NoteSnapshot = {
+	body: string,
+	/**
+	 *  `i32` không phải `i64` -- cùng lý do `TagWithCount::session_count`:
+	 *  specta-typescript cấm xuất kiểu BigInt, và revision (tăng dần theo
+	 *  lần gõ dừng của một Phiên) không bao giờ tới gần `i32::MAX`.
+	 */
+	revision: number,
+	/**
+	 *  Mili-giây kể từ Unix epoch (UTC), giữ dạng `f64` -- cùng quy ước
+	 *  `SessionDetail::created_at` (một mốc thời gian có thể vượt
+	 *  `i32::MAX` nhưng vẫn nguyên trong dải số nguyên chính xác của `f64`).
+	 */
+	updatedAt: number | null,
+};
+
+/**
+ *  Kết quả `notes_save` (spec Boundaries Always). `rename_all_fields`
+ *  khớp quy ước `SessionLookup` (`ipc/mod.rs`) cho enum có biến thể mang dữ
+ *  liệu qua IPC.
+ */
+export type NotesSaveOutcome = { kind: "saved"; revision: number; updatedAt: number | null } | { kind: "stale"; revision: number } | { kind: "notFound" };
 
 /**
  *  Kết quả `library_proxy_relink` (spec I/O Matrix "Chọn lại khớp/sai/huỷ",

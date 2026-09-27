@@ -396,5 +396,19 @@
   "intake.notice.dismissLabel": "Đóng thông báo",
   "intake.error.wrongFormat": "Định dạng không hỗ trợ. Hãy chuyển sang mp4, m4a hoặc mp3.",
   "intake.error.noAudio": "File không có audio phát được.",
-  "session.job.queuedCount": "{count} file đang chờ"
+  "session.job.queuedCount": "{count} file đang chờ",
+  "closeConfirm.flushError.title": "Chưa lưu được ghi chú",
+  "closeConfirm.flushError.body": "Ghi chú của phiên hiện tại chưa lưu được. Ở lại để thử lưu lại, hoặc thoát mà không lưu.",
+  "closeConfirm.flushError.stay": "Ở lại",
+  "closeConfirm.flushError.exit": "Vẫn thoát",
+  "session.aside.tabInfo": "Thông tin",
+  "session.aside.tabNotes": "Ghi chú",
+  "notesPanel.field.label": "Ghi chú",
+  "notesPanel.field.placeholder": "Ghi chú riêng cho phiên này…",
+  "notesPanel.status.saving": "Đang lưu…",
+  "notesPanel.status.saved": "Đã lưu {time}",
+  "notesPanel.status.unsaved": "Chưa lưu",
+  "notesPanel.status.retry": "Thử lại",
+  "notesPanel.status.loadError": "Không tải được ghi chú.",
+  "notesPanel.status.reload": "Tải lại"
 }

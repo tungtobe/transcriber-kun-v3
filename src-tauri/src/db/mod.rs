@@ -57,6 +57,14 @@ impl Db {
             ));
         }
 
+        // Story 3.5 (OQ10 autorun, 2026-09-27): `synchronous = FULL` đặt
+        // tường minh -- WAL mặc định `NORMAL`, không đủ mạnh cho cơ chế bền
+        // của `notes_save` (ACK = sau khi transaction thật sự `fsync` xuống
+        // đĩa, không chỉ ghi vào WAL trong bộ nhớ trang OS). Không trả hàng
+        // kết quả như `journal_mode` nên dùng `pragma_update`, không
+        // `query_row`.
+        conn.pragma_update(None, "synchronous", "FULL")?;
+
         migrations::run(&mut conn)?;
 
         Ok(Self {
@@ -117,7 +125,7 @@ mod tests {
             let version: i64 = conn
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 4);
+            assert_eq!(version, 5);
             Ok(())
         })
         .unwrap();
@@ -132,6 +140,24 @@ mod tests {
                 .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
                 .unwrap();
             assert_eq!(on, 1);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// Story 3.5 (OQ10 autorun): `synchronous = FULL` đặt tường minh trong
+    /// `Db::open`, không dựa vào mặc định `NORMAL` của WAL.
+    #[test]
+    fn synchronous_pragma_is_full() {
+        let dir = tempdir().unwrap();
+        let db = Db::open(dir.path()).unwrap();
+        db.with_connection(|conn| {
+            // SQLite trả số nguyên cho `PRAGMA synchronous`: 0=OFF, 1=NORMAL,
+            // 2=FULL, 3=EXTRA.
+            let mode: i64 = conn
+                .query_row("PRAGMA synchronous", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(mode, 2, "synchronous phải là FULL (2)");
             Ok(())
         })
         .unwrap();

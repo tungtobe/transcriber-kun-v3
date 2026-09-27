@@ -30,11 +30,18 @@ use crate::transcribe::registry::{self, RerunOutcome, RerunParams};
 use crate::transcribe::rerun::{self, RerunScope};
 use boot::AppState;
 
-/// Phát khi cửa sổ chính bị yêu cầu đóng trong lúc registry bận (spec Design
-/// Notes: "bận → emit `CloseRequested`") — UI hỏi xác nhận, gọi
-/// `app_close_confirm` nếu người dùng đồng ý huỷ sạch rồi thoát.
+/// Phát mỗi khi cửa sổ chính bị yêu cầu đóng (story 3.5, spec Code Map: "đổi
+/// để luôn emit (thêm cờ `busy` vào payload event) và frontend quyết định" --
+/// trước đây chỉ emit khi registry bận, nhánh rảnh thoát thẳng từ Rust, nên
+/// không có chỗ nào chắc chắn chạy để flush ghi chú trước khi đóng). `busy`
+/// phản ánh đúng kết quả `JobRegistryHandle::snapshot` tại thời điểm nhận yêu
+/// cầu đóng: `true` mở dialog Job hiện có (`CloseConfirm`), `false` là tín
+/// hiệu để `appStore` tự flush ghi chú rồi gọi `appCloseConfirm` nếu flush
+/// thành công.
 #[derive(Debug, Clone, Serialize, Deserialize, Type, tauri_specta::Event)]
-pub struct CloseRequested;
+pub struct CloseRequested {
+    pub busy: bool,
+}
 
 /// Story 3.1: `true` khi `session_id` đang bị `library_session_delete` đánh
 /// dấu "deleting" (spec Design Notes AD-1: chỉ `ipc/` đọc/ghi
@@ -1601,6 +1608,55 @@ async fn tags_delete(state: tauri::State<'_, AppState>, tag_id: TagId) -> Result
     track_ipc_error(&state.db, result).await
 }
 
+/// Đọc ghi chú đã lưu của một Phiên (story 3.5) — `Ok(None)` khi Phiên chưa
+/// từng có ghi chú (không phải lỗi). Không có guard `is_wiping`/
+/// `is_session_deleting` -- đọc không xung đột với xoá/wipe (spec Boundaries
+/// Always chỉ nói `notes_save` bị từ chối).
+#[tauri::command]
+#[specta::specta]
+async fn notes_get(
+    state: tauri::State<'_, AppState>,
+    session_id: SessionId,
+) -> Result<Option<library::notes::NoteSnapshot>, AppError> {
+    let db = state.db.clone();
+    let result = async {
+        let db = db?;
+        blocking(move || library::notes::get(&db, session_id)).await
+    }
+    .await;
+    track_ipc_error(&state.db, result).await
+}
+
+/// Lưu ghi chú của một Phiên nếu `revision` mới lớn hơn revision đang lưu
+/// (story 3.5, spec Boundaries Always) — từ chối khi Phiên đang bị
+/// `library_session_delete` xoá hoặc đang `library_wipe_all` (cùng khuôn với
+/// `session_tags_attach`/`tags_create`). Xem [`library::notes::save`] cho
+/// validate độ dài/upsert có điều kiện thật.
+#[tauri::command]
+#[specta::specta]
+async fn notes_save(
+    state: tauri::State<'_, AppState>,
+    session_id: SessionId,
+    body: String,
+    revision: i32,
+) -> Result<library::notes::NotesSaveOutcome, AppError> {
+    if is_session_deleting(&state.deleting, session_id) {
+        let result = Err(session_deleting_error());
+        return track_ipc_error(&state.db, result).await;
+    }
+    if is_wiping(&state.wiping) {
+        let result = Err(wiping_error());
+        return track_ipc_error(&state.db, result).await;
+    }
+    let db = state.db.clone();
+    let result = async {
+        let db = db?;
+        blocking(move || library::notes::save(&db, session_id, body, revision)).await
+    }
+    .await;
+    track_ipc_error(&state.db, result).await
+}
+
 /// Số liệu Settings → Lưu trữ (story 3.4) — xem [`library::store::storage_stats`]
 /// cho logic đo thật (Media đệ quy dưới `media/`, DB = `app.db` +
 /// `-wal`/`-shm`, số Phiên = số dòng `sessions`).
@@ -1782,6 +1838,8 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             session_tags_attach,
             session_tags_detach,
             tags_delete,
+            notes_get,
+            notes_save,
             library_storage_stats,
             library_open_data_dir,
             library_wipe_all,
