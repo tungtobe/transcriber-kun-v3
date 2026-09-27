@@ -41,6 +41,7 @@ const mocks = vi.hoisted(() => ({
   },
   diagnosticsSummary: vi.fn(),
   libraryStorageStats: vi.fn(),
+  memoTemplatesList: vi.fn(),
 }));
 
 vi.mock('../lib/stores/settings.svelte', () => ({ settingsStore: mocks.settingsStore }));
@@ -53,6 +54,7 @@ vi.mock('../lib/bindings', async (importOriginal) => {
       ...actual.commands,
       diagnosticsSummary: (...args: unknown[]) => mocks.diagnosticsSummary(...args),
       libraryStorageStats: (...args: unknown[]) => mocks.libraryStorageStats(...args),
+      memoTemplatesList: (...args: unknown[]) => mocks.memoTemplatesList(...args),
     },
   };
 });
@@ -84,6 +86,13 @@ beforeEach(() => {
   mocks.libraryStorageStats.mockReset().mockResolvedValue({
     status: 'ok',
     data: { mediaBytes: 125_829_120, dbBytes: 40_960, sessionCount: 3 },
+  });
+  mocks.memoTemplatesList.mockReset().mockResolvedValue({
+    status: 'ok',
+    data: [
+      { id: 'd1', name: 'Biên bản họp', prompt: 'Tóm tắt {transcript}', isDefault: true, locale: 'vi', defaultKey: 'meeting-minutes' },
+      { id: 'd2', name: 'Memo song ngữ Nhật–Việt', prompt: 'Tóm tắt {transcript}', isDefault: true, locale: 'vi', defaultKey: 'bilingual-ja-vi' },
+    ],
   });
 });
 
@@ -126,6 +135,16 @@ describe('Settings group routing', () => {
     expect(screen.queryByLabelText(/cache/i)).toBeNull();
   });
 
+  it('renders real SettingsMemo master-detail for the memo group', async () => {
+    render(Settings, { props: { routeParams: { group: 'memo' } } });
+
+    expect(await screen.findByText('Biên bản họp')).toBeTruthy();
+    expect(screen.getByText('Memo song ngữ Nhật–Việt')).toBeTruthy();
+    expect(screen.getByRole('button', { name: '+ Thêm mẫu' })).toBeTruthy();
+    expect(screen.getByLabelText('Tên mẫu')).toBeTruthy();
+    expect(screen.getByLabelText('Prompt')).toBeTruthy();
+  });
+
   it('renders real SettingsAbout content for the about group', () => {
     render(Settings, { props: { routeParams: { group: 'about' } } });
 
@@ -143,6 +162,7 @@ describe('Settings group routing', () => {
     expect(nav.textContent).toContain('Giới thiệu & Quyền riêng tư');
     expect(nav.textContent).not.toContain('Chung');
     expect(nav.textContent).not.toContain('Gemini');
+    expect(nav.textContent).not.toContain('Memo');
     expect(nav.textContent).not.toContain('Lưu trữ');
     expect(nav.textContent).not.toContain('Chẩn đoán');
   });

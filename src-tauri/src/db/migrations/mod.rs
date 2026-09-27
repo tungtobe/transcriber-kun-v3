@@ -39,7 +39,15 @@ use rusqlite_migration::{Migrations, M};
 /// notes::save` chỉ ghi khi `revision` mới lớn hơn revision đang lưu (upsert
 /// có điều kiện ở `db::repo::notes::save_if_newer`), nên ACK/lệnh về sai thứ
 /// tự không thể ghi đè bản mới hơn.
-static MIGRATIONS: [M; 5] = [
+/// `memo_templates` (story 3.6, spec Boundaries Always): `id` UUIDv7 do app
+/// sinh; `is_default` phân biệt 2 mẫu mặc định mỗi locale (seed lười ở
+/// `memo::templates::list`, không seed ở đây — spec Never) với mẫu người
+/// dùng (`locale`/`default_key` đều `NULL`). `UNIQUE(locale, default_key)`
+/// là điều kiện để seed idempotent qua `INSERT ... ON CONFLICT DO NOTHING`
+/// (`ensure_default`) và khôi phục qua `... DO UPDATE` (`restore_default`) --
+/// SQLite coi nhiều dòng `(NULL, NULL)` là không trùng nhau nên ràng buộc
+/// này không giới hạn số mẫu người dùng.
+static MIGRATIONS: [M; 6] = [
     M::up(
         "CREATE TABLE settings (\n\
              key TEXT PRIMARY KEY,\n\
@@ -113,6 +121,19 @@ static MIGRATIONS: [M; 5] = [
              updated_at INTEGER NOT NULL\n\
          );",
     ),
+    M::up(
+        "CREATE TABLE memo_templates (\n\
+             id TEXT PRIMARY KEY,\n\
+             name TEXT NOT NULL,\n\
+             prompt TEXT NOT NULL,\n\
+             is_default INTEGER NOT NULL CHECK (is_default IN (0, 1)),\n\
+             locale TEXT,\n\
+             default_key TEXT,\n\
+             created_at INTEGER NOT NULL,\n\
+             updated_at INTEGER NOT NULL,\n\
+             UNIQUE (locale, default_key)\n\
+         );",
+    ),
 ];
 
 fn runner() -> Migrations<'static> {
@@ -146,8 +167,8 @@ mod tests {
         let version_after_second: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version_after_first, 5);
-        assert_eq!(version_after_second, 5);
+        assert_eq!(version_after_first, 6);
+        assert_eq!(version_after_second, 6);
     }
 
     #[test]
@@ -322,7 +343,7 @@ mod tests {
         let version_after: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version_after, 5);
+        assert_eq!(version_after, 6);
         assert!(table_exists(&conn, "tags"));
         assert!(table_exists(&conn, "session_tags"));
         let title: String = conn
@@ -503,5 +524,68 @@ mod tests {
             )
             .unwrap_err();
         assert!(err.to_string().to_lowercase().contains("unique"));
+    }
+
+    #[test]
+    fn creates_memo_templates_table() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run(&mut conn).unwrap();
+        assert!(table_exists(&conn, "memo_templates"));
+    }
+
+    /// Story 3.6 spec Boundaries Always: `UNIQUE(locale, default_key)` --
+    /// hai mẫu mặc định cùng `(locale, default_key)` bị chặn, nhưng nhiều mẫu
+    /// người dùng cùng `(NULL, NULL)` không bị chặn (SQLite coi mỗi NULL là
+    /// khác nhau trong ràng buộc UNIQUE).
+    #[test]
+    fn memo_templates_locale_default_key_is_unique_but_null_rows_are_not() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run(&mut conn).unwrap();
+        conn.execute(
+            "INSERT INTO memo_templates (id, name, prompt, is_default, locale, default_key, created_at, updated_at) \
+             VALUES ('t1', 'a', '{transcript}', 1, 'vi', 'meeting-minutes', 0, 0)",
+            [],
+        )
+        .unwrap();
+        let err = conn
+            .execute(
+                "INSERT INTO memo_templates (id, name, prompt, is_default, locale, default_key, created_at, updated_at) \
+                 VALUES ('t2', 'b', '{transcript}', 1, 'vi', 'meeting-minutes', 0, 0)",
+                [],
+            )
+            .unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("unique"));
+
+        // Hai mẫu người dùng (locale/default_key đều NULL) chèn được cả hai.
+        conn.execute(
+            "INSERT INTO memo_templates (id, name, prompt, is_default, locale, default_key, created_at, updated_at) \
+             VALUES ('u1', 'của tôi 1', '{transcript}', 0, NULL, NULL, 0, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO memo_templates (id, name, prompt, is_default, locale, default_key, created_at, updated_at) \
+             VALUES ('u2', 'của tôi 2', '{transcript}', 0, NULL, NULL, 0, 0)",
+            [],
+        )
+        .unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memo_templates", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn memo_templates_is_default_check_rejects_values_outside_zero_or_one() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run(&mut conn).unwrap();
+        let err = conn
+            .execute(
+                "INSERT INTO memo_templates (id, name, prompt, is_default, locale, default_key, created_at, updated_at) \
+                 VALUES ('t1', 'a', '{transcript}', 2, NULL, NULL, 0, 0)",
+                [],
+            )
+            .unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("check"));
     }
 }

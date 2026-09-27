@@ -84,6 +84,7 @@ uuid_v7_id!(SessionId, "ID Phiên (Session), UUIDv7.");
 uuid_v7_id!(TranscriptId, "ID Transcript, UUIDv7.");
 uuid_v7_id!(JobId, "ID Job, UUIDv7.");
 uuid_v7_id!(TagId, "ID Tag (story 3.2), UUIDv7.");
+uuid_v7_id!(MemoTemplateId, "ID Template memo (story 3.6), UUIDv7.");
 
 #[cfg(test)]
 mod tests {

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from 'svelte';
   // Ghi chú tự lưu của một Phiên (story 3.5, spec Approach): textarea thuần
   // (spec Never: "Không làm Markdown/rich text") tự lưu qua `notesStore` sau
   // debounce 800 ms, dòng trạng thái "Đang lưu…"/"Đã lưu hh:mm"/"Chưa lưu" +
@@ -21,7 +22,9 @@
 
   $effect(() => {
     const id = sessionId;
-    void notesStore.load(id);
+    // `untrack`: `load()` đọc `entries` đồng bộ (kiểm buffer chưa lưu) -- nếu
+    // bị theo dõi, effect vừa đọc vừa ghi `entries` và tự chạy lại vô hạn.
+    untrack(() => void notesStore.load(id));
     return () => {
       void notesStore.flush(id);
     };
