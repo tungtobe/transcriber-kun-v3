@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onDestroy } from 'svelte';
-  import { link } from '@keenmate/svelte-spa-router';
+  import { link, push } from '@keenmate/svelte-spa-router';
   import { i18n } from '../i18n/index.svelte';
   import { commands, type RerunScope, type SessionDetail, type SessionLookup } from '../lib/bindings';
   import { registerKeymap } from '../lib/keymap';
@@ -330,6 +330,20 @@
     }
   }
 
+  // Story 3.1: `SessionHeader` owns the rename/delete UI and calls
+  // `libraryStore` itself -- this just reconciles the two results back into
+  // `view` (which `SessionHeader` doesn't hold): a new title updates the
+  // already-loaded detail in place, a delete navigates back to Home (spec
+  // Code Map: "Xoá → dialog → `push('/home')` khi `Deleted`").
+  function handleSessionRenamed(newTitle: string): void {
+    if (view.kind !== 'saved') return;
+    view = { ...view, detail: { ...view.detail, title: newTitle } };
+  }
+
+  function handleSessionDeleted(): void {
+    void push('/home');
+  }
+
   async function handleRelinkRequest(): Promise<void> {
     if (view.kind !== 'saved' || relinking) return;
     const sessionId = view.sessionId;
@@ -384,6 +398,7 @@
   {@const segmentTextCount = (transcript?.segments ?? []).filter((s) => s.kind === 'text').length}
   <section class="session-shell" aria-labelledby="session-title">
     <SessionHeader
+      sessionId={sessionId}
       title={detail.title}
       kind={detail.kind}
       createdAtMs={detail.createdAt}
@@ -391,6 +406,8 @@
       segmentTextCount={segmentTextCount}
       recovered={detail.recovered}
       partial={transcript?.status === 'partial'}
+      onRenamed={handleSessionRenamed}
+      onDeleted={handleSessionDeleted}
     />
 
     {#if transcript}

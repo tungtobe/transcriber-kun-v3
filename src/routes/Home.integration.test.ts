@@ -23,6 +23,8 @@ const mocks = vi.hoisted(() => {
   }
   return {
     librarySessionsList: vi.fn(),
+    librarySessionRename: vi.fn(),
+    librarySessionDelete: vi.fn(),
     jobsSubscribe: vi.fn(),
     jobsUnsubscribe: vi.fn().mockResolvedValue({ status: 'ok', data: null }),
     jobsCancel: vi.fn(),
@@ -38,6 +40,8 @@ vi.mock('@tauri-apps/api/core', () => ({
 vi.mock('../lib/bindings', () => ({
   commands: {
     librarySessionsList: (...args: unknown[]) => mocks.librarySessionsList(...args),
+    librarySessionRename: (...args: unknown[]) => mocks.librarySessionRename(...args),
+    librarySessionDelete: (...args: unknown[]) => mocks.librarySessionDelete(...args),
     jobsSubscribe: (...args: unknown[]) => mocks.jobsSubscribe(...args),
     jobsUnsubscribe: (...args: unknown[]) => mocks.jobsUnsubscribe(...args),
     jobsCancel: (...args: unknown[]) => mocks.jobsCancel(...args),

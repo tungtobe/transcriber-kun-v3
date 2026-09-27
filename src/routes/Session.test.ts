@@ -11,6 +11,8 @@ const mocks = vi.hoisted(() => {
   return {
     librarySessionGet: vi.fn(),
     librarySessionDetail: vi.fn(),
+    librarySessionRename: vi.fn(),
+    librarySessionDelete: vi.fn(),
     libraryProxyRelink: vi.fn(),
     libraryTranscriptExport: vi.fn(),
     jobsSubscribe: vi.fn(),
@@ -19,6 +21,7 @@ const mocks = vi.hoisted(() => {
     transcribeRerun: vi.fn(),
     clipboardWriteText: vi.fn(),
     settingsStore: { timestampOffsetSec: 0 },
+    push: vi.fn(),
     FakeChannel,
     intakeStore: {
       notices: [] as Array<{ id: string; variant: string; title: string; message: string }>,
@@ -32,6 +35,15 @@ const mocks = vi.hoisted(() => {
 // mocks it, so this suite stays about Session's own routing/job/rerun logic.
 vi.mock('../lib/stores/intake.svelte', () => ({ intakeStore: mocks.intakeStore }));
 
+// Story 3.1: `SessionHeader`'s delete flow calls `push('/home')` on success
+// (spec Code Map: "Xoá → dialog → `push('/home')` khi `Deleted`"). Keep
+// `link` and everything else real (the back-link and other `<a use:link>`
+// elements throughout this tree still need it) and only spy on `push`.
+vi.mock('@keenmate/svelte-spa-router', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@keenmate/svelte-spa-router')>();
+  return { ...actual, push: (...args: unknown[]) => mocks.push(...args) };
+});
+
 vi.mock('@tauri-apps/api/core', () => ({
   Channel: mocks.FakeChannel,
   convertFileSrc: (path: string) => `asset://localhost/${path}`,
@@ -41,6 +53,8 @@ vi.mock('../lib/bindings', () => ({
   commands: {
     librarySessionGet: (...args: unknown[]) => mocks.librarySessionGet(...args),
     librarySessionDetail: (...args: unknown[]) => mocks.librarySessionDetail(...args),
+    librarySessionRename: (...args: unknown[]) => mocks.librarySessionRename(...args),
+    librarySessionDelete: (...args: unknown[]) => mocks.librarySessionDelete(...args),
     libraryProxyRelink: (...args: unknown[]) => mocks.libraryProxyRelink(...args),
     libraryTranscriptExport: (...args: unknown[]) => mocks.libraryTranscriptExport(...args),
     jobsSubscribe: (...args: unknown[]) => mocks.jobsSubscribe(...args),
@@ -78,6 +92,8 @@ beforeEach(async () => {
   i18n.applyPreference('vi');
   mocks.librarySessionGet.mockReset();
   mocks.librarySessionDetail.mockReset();
+  mocks.librarySessionRename.mockReset();
+  mocks.librarySessionDelete.mockReset();
   mocks.libraryProxyRelink.mockReset();
   mocks.libraryTranscriptExport.mockReset();
   mocks.clipboardWriteText.mockReset();
@@ -94,6 +110,7 @@ beforeEach(async () => {
   mocks.transcribeRerun.mockReset();
   mocks.intakeStore.notices = [];
   mocks.intakeStore.dismiss.mockReset();
+  mocks.push.mockReset();
   capturedChannel = null;
   mocks.jobsSubscribe.mockImplementation((channel: CapturedChannel) => {
     capturedChannel = channel;
@@ -691,5 +708,65 @@ describe('Session route', () => {
 
     expect(await screen.findByRole('heading', { name: 'cuộc họp' })).toBeTruthy();
     expect(screen.getByText('Đã thêm vào hàng đợi transcribe.')).toBeTruthy();
+  });
+
+  // Story 3.1: rename/delete from the Transcript detail header.
+  it('renaming from the header updates the displayed title in place', async () => {
+    mocks.librarySessionGet.mockResolvedValue({
+      status: 'ok',
+      data: { kind: 'session', sessionId: 's1', title: 'cuộc họp', durationSec: 120, status: 'complete', partial: false, transcriptId: 't1' },
+    });
+    mocks.librarySessionDetail.mockResolvedValue({ status: 'ok', data: detail() });
+    mocks.librarySessionRename.mockResolvedValue({ status: 'ok', data: 'tên đã đổi' });
+    render(Session, { routeParams: { id: 's1' } });
+
+    await screen.findByRole('heading', { name: 'cuộc họp' });
+    await fireEvent.click(screen.getByRole('button', { name: 'cuộc họp' }));
+    const input = screen.getByRole('textbox', { name: 'Tên phiên' });
+    await fireEvent.input(input, { target: { value: 'tên đã đổi' } });
+    await fireEvent.keyDown(input, { key: 'Enter' });
+
+    expect(mocks.librarySessionRename).toHaveBeenCalledWith('s1', 'tên đã đổi');
+    expect(await screen.findByRole('heading', { name: 'tên đã đổi' })).toBeTruthy();
+  });
+
+  it('deleting from the header navigates back to Home on a Deleted outcome', async () => {
+    mocks.librarySessionGet.mockResolvedValue({
+      status: 'ok',
+      data: { kind: 'session', sessionId: 's1', title: 'cuộc họp', durationSec: 120, status: 'complete', partial: false, transcriptId: 't1' },
+    });
+    mocks.librarySessionDetail.mockResolvedValue({ status: 'ok', data: detail() });
+    mocks.librarySessionDelete.mockResolvedValue({ status: 'ok', data: 'deleted' });
+    render(Session, { routeParams: { id: 's1' } });
+
+    await screen.findByRole('heading', { name: 'cuộc họp' });
+    await fireEvent.click(screen.getByRole('button', { name: 'Thao tác khác' }));
+    await fireEvent.click(screen.getByRole('menuitem', { name: 'Xoá' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Xoá phiên' }));
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(mocks.librarySessionDelete).toHaveBeenCalledWith('s1');
+    expect(mocks.push).toHaveBeenCalledWith('/home');
+  });
+
+  it('a Busy delete outcome shows an inline explanation and does not navigate', async () => {
+    mocks.librarySessionGet.mockResolvedValue({
+      status: 'ok',
+      data: { kind: 'session', sessionId: 's1', title: 'cuộc họp', durationSec: 120, status: 'complete', partial: false, transcriptId: 't1' },
+    });
+    mocks.librarySessionDetail.mockResolvedValue({ status: 'ok', data: detail() });
+    mocks.librarySessionDelete.mockResolvedValue({ status: 'ok', data: 'busy' });
+    render(Session, { routeParams: { id: 's1' } });
+
+    await screen.findByRole('heading', { name: 'cuộc họp' });
+    await fireEvent.click(screen.getByRole('button', { name: 'Thao tác khác' }));
+    await fireEvent.click(screen.getByRole('menuitem', { name: 'Xoá' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Xoá phiên' }));
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(screen.getByText('Phiên đang có tác vụ chạy, thử lại khi xong.')).toBeTruthy();
+    expect(mocks.push).not.toHaveBeenCalled();
   });
 });

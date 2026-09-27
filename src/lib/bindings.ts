@@ -147,6 +147,20 @@ export const commands = {
 	 */
 	libraryProxyRelink: (sessionId: string) => typedError<ProxyRelinkOutcome, AppError>(__TAURI_INVOKE("library_proxy_relink", { sessionId })),
 	/**
+	 *  Đổi tên một Phiên đã lưu (story 3.1, spec Approach "đổi tên inline") — xem
+	 *  [`library::store::rename_session`] cho validate/ghi thật. `Ok(None)` khi
+	 *  Phiên không còn tồn tại (đã bị xoá đồng thời) — frontend coi như không có
+	 *  gì để cập nhật, không phải lỗi.
+	 */
+	librarySessionRename: (sessionId: string, title: string) => typedError<string | null, AppError>(__TAURI_INVOKE("library_session_rename", { sessionId, title })),
+	/**
+	 *  Xoá hẳn một Phiên đã lưu (story 3.1, spec Approach): chặn khi
+	 *  `JobRegistry.is_busy(session_id)` (outcome `Busy`, không xoá gì) — xem
+	 *  [`decide_session_delete`] cho thứ tự gate thật và
+	 *  [`library::store::delete_session`] cho logic xoá DB/media.
+	 */
+	librarySessionDelete: (sessionId: string) => typedError<SessionDeleteOutcome, AppError>(__TAURI_INVOKE("library_session_delete", { sessionId })),
+	/**
 	 *  Người dùng xác nhận đóng app khi registry đang bận (spec Design Notes:
 	 *  "đồng ý → huỷ sạch rồi thoát"): huỷ mọi Job hiện có, chờ tối đa ~4 s để
 	 *  mỗi Job dọn xong (huỷ có hiệu lực ≤ 2 s — spec Always), rồi thoát tiến
@@ -394,6 +408,12 @@ export type SegmentDetail = {
 	gapReason: string | null,
 	text: string,
 };
+
+/**
+ *  Kết quả `library_session_delete` (spec I/O Matrix "Xoá phiên rảnh", "Xoá
+ *  khi có Job").
+ */
+export type SessionDeleteOutcome = "deleted" | "busy";
 
 /**
  *  Chi tiết đầy đủ một Phiên cho `/session/:id` (story 2.7, Task:

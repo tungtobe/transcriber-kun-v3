@@ -91,6 +91,11 @@ pub(crate) mod fault {
         PublishRename,
         Commit,
         Discard,
+        /// Story 3.1: fail the `media/<sid>/` removal step of
+        /// [`super::delete_session`] after its DB transaction already
+        /// committed -- proves the DB row is gone and the caller still gets
+        /// back a `storage` error (spec I/O Matrix "Xoá lỗi FS").
+        DeleteMediaDir,
     }
 
     thread_local! {
@@ -737,6 +742,73 @@ pub fn replace_primary_transcript(
     })?;
 
     Ok(transcript_id)
+}
+
+/// Giới hạn tên Phiên đếm theo Unicode scalar (spec Boundaries Always: "> 200
+/// ký tự (đếm theo Unicode scalar) bị chặn ở cả UI (`maxlength`) lẫn Rust").
+const MAX_TITLE_SCALARS: usize = 200;
+
+/// Đổi tên một Phiên (story 3.1, spec Approach "đổi tên inline"): trim rồi từ
+/// chối rỗng/quá dài trước khi ghi (spec I/O Matrix "Tên rỗng/khoảng trắng",
+/// "Tên 201 ký tự": cả hai trả `Code::Request` khi Rust bị gọi trực tiếp,
+/// không phải UI đã chặn trước). Không đụng `source_name`/`source_hash` (spec
+/// Never). Trả `Ok(None)` khi Phiên không còn tồn tại (ví dụ vừa bị xoá) --
+/// không phải lỗi, giống quy ước `get`/`get_detail` ở trên.
+pub fn rename_session(
+    db: &Db,
+    session_id: SessionId,
+    title: &str,
+) -> Result<Option<String>, AppError> {
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::new(
+            Code::Request,
+            "Tên phiên không được để trống",
+        ));
+    }
+    if trimmed.chars().count() > MAX_TITLE_SCALARS {
+        return Err(AppError::new(
+            Code::Request,
+            format!("Tên phiên vượt quá {MAX_TITLE_SCALARS} ký tự"),
+        ));
+    }
+
+    let now = now_ms();
+    let affected =
+        db.with_connection(|conn| Ok(repo::sessions::set_title(conn, session_id, trimmed, now)?))?;
+    if affected == 0 {
+        return Ok(None);
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
+/// Xoá hẳn một Phiên (story 3.1, spec Approach): xoá dòng DB trong một
+/// transaction (FK `ON DELETE CASCADE` xoá luôn transcript/segment của nó)
+/// rồi xoá `media/<sid>/` -- đúng thứ tự DB trước, file sau (spec Design
+/// Notes: "DB trước, file sau: nếu crash giữa chừng, thư mục không còn dòng
+/// DB và `reconcile` ... sẽ xoá nó lúc boot"). Idempotent theo cả hai chiều:
+/// `id` không còn dòng DB xoá `0` dòng (không lỗi -- `repo::sessions::delete`)
+/// và `media/<sid>/` không còn tồn tại cũng không lỗi (`remove_path_if_exists`)
+/// -- gọi lại trên một Phiên đã xoá dở (DB mất, thư mục còn) vẫn dọn nốt thư
+/// mục (spec I/O Matrix "Xoá session không tồn tại", "Xoá lỗi FS": "Gọi lại /
+/// boot reconcile dọn tiếp"). Lỗi xoá `media/<sid>/` trả `storage` **sau khi**
+/// DB đã commit -- caller không bao giờ báo "Đã xoá" trong nhánh này (spec
+/// Always: "Xoá thư mục thất bại → lỗi category storage, không báo thành
+/// công").
+pub fn delete_session(db: &Db, root: &Path, session_id: SessionId) -> Result<(), AppError> {
+    db.with_connection(|conn| {
+        let tx = conn.transaction()?;
+        repo::sessions::delete(&tx, session_id)?;
+        tx.commit()?;
+        Ok(())
+    })?;
+
+    #[cfg(test)]
+    if fault::should_fail(fault::Point::DeleteMediaDir) {
+        return Err(storage_error("injected: delete media dir failure"));
+    }
+
+    remove_path_if_exists(&paths::media_dir(root, session_id))
 }
 
 /// Xoá hẳn thư mục staging của một job (huỷ trước commit, hoặc dọn dẹp sau
@@ -2276,5 +2348,200 @@ mod tests {
             Some("flac"),
             "reconcile phải tự sửa proxy_ext từ file thật trên đĩa"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Story 3.1: `rename_session` / `delete_session`.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn rename_session_trims_and_saves_the_new_title() {
+        let root = tempdir().unwrap();
+        let db = open_db(root.path());
+        let job_id = JobId::new();
+        let outcome = commit_file_session(
+            &db,
+            root.path(),
+            job_id,
+            SessionId::new(),
+            sample_draft(None),
+            Err(storage_error("no proxy")),
+        )
+        .unwrap();
+
+        let saved = rename_session(&db, outcome.session_id, "  Họp sprint 12  ").unwrap();
+        assert_eq!(saved.as_deref(), Some("Họp sprint 12"));
+
+        let session = db
+            .with_connection(|conn| Ok(repo::sessions::get(conn, outcome.session_id)?))
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.title, "Họp sprint 12");
+        assert_eq!(
+            session.source_hash, None,
+            "đổi tên không được đụng source_hash/source_name (spec Never)"
+        );
+    }
+
+    #[test]
+    fn rename_session_rejects_empty_or_whitespace_only_title() {
+        let root = tempdir().unwrap();
+        let db = open_db(root.path());
+        let outcome = commit_file_session(
+            &db,
+            root.path(),
+            JobId::new(),
+            SessionId::new(),
+            sample_draft(None),
+            Err(storage_error("no proxy")),
+        )
+        .unwrap();
+
+        let err = rename_session(&db, outcome.session_id, "   ").unwrap_err();
+        assert_eq!(err.code, Code::Request);
+
+        let session = db
+            .with_connection(|conn| Ok(repo::sessions::get(conn, outcome.session_id)?))
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.title, "cuộc họp", "tên cũ phải giữ nguyên");
+    }
+
+    #[test]
+    fn rename_session_rejects_a_title_over_200_unicode_scalars() {
+        let root = tempdir().unwrap();
+        let db = open_db(root.path());
+        let outcome = commit_file_session(
+            &db,
+            root.path(),
+            JobId::new(),
+            SessionId::new(),
+            sample_draft(None),
+            Err(storage_error("no proxy")),
+        )
+        .unwrap();
+
+        let too_long = "x".repeat(201);
+        let err = rename_session(&db, outcome.session_id, &too_long).unwrap_err();
+        assert_eq!(err.code, Code::Request);
+
+        // Exactly 200 is allowed.
+        let exactly_200 = "y".repeat(200);
+        let saved = rename_session(&db, outcome.session_id, &exactly_200).unwrap();
+        assert_eq!(saved, Some(exactly_200));
+    }
+
+    #[test]
+    fn rename_session_returns_none_when_the_session_no_longer_exists() {
+        let root = tempdir().unwrap();
+        let db = open_db(root.path());
+        assert_eq!(
+            rename_session(&db, SessionId::new(), "tên mới").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn delete_session_removes_db_row_transcript_segments_and_media_dir() {
+        let root = tempdir().unwrap();
+        let db = open_db(root.path());
+        let job_id = JobId::new();
+        let staged = stage_fake_proxy(root.path(), job_id);
+        let outcome = commit_file_session(
+            &db,
+            root.path(),
+            job_id,
+            SessionId::new(),
+            sample_draft(Some("delete-a")),
+            Ok(staged),
+        )
+        .unwrap();
+        assert!(paths::media_dir(root.path(), outcome.session_id).is_dir());
+
+        delete_session(&db, root.path(), outcome.session_id).unwrap();
+
+        db.with_connection(|conn| {
+            assert!(repo::sessions::get(conn, outcome.session_id)?.is_none());
+            let transcript_count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM transcripts WHERE session_id = ?1",
+                [outcome.session_id.to_string()],
+                |row| row.get(0),
+            )?;
+            assert_eq!(transcript_count, 0);
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            !paths::media_dir(root.path(), outcome.session_id).exists(),
+            "media/<sid>/ phải biến mất, không còn file mồ côi"
+        );
+    }
+
+    #[test]
+    fn delete_session_is_idempotent_for_an_already_missing_session() {
+        let root = tempdir().unwrap();
+        let db = open_db(root.path());
+        // Không dòng DB, không thư mục -- vẫn `Ok(())` (spec I/O Matrix "Xoá
+        // session không tồn tại").
+        delete_session(&db, root.path(), SessionId::new()).unwrap();
+    }
+
+    #[test]
+    fn delete_session_retried_after_the_db_row_is_already_gone_still_cleans_the_media_dir() {
+        let root = tempdir().unwrap();
+        let db = open_db(root.path());
+        let job_id = JobId::new();
+        let staged = stage_fake_proxy(root.path(), job_id);
+        let outcome = commit_file_session(
+            &db,
+            root.path(),
+            job_id,
+            SessionId::new(),
+            sample_draft(Some("delete-b")),
+            Ok(staged),
+        )
+        .unwrap();
+
+        // Simulate a crash between the DB delete and the media cleanup: drop
+        // the DB row directly, leaving the directory behind.
+        db.with_connection(|conn| Ok(repo::sessions::delete(conn, outcome.session_id)?))
+            .unwrap();
+        assert!(paths::media_dir(root.path(), outcome.session_id).is_dir());
+
+        // A retried delete on a session whose DB row is already gone must
+        // still clean up the orphaned directory (spec I/O Matrix "Xoá lỗi
+        // FS": "Gọi lại ... dọn thư mục mồ côi", idempotent).
+        delete_session(&db, root.path(), outcome.session_id).unwrap();
+        assert!(!paths::media_dir(root.path(), outcome.session_id).exists());
+    }
+
+    #[test]
+    fn delete_session_fs_failure_still_leaves_the_db_row_deleted_and_reports_storage() {
+        let root = tempdir().unwrap();
+        let db = open_db(root.path());
+        let job_id = JobId::new();
+        let staged = stage_fake_proxy(root.path(), job_id);
+        let outcome = commit_file_session(
+            &db,
+            root.path(),
+            job_id,
+            SessionId::new(),
+            sample_draft(Some("delete-c")),
+            Ok(staged),
+        )
+        .unwrap();
+
+        fault::set(Some(fault::Point::DeleteMediaDir));
+        let err = delete_session(&db, root.path(), outcome.session_id).unwrap_err();
+        fault::set(None);
+        assert_eq!(err.category, crate::core::error::Category::Storage);
+
+        // DB row must already be gone -- caller never reports "Đã xoá" in
+        // this branch, but a retry (or boot reconcile) does not resurrect it
+        // either (spec Always: "không báo thành công").
+        let session = db
+            .with_connection(|conn| Ok(repo::sessions::get(conn, outcome.session_id)?))
+            .unwrap();
+        assert!(session.is_none());
     }
 }
