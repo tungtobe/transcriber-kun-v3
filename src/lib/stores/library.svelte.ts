@@ -94,6 +94,13 @@ export function createLibraryStore() {
   let tags = $state<TagWithCount[]>([]);
   let tagFilter = $state<TagFilterState>({ ...EMPTY_TAG_FILTER });
 
+  // Story 3.3 (spec-3-3-tim-phien-theo-ten-ket-hop-loc-tag.md): chuỗi tìm
+  // theo tên, sống cạnh `tagFilter` -- không persist (spec Always: "Query
+  // sống trong `libraryStore` cạnh `tagFilter` (không persist)"). Chưa
+  // chuẩn hoá ở đây -- `filterSessions` tự chuẩn hoá qua `normalizeSearchText`
+  // khi so khớp, để `nameQuery` phản ánh đúng những gì người dùng đã gõ.
+  let nameQuery = $state('');
+
   let hasLoadedOnce = false;
   let activeLoad: Promise<void> | undefined;
 
@@ -342,6 +349,25 @@ export function createLibraryStore() {
     tagFilter = { tagIds: [], untagged: false };
   }
 
+  // Story 3.3: gõ vào ô tìm cập nhật ngay (không debounce -- spec Always:
+  // "Danh sách cập nhật khi gõ").
+  function setNameQuery(query: string): void {
+    nameQuery = query;
+  }
+
+  // Nút × / Esc trong ô tìm khi có query (spec Always: "giữ nguyên bộ lọc
+  // tag") -- chỉ xoá `nameQuery`, không đụng `tagFilter`.
+  function clearNameQuery(): void {
+    nameQuery = '';
+  }
+
+  // Nút "Xoá bộ lọc" ở footer và trạng thái rỗng (spec Always: "xoá cả query
+  // lẫn tag").
+  function clearAllFilters(): void {
+    nameQuery = '';
+    tagFilter = { tagIds: [], untagged: false };
+  }
+
   /** Test-only seam: resets every field without touching a live request. */
   function reset(): void {
     sessions = [];
@@ -354,6 +380,7 @@ export function createLibraryStore() {
     lastHandledResultSeq = jobsStore.resultSeq;
     tags = [];
     tagFilter = { tagIds: [], untagged: false };
+    nameQuery = '';
   }
 
   return {
@@ -361,7 +388,7 @@ export function createLibraryStore() {
       return sessions;
     },
     get filteredSessions() {
-      return filterSessions(sessions, tagFilter);
+      return filterSessions(sessions, { ...tagFilter, query: nameQuery });
     },
     get status() {
       return status;
@@ -378,6 +405,9 @@ export function createLibraryStore() {
     get tagFilter() {
       return tagFilter;
     },
+    get nameQuery() {
+      return nameQuery;
+    },
     load,
     rename,
     remove,
@@ -389,6 +419,9 @@ export function createLibraryStore() {
     toggleFilterTag,
     toggleUntaggedFilter,
     clearTagFilter,
+    setNameQuery,
+    clearNameQuery,
+    clearAllFilters,
     reset,
   };
 }

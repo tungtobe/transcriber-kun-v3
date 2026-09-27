@@ -440,4 +440,60 @@ describe('libraryStore', () => {
     store.clearTagFilter();
     expect(store.filteredSessions.map((s) => s.sessionId)).toEqual(['a', 'b', 'c']);
   });
+
+  // Story 3.3: nameQuery + tagFilter AND, clear riêng/clear tất cả.
+
+  it('setNameQuery() ANDs the name query with the current tag filter in filteredSessions', async () => {
+    mocks.librarySessionsList.mockResolvedValueOnce({
+      status: 'ok',
+      data: [
+        item('a', { title: 'họp sprint', tagIds: ['x'] }),
+        item('b', { title: 'review code', tagIds: ['x'] }),
+        item('c', { title: 'họp sprint khác', tagIds: [] }),
+      ],
+    });
+    const { libraryStore: store } = await import('./library.svelte');
+    await store.load();
+
+    store.toggleFilterTag('x');
+    store.setNameQuery('  HỌP ');
+    expect(store.nameQuery).toBe('  HỌP ');
+    expect(store.filteredSessions.map((s) => s.sessionId)).toEqual(['a']);
+  });
+
+  it('clearNameQuery() clears only the query, leaving the tag filter untouched', async () => {
+    mocks.librarySessionsList.mockResolvedValueOnce({
+      status: 'ok',
+      data: [item('a', { title: 'họp sprint', tagIds: ['x'] }), item('b', { title: 'review code', tagIds: ['x'] })],
+    });
+    const { libraryStore: store } = await import('./library.svelte');
+    await store.load();
+
+    store.toggleFilterTag('x');
+    store.setNameQuery('họp');
+    expect(store.filteredSessions.map((s) => s.sessionId)).toEqual(['a']);
+
+    store.clearNameQuery();
+    expect(store.nameQuery).toBe('');
+    expect(store.tagFilter).toEqual({ tagIds: ['x'], untagged: false });
+    expect(store.filteredSessions.map((s) => s.sessionId)).toEqual(['a', 'b']);
+  });
+
+  it('clearAllFilters() clears both the query and the tag filter', async () => {
+    mocks.librarySessionsList.mockResolvedValueOnce({
+      status: 'ok',
+      data: [item('a', { title: 'họp sprint', tagIds: ['x'] }), item('b', { title: 'review code', tagIds: [] })],
+    });
+    const { libraryStore: store } = await import('./library.svelte');
+    await store.load();
+
+    store.toggleFilterTag('x');
+    store.setNameQuery('họp');
+    expect(store.filteredSessions.map((s) => s.sessionId)).toEqual(['a']);
+
+    store.clearAllFilters();
+    expect(store.nameQuery).toBe('');
+    expect(store.tagFilter).toEqual({ tagIds: [], untagged: false });
+    expect(store.filteredSessions.map((s) => s.sessionId)).toEqual(['a', 'b']);
+  });
 });

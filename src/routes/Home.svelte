@@ -13,9 +13,12 @@
   import IntakeNotices from '../components/IntakeNotices.svelte';
   import JobCard from '../components/JobCard.svelte';
   import SessionList from './home/SessionList.svelte';
+  import SessionListFooter from './home/SessionListFooter.svelte';
   import SessionListSkeleton from './home/SessionListSkeleton.svelte';
+  import SessionSearch from './home/SessionSearch.svelte';
   import TagFilterBar from './home/TagFilterBar.svelte';
   import { i18n } from '../i18n/index.svelte';
+  import { registerKeymap } from '../lib/keymap';
   import { keysStore } from '../lib/stores/keys.svelte';
   import { intakeStore } from '../lib/stores/intake.svelte';
   import { jobsStore } from '../lib/stores/jobs.svelte';
@@ -31,6 +34,10 @@
 
   let subscribedJobs = false;
   let cancellingJobId = $state<string | null>(null);
+
+  // Story 3.3: ref tới `SessionSearch` để `⌘F`/`Ctrl+F` focus + chọn nội dung
+  // ô tìm (spec Always) -- `focusAndSelect` là hàm export của component đó.
+  let sessionSearchRef = $state<{ focusAndSelect: () => void } | null>(null);
 
   onMount(() => {
     void keysStore.load();
@@ -85,6 +92,27 @@
     libraryStore.status === 'ready' && libraryStore.sessions.length === 0 && jobsKnown && !activeJob,
   );
 
+  // Story 3.3, spec Always: "`⌘F` (Meta+F) và `Ctrl+F` focus ... ô tìm khi
+  // đang ở Home" -- đăng ký lúc mount, gỡ lúc destroy/khi Home rơi vào trạng
+  // thái trống thật sự (không có ô tìm để focus), theo đúng mẫu
+  // `Session.svelte` (đăng ký trong `$effect`, cleanup trả về từ đó). Vì mỗi
+  // route chỉ mount một component tại một thời điểm, `Session.svelte` gỡ
+  // entry của nó khi rời màn nên hai màn không giành phím của nhau (Acceptance:
+  // "đang ở route khác Home ... Home không chiếm phím").
+  function focusSessionSearch(): void {
+    sessionSearchRef?.focusAndSelect();
+  }
+
+  $effect(() => {
+    if (isEmpty) return;
+    const removeMetaFind = registerKeymap({ id: 'home-session-search-meta', combo: 'Meta+F', handler: focusSessionSearch });
+    const removeControlFind = registerKeymap({ id: 'home-session-search-control', combo: 'Control+F', handler: focusSessionSearch });
+    return () => {
+      removeMetaFind();
+      removeControlFind();
+    };
+  });
+
   // Loading is treated as "not yet confirmed missing" to avoid a flash of
   // the banner while `keysList` is still in flight; a load error is treated
   // conservatively as missing (spec I/O Matrix: no banner only once a usable
@@ -121,6 +149,9 @@
       <p class="route-kicker">{i18n.t('home.header.kicker')}</p>
       <h1 id="home-title">{i18n.t('home.header.title')}</h1>
     </div>
+    {#if !isEmpty}
+      <SessionSearch bind:this={sessionSearchRef} />
+    {/if}
     <div class="header-actions">
       {#if canChooseFile}
         <button type="button" class="button button-secondary" onclick={chooseFile}>
@@ -223,12 +254,18 @@
       {/if}
       <TagFilterBar />
       {#if libraryStore.sessions.length > 0 && libraryStore.filteredSessions.length === 0}
-        <p class="filter-empty" role="status">{i18n.t('home.list.filterEmpty')}</p>
+        <div class="filter-empty" role="status">
+          <p>{i18n.t('home.list.filterEmpty')}</p>
+          <button type="button" class="button button-secondary" onclick={() => libraryStore.clearAllFilters()}>
+            {i18n.t('home.footer.clearFilters')}
+          </button>
+        </div>
       {:else}
         <div class="session-list-wrap">
           <SessionList sessions={libraryStore.filteredSessions} viewportHeight={sessionListViewportHeight} />
         </div>
       {/if}
+      <SessionListFooter />
     {/if}
   {/if}
 </section>
@@ -242,6 +279,7 @@
 
   .screen-header {
     display: flex;
+    flex-wrap: wrap;
     align-items: flex-start;
     justify-content: space-between;
     gap: var(--space-4);
@@ -422,12 +460,19 @@
   }
 
   .filter-empty {
-    margin: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: var(--space-3);
     padding: var(--space-6);
     border: 1px solid var(--color-border);
     border-radius: var(--radius-xl);
     color: var(--color-text-secondary);
     text-align: center;
+  }
+
+  .filter-empty p {
+    margin: 0;
   }
 
   .session-list-wrap {
