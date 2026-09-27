@@ -17,12 +17,13 @@ use tauri_specta::{collect_commands, collect_events, Builder, Event};
 
 use crate::consent::{self, ConsentPolicy};
 use crate::core::error::{AppError, Code};
-use crate::core::id::{JobId, SessionId, TagId, TranscriptId};
+use crate::core::id::{JobId, MemoTemplateId, SessionId, TagId, TranscriptId};
 use crate::core::paths;
 use crate::db::{repo, Db};
 use crate::diagnostics::{self, DiagnosticsSummary};
 use crate::gemini::{CancellationToken, ConsentSnapshot, KeyTestResult, ModelInfo, ModelKind};
 use crate::library;
+use crate::memo;
 use crate::secrets::{KeyId, KeyMetadata};
 use crate::settings::{self, Settings, SettingsChanged};
 use crate::transcribe::job::{CancelOutcome, JobEvent};
@@ -1657,6 +1658,96 @@ async fn notes_save(
     track_ipc_error(&state.db, result).await
 }
 
+/// Danh sách Template memo của một locale (story 3.6): hai mẫu mặc định của
+/// `locale` (seed lười nếu chưa có) + mọi mẫu người dùng — xem
+/// [`memo::templates::list`] cho logic seed/đọc thật. `locale` khác
+/// `vi`/`en`/`ja` trả lỗi `Request`.
+#[tauri::command]
+#[specta::specta]
+async fn memo_templates_list(
+    state: tauri::State<'_, AppState>,
+    locale: String,
+) -> Result<Vec<memo::templates::MemoTemplate>, AppError> {
+    let db = state.db.clone();
+    let result = async {
+        let db = db?;
+        blocking(move || memo::templates::list(&db, &locale)).await
+    }
+    .await;
+    track_ipc_error(&state.db, result).await
+}
+
+/// Tạo một Template memo mới của người dùng (story 3.6) — xem
+/// [`memo::templates::create`] cho validate tên/prompt thật.
+#[tauri::command]
+#[specta::specta]
+async fn memo_template_create(
+    state: tauri::State<'_, AppState>,
+    name: String,
+    prompt: String,
+) -> Result<memo::templates::MemoTemplate, AppError> {
+    let db = state.db.clone();
+    let result = async {
+        let db = db?;
+        blocking(move || memo::templates::create(&db, name, prompt)).await
+    }
+    .await;
+    track_ipc_error(&state.db, result).await
+}
+
+/// Sửa tên/prompt của một Template memo, kể cả mẫu mặc định (story 3.6) —
+/// xem [`memo::templates::update`].
+#[tauri::command]
+#[specta::specta]
+async fn memo_template_update(
+    state: tauri::State<'_, AppState>,
+    id: MemoTemplateId,
+    name: String,
+    prompt: String,
+) -> Result<memo::templates::MemoTemplate, AppError> {
+    let db = state.db.clone();
+    let result = async {
+        let db = db?;
+        blocking(move || memo::templates::update(&db, id, name, prompt)).await
+    }
+    .await;
+    track_ipc_error(&state.db, result).await
+}
+
+/// Xoá một Template memo người dùng (story 3.6) — từ chối mẫu mặc định, xem
+/// [`memo::templates::delete`].
+#[tauri::command]
+#[specta::specta]
+async fn memo_template_delete(
+    state: tauri::State<'_, AppState>,
+    id: MemoTemplateId,
+) -> Result<(), AppError> {
+    let db = state.db.clone();
+    let result = async {
+        let db = db?;
+        blocking(move || memo::templates::delete(&db, id)).await
+    }
+    .await;
+    track_ipc_error(&state.db, result).await
+}
+
+/// Ghi lại tên/prompt gốc của hai mẫu mặc định của `locale` (story 3.6) —
+/// xem [`memo::templates::restore_defaults`].
+#[tauri::command]
+#[specta::specta]
+async fn memo_templates_restore_defaults(
+    state: tauri::State<'_, AppState>,
+    locale: String,
+) -> Result<Vec<memo::templates::MemoTemplate>, AppError> {
+    let db = state.db.clone();
+    let result = async {
+        let db = db?;
+        blocking(move || memo::templates::restore_defaults(&db, &locale)).await
+    }
+    .await;
+    track_ipc_error(&state.db, result).await
+}
+
 /// Số liệu Settings → Lưu trữ (story 3.4) — xem [`library::store::storage_stats`]
 /// cho logic đo thật (Media đệ quy dưới `media/`, DB = `app.db` +
 /// `-wal`/`-shm`, số Phiên = số dòng `sessions`).
@@ -1840,6 +1931,11 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             tags_delete,
             notes_get,
             notes_save,
+            memo_templates_list,
+            memo_template_create,
+            memo_template_update,
+            memo_template_delete,
+            memo_templates_restore_defaults,
             library_storage_stats,
             library_open_data_dir,
             library_wipe_all,

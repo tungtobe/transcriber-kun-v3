@@ -222,6 +222,33 @@ export const commands = {
 	 */
 	notesSave: (sessionId: string, body: string, revision: number) => typedError<NotesSaveOutcome, AppError>(__TAURI_INVOKE("notes_save", { sessionId, body, revision })),
 	/**
+	 *  Danh sách Template memo của một locale (story 3.6): hai mẫu mặc định của
+	 *  `locale` (seed lười nếu chưa có) + mọi mẫu người dùng — xem
+	 *  [`memo::templates::list`] cho logic seed/đọc thật. `locale` khác
+	 *  `vi`/`en`/`ja` trả lỗi `Request`.
+	 */
+	memoTemplatesList: (locale: string) => typedError<MemoTemplate[], AppError>(__TAURI_INVOKE("memo_templates_list", { locale })),
+	/**
+	 *  Tạo một Template memo mới của người dùng (story 3.6) — xem
+	 *  [`memo::templates::create`] cho validate tên/prompt thật.
+	 */
+	memoTemplateCreate: (name: string, prompt: string) => typedError<MemoTemplate, AppError>(__TAURI_INVOKE("memo_template_create", { name, prompt })),
+	/**
+	 *  Sửa tên/prompt của một Template memo, kể cả mẫu mặc định (story 3.6) —
+	 *  xem [`memo::templates::update`].
+	 */
+	memoTemplateUpdate: (id: string, name: string, prompt: string) => typedError<MemoTemplate, AppError>(__TAURI_INVOKE("memo_template_update", { id, name, prompt })),
+	/**
+	 *  Xoá một Template memo người dùng (story 3.6) — từ chối mẫu mặc định, xem
+	 *  [`memo::templates::delete`].
+	 */
+	memoTemplateDelete: (id: string) => typedError<null, AppError>(__TAURI_INVOKE("memo_template_delete", { id })),
+	/**
+	 *  Ghi lại tên/prompt gốc của hai mẫu mặc định của `locale` (story 3.6) —
+	 *  xem [`memo::templates::restore_defaults`].
+	 */
+	memoTemplatesRestoreDefaults: (locale: string) => typedError<MemoTemplate[], AppError>(__TAURI_INVOKE("memo_templates_restore_defaults", { locale })),
+	/**
 	 *  Số liệu Settings → Lưu trữ (story 3.4) — xem [`library::store::storage_stats`]
 	 *  cho logic đo thật (Media đệ quy dưới `media/`, DB = `app.db` +
 	 *  `-wal`/`-shm`, số Phiên = số dòng `sessions`).
@@ -436,6 +463,20 @@ export type KeyMetadata = {
 export type KeyTestResult = {
 	keyId: KeyId,
 	valid: boolean,
+};
+
+/**
+ *  Một Template memo qua IPC (spec Code Map: `MemoTemplate { id, name,
+ *  prompt, isDefault, locale, defaultKey }`). `locale`/`defaultKey` là `None`
+ *  cho mẫu người dùng.
+ */
+export type MemoTemplate = {
+	id: string,
+	name: string,
+	prompt: string,
+	isDefault: boolean,
+	locale: string | null,
+	defaultKey: string | null,
 };
 
 /**  Safe model metadata returned to the frontend and later feature modules. */

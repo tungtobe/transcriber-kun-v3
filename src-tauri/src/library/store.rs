@@ -909,8 +909,11 @@ pub fn storage_stats(db: &Db, root: &Path) -> Result<StorageStats, AppError> {
 /// Phiên/Transcript/segment/Proxy/Recording/Ghi chú/Memo/Tag (kể cả tag
 /// không còn Phiên) và thư mục `media/` (kể cả `.staging`) -- **giữ**
 /// `settings`/Consent (bảng `settings`, không đụng ở đây), API key
-/// (Keychain, ngoài phạm vi DB/FS này), Template memo (chưa tồn tại, Epic
-/// sau thêm bảng vào đây theo Design Notes).
+/// (Keychain, ngoài phạm vi DB/FS này), Template memo (bảng
+/// `memo_templates`, story 3.6 spec Never: "Xoá toàn bộ dữ liệu (3.4) giữ
+/// nguyên `memo_templates`" -- không có câu SQL nào trong hàm này tham chiếu
+/// bảng đó nên nó tự nhiên sống sót, kiểm chứng ở test
+/// `wipe_all_keeps_memo_templates`).
 ///
 /// Thứ tự (spec Always: "DB trong một transaction ... rồi mới xoá nội dung
 /// `media/`; sau đó `wal_checkpoint(TRUNCATE)`"): xoá `sessions` rồi `tags`
@@ -2801,6 +2804,30 @@ mod tests {
         let db = open_db(root.path());
         wipe_all(&db, root.path()).unwrap();
         wipe_all(&db, root.path()).unwrap();
+    }
+
+    /// Story 3.6 spec Never: "Xoá toàn bộ dữ liệu (3.4) giữ nguyên
+    /// `memo_templates`" -- seed hai mẫu mặc định + một mẫu người dùng, xoá
+    /// toàn bộ, rồi kiểm cả ba dòng còn nguyên.
+    #[test]
+    fn wipe_all_keeps_memo_templates() {
+        let root = tempdir().unwrap();
+        let db = open_db(root.path());
+        crate::memo::templates::list(&db, "vi").unwrap();
+        crate::memo::templates::create(&db, "Của tôi".to_string(), "{transcript}".to_string())
+            .unwrap();
+
+        wipe_all(&db, root.path()).unwrap();
+
+        let count: i64 = db
+            .with_connection(|conn| {
+                Ok(conn.query_row("SELECT COUNT(*) FROM memo_templates", [], |row| row.get(0))?)
+            })
+            .unwrap();
+        assert_eq!(
+            count, 3,
+            "memo_templates phải giữ nguyên sau khi xoá toàn bộ"
+        );
     }
 
     #[test]
