@@ -22,10 +22,14 @@ vi.mock('./stores/jobs.svelte', () => ({
 vi.mock('./stores/library.svelte', () => ({
   libraryStore: {
     sessions: [],
+    filteredSessions: [],
     status: 'ready',
     error: null,
     reloadError: false,
     load: vi.fn(() => Promise.resolve()),
+    tags: [],
+    tagFilter: { tagIds: [], untagged: false },
+    loadTags: vi.fn(() => Promise.resolve()),
   },
 }));
 

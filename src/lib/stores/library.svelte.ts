@@ -11,7 +11,15 @@
 // that failure surfaces through `reloadError` instead, which `Home.svelte`
 // renders as a transient notice next to the (still-visible) old list.
 import { jobsStore } from './jobs.svelte';
-import { commands, type AppError, type SessionDeleteOutcome, type SessionListItem } from '../bindings';
+import {
+  commands,
+  type AppError,
+  type SessionDeleteOutcome,
+  type SessionListItem,
+  type TagSummary,
+  type TagWithCount,
+} from '../bindings';
+import { EMPTY_TAG_FILTER, filterSessions, type TagFilterState } from '../session-filter';
 
 export type LibraryStatus = 'loading' | 'ready' | 'error';
 
@@ -33,6 +41,30 @@ const DELETE_UNAVAILABLE_ERROR: AppError = {
   detailRedacted: 'library session delete unavailable',
 };
 
+const CREATE_TAG_UNAVAILABLE_ERROR: AppError = {
+  category: 'network',
+  code: 'network',
+  detailRedacted: 'tag create unavailable',
+};
+
+const ATTACH_TAG_UNAVAILABLE_ERROR: AppError = {
+  category: 'network',
+  code: 'network',
+  detailRedacted: 'tag attach unavailable',
+};
+
+const DETACH_TAG_UNAVAILABLE_ERROR: AppError = {
+  category: 'network',
+  code: 'network',
+  detailRedacted: 'tag detach unavailable',
+};
+
+const DELETE_TAG_UNAVAILABLE_ERROR: AppError = {
+  category: 'network',
+  code: 'network',
+  detailRedacted: 'tag delete unavailable',
+};
+
 export type RenameResult =
   | { status: 'ok'; title: string | null }
   | { status: 'error'; error: AppError };
@@ -40,6 +72,12 @@ export type RenameResult =
 export type RemoveResult =
   | { status: 'ok'; outcome: SessionDeleteOutcome }
   | { status: 'error'; error: AppError };
+
+export type CreateTagResult =
+  | { status: 'ok'; tag: TagSummary }
+  | { status: 'error'; error: AppError };
+
+export type TagActionResult = { status: 'ok' } | { status: 'error'; error: AppError };
 
 export function createLibraryStore() {
   let sessions = $state<SessionListItem[]>([]);
@@ -49,6 +87,12 @@ export function createLibraryStore() {
   // the first load) fails — the old `sessions` list stays on screen (spec
   // I/O Matrix "Commit": "Tải lại lỗi → giữ danh sách cũ + thông báo").
   let reloadError = $state(false);
+
+  // Story 3.2: mọi tag kèm số Phiên (dùng bởi `TagPicker`/`TagFilterBar`/
+  // chip tag trong dòng) và bộ lọc tag hiện tại của Home (spec Boundaries
+  // Always: "Trạng thái lọc sống trong `libraryStore` (không persist)").
+  let tags = $state<TagWithCount[]>([]);
+  let tagFilter = $state<TagFilterState>({ ...EMPTY_TAG_FILTER });
 
   let hasLoadedOnce = false;
   let activeLoad: Promise<void> | undefined;
@@ -158,6 +202,146 @@ export function createLibraryStore() {
     }
   }
 
+  // Story 3.2: tải mọi tag kèm số Phiên (spec Code Map: "thêm `tags` (list +
+  // count)"). Lỗi tải chỉ giữ danh sách cũ -- không có banner riêng cho việc
+  // này, `TagPicker`/`TagFilterBar` vẫn dùng được với danh sách đã có (hoặc
+  // rỗng lúc đầu, hiển thị "Gõ để tạo tag đầu tiên").
+  async function loadTags(): Promise<void> {
+    try {
+      const result = await commands.tagsList();
+      if (result.status === 'ok') {
+        tags = result.data;
+      }
+    } catch {
+      // giữ nguyên `tags` hiện tại.
+    }
+  }
+
+  // Tạo tag mới hoặc lấy lại tag đã có cùng tên chuẩn hoá (spec I/O Matrix
+  // "Trùng hoa thường"/"Tạo đồng thời") -- thêm vào `tags` tại chỗ (count 0)
+  // nếu Rust trả một id chưa có trong danh sách hiện tại, tránh phải tải lại
+  // toàn bộ chỉ để hiện tag vừa tạo trong picker.
+  // Story 3.2, spec Design Notes: "NFC làm ở frontend vì không được thêm
+  // crate chuẩn hoá" -- Rust chuẩn hoá khoảng trắng + lowercase nhưng không
+  // NFC (Unicode) mọi tổ hợp ký tự tương đương thị giác nhưng khác chuỗi
+  // byte (ví dụ dấu kết hợp) thành cùng một `name_key`, nên bước NFC phải
+  // chạy trước khi gửi.
+  async function createTag(name: string): Promise<CreateTagResult> {
+    try {
+      const result = await commands.tagsCreate(name.normalize('NFC'));
+      if (result.status !== 'ok') {
+        return { status: 'error', error: result.error };
+      }
+      const tag = result.data;
+      if (!tags.some((existing) => existing.id === tag.id)) {
+        tags = [...tags, { id: tag.id, name: tag.name, sessionCount: 0 }];
+      }
+      return { status: 'ok', tag };
+    } catch {
+      return { status: 'error', error: CREATE_TAG_UNAVAILABLE_ERROR };
+    }
+  }
+
+  // Gắn tag cho một Phiên (spec Acceptance: "gắn tag cho Phiên khi Home đang
+  // lọc, khi gắn xong, bộ lọc Home không đổi" -- hàm này không chạm
+  // `tagFilter`). Cập nhật `sessions`/`tags` tại chỗ chỉ khi liên kết thật sự
+  // mới (Rust coi gắn lại một tag đã có là no-op -- không tăng đếm hai lần).
+  async function attachTag(sessionId: string, tagId: string): Promise<TagActionResult> {
+    try {
+      const result = await commands.sessionTagsAttach(sessionId, tagId);
+      if (result.status !== 'ok') {
+        return { status: 'error', error: result.error };
+      }
+      const alreadyAttached = sessions.some(
+        (session) => session.sessionId === sessionId && session.tagIds.includes(tagId),
+      );
+      if (!alreadyAttached) {
+        sessions = sessions.map((session) =>
+          session.sessionId === sessionId
+            ? { ...session, tagIds: [...session.tagIds, tagId] }
+            : session,
+        );
+        tags = tags.map((tag) =>
+          tag.id === tagId ? { ...tag, sessionCount: tag.sessionCount + 1 } : tag,
+        );
+      }
+      return { status: 'ok' };
+    } catch {
+      return { status: 'error', error: ATTACH_TAG_UNAVAILABLE_ERROR };
+    }
+  }
+
+  /** Gỡ một tag khỏi một Phiên -- cập nhật `sessions`/`tags` tại chỗ. */
+  async function detachTag(sessionId: string, tagId: string): Promise<TagActionResult> {
+    try {
+      const result = await commands.sessionTagsDetach(sessionId, tagId);
+      if (result.status !== 'ok') {
+        return { status: 'error', error: result.error };
+      }
+      const hadTag = sessions.some(
+        (session) => session.sessionId === sessionId && session.tagIds.includes(tagId),
+      );
+      if (hadTag) {
+        sessions = sessions.map((session) =>
+          session.sessionId === sessionId
+            ? { ...session, tagIds: session.tagIds.filter((id) => id !== tagId) }
+            : session,
+        );
+        tags = tags.map((tag) =>
+          tag.id === tagId ? { ...tag, sessionCount: Math.max(0, tag.sessionCount - 1) } : tag,
+        );
+      }
+      return { status: 'ok' };
+    } catch {
+      return { status: 'error', error: DETACH_TAG_UNAVAILABLE_ERROR };
+    }
+  }
+
+  // Xoá hẳn một tag toàn cục (spec I/O Matrix "Xoá tag toàn cục"): gỡ khỏi
+  // `tags`, khỏi `tagIds` của mọi Phiên trong `sessions`, và khỏi bộ lọc nếu
+  // đang lọc theo nó (spec Boundaries Always: "gỡ khỏi mọi Phiên trong một
+  // transaction" ở Rust; "gỡ khỏi bộ lọc" ở I/O Matrix).
+  async function deleteTagGlobally(tagId: string): Promise<TagActionResult> {
+    try {
+      const result = await commands.tagsDelete(tagId);
+      if (result.status !== 'ok') {
+        return { status: 'error', error: result.error };
+      }
+      tags = tags.filter((tag) => tag.id !== tagId);
+      sessions = sessions.map((session) =>
+        session.tagIds.includes(tagId)
+          ? { ...session, tagIds: session.tagIds.filter((id) => id !== tagId) }
+          : session,
+      );
+      if (tagFilter.tagIds.includes(tagId)) {
+        tagFilter = { ...tagFilter, tagIds: tagFilter.tagIds.filter((id) => id !== tagId) };
+      }
+      return { status: 'ok' };
+    } catch {
+      return { status: 'error', error: DELETE_TAG_UNAVAILABLE_ERROR };
+    }
+  }
+
+  // Bật/tắt lọc theo một tag cụ thể (spec I/O Matrix "Chưa gắn tag": "chọn A
+  // lại tắt Chưa gắn tag") -- chọn bất kỳ tag cụ thể nào luôn tắt `untagged`.
+  function toggleFilterTag(tagId: string): void {
+    const active = tagFilter.tagIds.includes(tagId);
+    tagFilter = {
+      tagIds: active ? tagFilter.tagIds.filter((id) => id !== tagId) : [...tagFilter.tagIds, tagId],
+      untagged: false,
+    };
+  }
+
+  // Bật/tắt "Chưa gắn tag" (spec I/O Matrix "Chưa gắn tag": "bật nó xoá tag
+  // lọc") -- bật luôn xoá mọi `tagIds` đang lọc.
+  function toggleUntaggedFilter(): void {
+    tagFilter = tagFilter.untagged ? { tagIds: [], untagged: false } : { tagIds: [], untagged: true };
+  }
+
+  function clearTagFilter(): void {
+    tagFilter = { tagIds: [], untagged: false };
+  }
+
   /** Test-only seam: resets every field without touching a live request. */
   function reset(): void {
     sessions = [];
@@ -168,11 +352,16 @@ export function createLibraryStore() {
     activeLoad = undefined;
     reloadQueued = undefined;
     lastHandledResultSeq = jobsStore.resultSeq;
+    tags = [];
+    tagFilter = { tagIds: [], untagged: false };
   }
 
   return {
     get sessions() {
       return sessions;
+    },
+    get filteredSessions() {
+      return filterSessions(sessions, tagFilter);
     },
     get status() {
       return status;
@@ -183,9 +372,23 @@ export function createLibraryStore() {
     get reloadError() {
       return reloadError;
     },
+    get tags() {
+      return tags;
+    },
+    get tagFilter() {
+      return tagFilter;
+    },
     load,
     rename,
     remove,
+    loadTags,
+    createTag,
+    attachTag,
+    detachTag,
+    deleteTagGlobally,
+    toggleFilterTag,
+    toggleUntaggedFilter,
+    clearTagFilter,
     reset,
   };
 }

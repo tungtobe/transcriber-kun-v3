@@ -7,6 +7,11 @@ const mocks = vi.hoisted(() => ({
   librarySessionRename: vi.fn(),
   librarySessionDelete: vi.fn(),
   jobsSubscribe: vi.fn(),
+  tagsList: vi.fn(),
+  tagsCreate: vi.fn(),
+  sessionTagsAttach: vi.fn(),
+  sessionTagsDetach: vi.fn(),
+  tagsDelete: vi.fn(),
 }));
 
 class FakeChannel<T> {
@@ -23,6 +28,11 @@ vi.mock('../bindings', () => ({
     librarySessionRename: (...args: unknown[]) => mocks.librarySessionRename(...args),
     librarySessionDelete: (...args: unknown[]) => mocks.librarySessionDelete(...args),
     jobsSubscribe: (...args: unknown[]) => mocks.jobsSubscribe(...args),
+    tagsList: (...args: unknown[]) => mocks.tagsList(...args),
+    tagsCreate: (...args: unknown[]) => mocks.tagsCreate(...args),
+    sessionTagsAttach: (...args: unknown[]) => mocks.sessionTagsAttach(...args),
+    sessionTagsDetach: (...args: unknown[]) => mocks.sessionTagsDetach(...args),
+    tagsDelete: (...args: unknown[]) => mocks.tagsDelete(...args),
   },
 }));
 
@@ -35,6 +45,7 @@ function item(sessionId: string, overrides: Partial<Record<string, unknown>> = {
     durationSec: 10,
     recovered: false,
     missingGapCount: 0,
+    tagIds: [],
     ...overrides,
   };
 }
@@ -48,6 +59,11 @@ describe('libraryStore', () => {
     mocks.librarySessionRename.mockReset();
     mocks.librarySessionDelete.mockReset();
     mocks.jobsSubscribe.mockReset();
+    mocks.tagsList.mockReset();
+    mocks.tagsCreate.mockReset();
+    mocks.sessionTagsAttach.mockReset();
+    mocks.sessionTagsDetach.mockReset();
+    mocks.tagsDelete.mockReset();
     capturedChannel = null;
     mocks.jobsSubscribe.mockImplementation((channel: FakeChannel<unknown>) => {
       capturedChannel = channel;
@@ -288,5 +304,140 @@ describe('libraryStore', () => {
       error: { category: 'storage', code: 'storage', detailRedacted: 'fs failed' },
     });
     expect(mocks.librarySessionsList).toHaveBeenCalledTimes(1);
+  });
+
+  // Story 3.2: tags + tagFilter + filteredSessions.
+
+  function tag(id: string, overrides: Partial<Record<string, unknown>> = {}) {
+    return { id, name: `tag-${id}`, sessionCount: 0, ...overrides };
+  }
+
+  it('loadTags() populates tags on success and keeps the old list on failure', async () => {
+    mocks.librarySessionsList.mockResolvedValueOnce({ status: 'ok', data: [] });
+    const { libraryStore: store } = await import('./library.svelte');
+    await store.load();
+
+    mocks.tagsList.mockResolvedValueOnce({ status: 'ok', data: [tag('a'), tag('b')] });
+    await store.loadTags();
+    expect(store.tags.map((t) => t.id)).toEqual(['a', 'b']);
+
+    mocks.tagsList.mockResolvedValueOnce({
+      status: 'error',
+      error: { category: 'storage', code: 'storage', detailRedacted: 'x' },
+    });
+    await store.loadTags();
+    expect(store.tags.map((t) => t.id)).toEqual(['a', 'b']);
+  });
+
+  it('createTag() adds a brand-new tag to the list but not a duplicate of an existing id', async () => {
+    const { libraryStore: store } = await import('./library.svelte');
+
+    mocks.tagsCreate.mockResolvedValueOnce({ status: 'ok', data: { id: 'a', name: 'A' } });
+    const result = await store.createTag('  A  ');
+    expect(result).toEqual({ status: 'ok', tag: { id: 'a', name: 'A' } });
+    expect(store.tags).toEqual([{ id: 'a', name: 'A', sessionCount: 0 }]);
+
+    // Trùng hoa thường -- Rust trả lại cùng id, không thêm dòng thứ hai.
+    mocks.tagsCreate.mockResolvedValueOnce({ status: 'ok', data: { id: 'a', name: 'A' } });
+    await store.createTag('a');
+    expect(store.tags).toHaveLength(1);
+  });
+
+  it('attachTag() adds the tag to the session and bumps its count, but is a no-op the second time', async () => {
+    mocks.librarySessionsList.mockResolvedValueOnce({ status: 'ok', data: [item('a')] });
+    const { libraryStore: store } = await import('./library.svelte');
+    await store.load();
+    mocks.tagsList.mockResolvedValueOnce({ status: 'ok', data: [tag('t1')] });
+    await store.loadTags();
+
+    mocks.sessionTagsAttach.mockResolvedValueOnce({ status: 'ok', data: null });
+    await store.attachTag('a', 't1');
+    expect(store.sessions.find((s) => s.sessionId === 'a')?.tagIds).toEqual(['t1']);
+    expect(store.tags.find((t) => t.id === 't1')?.sessionCount).toBe(1);
+
+    // Gắn lại (Rust coi là no-op) -- không tăng đếm lần hai.
+    mocks.sessionTagsAttach.mockResolvedValueOnce({ status: 'ok', data: null });
+    await store.attachTag('a', 't1');
+    expect(store.tags.find((t) => t.id === 't1')?.sessionCount).toBe(1);
+  });
+
+  it('attaching a tag while a filter is active never changes the filter (Acceptance Criteria)', async () => {
+    mocks.librarySessionsList.mockResolvedValueOnce({ status: 'ok', data: [item('a')] });
+    const { libraryStore: store } = await import('./library.svelte');
+    await store.load();
+    mocks.tagsList.mockResolvedValueOnce({ status: 'ok', data: [tag('t1')] });
+    await store.loadTags();
+    store.toggleFilterTag('t1');
+    expect(store.tagFilter).toEqual({ tagIds: ['t1'], untagged: false });
+
+    mocks.sessionTagsAttach.mockResolvedValueOnce({ status: 'ok', data: null });
+    await store.attachTag('a', 't1');
+
+    expect(store.tagFilter).toEqual({ tagIds: ['t1'], untagged: false });
+  });
+
+  it('detachTag() removes the tag from the session and decrements its count, floored at zero', async () => {
+    mocks.librarySessionsList.mockResolvedValueOnce({
+      status: 'ok',
+      data: [item('a', { tagIds: ['t1'] })],
+    });
+    const { libraryStore: store } = await import('./library.svelte');
+    await store.load();
+    mocks.tagsList.mockResolvedValueOnce({ status: 'ok', data: [tag('t1', { sessionCount: 1 })] });
+    await store.loadTags();
+
+    mocks.sessionTagsDetach.mockResolvedValueOnce({ status: 'ok', data: null });
+    await store.detachTag('a', 't1');
+
+    expect(store.sessions.find((s) => s.sessionId === 'a')?.tagIds).toEqual([]);
+    expect(store.tags.find((t) => t.id === 't1')?.sessionCount).toBe(0);
+  });
+
+  it('deleteTagGlobally() removes the tag everywhere: the list, every session, and the active filter', async () => {
+    mocks.librarySessionsList.mockResolvedValueOnce({
+      status: 'ok',
+      data: [item('a', { tagIds: ['t1'] }), item('b', { tagIds: ['t1'] })],
+    });
+    const { libraryStore: store } = await import('./library.svelte');
+    await store.load();
+    mocks.tagsList.mockResolvedValueOnce({ status: 'ok', data: [tag('t1', { sessionCount: 2 })] });
+    await store.loadTags();
+    store.toggleFilterTag('t1');
+
+    mocks.tagsDelete.mockResolvedValueOnce({ status: 'ok', data: null });
+    await store.deleteTagGlobally('t1');
+
+    expect(store.tags).toEqual([]);
+    expect(store.sessions.every((s) => s.tagIds.length === 0)).toBe(true);
+    expect(store.tagFilter).toEqual({ tagIds: [], untagged: false });
+  });
+
+  it('toggleFilterTag/toggleUntaggedFilter are mutually exclusive and drive filteredSessions (AND, untagged)', async () => {
+    mocks.librarySessionsList.mockResolvedValueOnce({
+      status: 'ok',
+      data: [
+        item('a', { tagIds: ['x', 'y'] }),
+        item('b', { tagIds: ['x'] }),
+        item('c', { tagIds: [] }),
+      ],
+    });
+    const { libraryStore: store } = await import('./library.svelte');
+    await store.load();
+
+    store.toggleFilterTag('x');
+    store.toggleFilterTag('y');
+    expect(store.filteredSessions.map((s) => s.sessionId)).toEqual(['a']);
+
+    // Bật "Chưa gắn tag" xoá tag đang lọc.
+    store.toggleUntaggedFilter();
+    expect(store.tagFilter).toEqual({ tagIds: [], untagged: true });
+    expect(store.filteredSessions.map((s) => s.sessionId)).toEqual(['c']);
+
+    // Chọn lại một tag cụ thể tắt "Chưa gắn tag".
+    store.toggleFilterTag('x');
+    expect(store.tagFilter).toEqual({ tagIds: ['x'], untagged: false });
+
+    store.clearTagFilter();
+    expect(store.filteredSessions.map((s) => s.sessionId)).toEqual(['a', 'b', 'c']);
   });
 });

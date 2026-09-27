@@ -4,3 +4,4 @@
 
 pub mod export;
 pub mod store;
+pub mod tags;

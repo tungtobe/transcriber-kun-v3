@@ -15,6 +15,7 @@ function sessions(count: number): SessionListItem[] {
     durationSec: 10,
     recovered: false,
     missingGapCount: 0,
+    tagIds: [],
   }));
 }
 

@@ -21,9 +21,23 @@
   import SessionMenu from '../../components/SessionMenu.svelte';
   import InlineRename from '../../components/InlineRename.svelte';
   import ConfirmDialog from '../../components/ConfirmDialog.svelte';
+  import TagPicker from '../../components/TagPicker.svelte';
   import type { SessionListItem } from '../../lib/bindings';
 
   let { session }: { session: SessionListItem } = $props();
+
+  // Story 3.2: tên của tag gắn trên dòng này -- tra qua `libraryStore.tags`
+  // (đã tải riêng), giữ tối đa 2 chip để không phá vỡ chiều cao 56 px cố định
+  // (spec Code Map: "hiển thị tối đa vài chip tag trong dòng mà vẫn giữ
+  // chiều cao 56 px").
+  const MAX_ROW_TAG_CHIPS = 2;
+  const rowTags = $derived(
+    session.tagIds
+      .map((tagId) => libraryStore.tags.find((tag) => tag.id === tagId))
+      .filter((tag): tag is NonNullable<typeof tag> => tag !== undefined),
+  );
+  const visibleRowTags = $derived(rowTags.slice(0, MAX_ROW_TAG_CHIPS));
+  const hiddenRowTagCount = $derived(rowTags.length - visibleRowTags.length);
 
   const LOCALE_TAG: Record<string, string> = { vi: 'vi-VN', en: 'en-US', ja: 'ja-JP' };
 
@@ -45,6 +59,43 @@
   let deleteConfirming = $state(false);
   let deleteSaving = $state(false);
   let deleteError = $state<string | null>(null);
+
+  let tagPickerOpen = $state(false);
+  let menuWrapEl = $state<HTMLDivElement | null>(null);
+
+  function openTagPicker(): void {
+    tagPickerOpen = true;
+  }
+
+  function closeTagPicker(): void {
+    tagPickerOpen = false;
+    menuRef?.focusTrigger();
+  }
+
+  async function toggleRowTag(tagId: string) {
+    const attached = session.tagIds.includes(tagId);
+    const result = attached
+      ? await libraryStore.detachTag(session.sessionId, tagId)
+      : await libraryStore.attachTag(session.sessionId, tagId);
+    if (result.status === 'ok') return { status: 'ok' as const };
+    const message =
+      result.error.code === 'request' ? i18n.t('tagPicker.error.limit') : i18n.t('tagPicker.error.failed');
+    return { status: 'error' as const, message };
+  }
+
+  async function createRowTag(name: string) {
+    const result = await libraryStore.createTag(name);
+    return result.status === 'ok'
+      ? { status: 'ok' as const, id: result.tag.id, name: result.tag.name }
+      : { status: 'error' as const, message: i18n.t('tagPicker.error.failed') };
+  }
+
+  async function deleteRowTag(tagId: string) {
+    const result = await libraryStore.deleteTagGlobally(tagId);
+    return result.status === 'ok'
+      ? { status: 'ok' as const }
+      : { status: 'error' as const, message: i18n.t('tagPicker.deleteDialog.error') };
+  }
 
   function startRename(): void {
     deleteError = null;
@@ -115,6 +166,16 @@
     <a class="session-row-link" href={`/session/${session.sessionId}`} use:link>
       <span class="session-row-name">
         <span class="session-row-title">{session.title}</span>
+        {#if visibleRowTags.length > 0}
+          <span class="session-row-tags">
+            {#each visibleRowTags as tag (tag.id)}
+              <span class="session-row-tag-chip">{tag.name}</span>
+            {/each}
+            {#if hiddenRowTagCount > 0}
+              <span class="session-row-tag-chip session-row-tag-more">+{hiddenRowTagCount}</span>
+            {/if}
+          </span>
+        {/if}
         {#if session.missingGapCount > 0}
           <Badge
             variant="partial"
@@ -137,7 +198,22 @@
       {/if}
     </a>
   {/if}
-  <SessionMenu bind:this={menuRef} onRename={startRename} onDelete={startDelete} />
+  <div class="session-row-menu-wrap" bind:this={menuWrapEl}>
+    <SessionMenu bind:this={menuRef} onRename={startRename} onDelete={startDelete} onTag={openTagPicker} />
+    {#if tagPickerOpen}
+      <TagPicker
+        mode="assign"
+        dialogLabel={i18n.t('tagPicker.dialog.assignLabel')}
+        tags={libraryStore.tags}
+        selectedIds={session.tagIds}
+        onToggle={toggleRowTag}
+        onCreate={createRowTag}
+        onDeleteTag={deleteRowTag}
+        onClose={closeTagPicker}
+        anchor={menuWrapEl}
+      />
+    {/if}
+  </div>
   {#if deleteError}
     <p class="session-row-inline-notice" role="alert">{deleteError}</p>
   {/if}
@@ -198,6 +274,36 @@
     font-weight: 500;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .session-row-tags {
+    display: inline-flex;
+    flex: 0 0 auto;
+    gap: 4px;
+  }
+
+  .session-row-tag-chip {
+    display: inline-flex;
+    height: 18px;
+    flex: 0 0 auto;
+    align-items: center;
+    padding: 0 6px;
+    border-radius: var(--radius-full);
+    background: var(--color-surface-sunken);
+    color: var(--color-text-secondary);
+    font-size: 11px;
+    font-weight: 500;
+    white-space: nowrap;
+  }
+
+  .session-row-tag-more {
+    color: var(--color-text-muted);
+  }
+
+  .session-row-menu-wrap {
+    position: relative;
+    display: inline-flex;
+    flex: 0 0 auto;
   }
 
   .session-row-date {

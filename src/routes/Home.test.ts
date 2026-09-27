@@ -32,6 +32,7 @@ function item(sessionId: string, overrides: Partial<Record<string, unknown>> = {
     durationSec: 65,
     recovered: false,
     missingGapCount: 0,
+    tagIds: [],
     ...overrides,
   };
 }
@@ -64,6 +65,21 @@ const mocks = vi.hoisted(() => ({
     load: vi.fn(() => Promise.resolve()),
     rename: vi.fn(() => Promise.resolve({ status: 'ok', title: 'renamed' })),
     remove: vi.fn(() => Promise.resolve({ status: 'ok', outcome: 'deleted' })),
+    // Story 3.2: đọc-only trong test này (không có test nào ở đây lọc theo
+    // tag) -- `filteredSessions` trả thẳng `sessions` hiện tại.
+    get filteredSessions() {
+      return this.sessions;
+    },
+    tags: [] as unknown[],
+    tagFilter: { tagIds: [] as string[], untagged: false },
+    loadTags: vi.fn(() => Promise.resolve()),
+    createTag: vi.fn(),
+    attachTag: vi.fn(),
+    detachTag: vi.fn(),
+    deleteTagGlobally: vi.fn(),
+    toggleFilterTag: vi.fn(),
+    toggleUntaggedFilter: vi.fn(),
+    clearTagFilter: vi.fn(),
   },
 }));
 
@@ -96,6 +112,16 @@ beforeEach(() => {
   mocks.libraryStore.load.mockReset().mockResolvedValue(undefined);
   mocks.libraryStore.rename.mockReset().mockResolvedValue({ status: 'ok', title: 'renamed' });
   mocks.libraryStore.remove.mockReset().mockResolvedValue({ status: 'ok', outcome: 'deleted' });
+  mocks.libraryStore.tags = [];
+  mocks.libraryStore.tagFilter = { tagIds: [], untagged: false };
+  mocks.libraryStore.loadTags.mockReset().mockResolvedValue(undefined);
+  mocks.libraryStore.createTag.mockReset();
+  mocks.libraryStore.attachTag.mockReset();
+  mocks.libraryStore.detachTag.mockReset();
+  mocks.libraryStore.deleteTagGlobally.mockReset();
+  mocks.libraryStore.toggleFilterTag.mockReset();
+  mocks.libraryStore.toggleUntaggedFilter.mockReset();
+  mocks.libraryStore.clearTagFilter.mockReset();
 });
 
 describe('Home locale rendering', () => {

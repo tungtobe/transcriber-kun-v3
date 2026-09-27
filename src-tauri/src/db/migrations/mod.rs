@@ -22,7 +22,17 @@ use rusqlite_migration::{Migrations, M};
 /// gộp cả đoạn text lẫn khoảng thiếu (gap) vào một bảng, phân biệt bằng
 /// `kind`; CHECK biconditional `(kind = 'gap') = (gap_reason IS NOT NULL)`
 /// đảm bảo `gap_reason` có mặt đúng lúc `kind = 'gap'`, không lúc nào khác.
-static MIGRATIONS: [M; 3] = [
+/// `tags`/`session_tags` (story 3.2, spec Boundaries Always): `name_key` là
+/// khoá chuẩn hoá UNIQUE (trim + gộp khoảng trắng rồi lowercase Unicode ở
+/// `library::tags::normalize_tag_name` — không dựa vào `COLLATE NOCASE`, chỉ
+/// ASCII-aware) dùng để tạo tag idempotent (`INSERT ... ON CONFLICT
+/// (name_key) DO NOTHING` rồi đọc lại). `session_tags` là bảng nối thuần với
+/// khoá chính ghép `(session_id, tag_id)` — không có cột riêng, không cần
+/// UNIQUE thêm vì khoá chính đã đúng vai trò đó. Cả hai FK đều `ON DELETE
+/// CASCADE`: xoá một Phiên gỡ mọi liên kết của nó (tag vẫn còn), xoá một tag
+/// gỡ liên kết của nó khỏi mọi Phiên (Phiên vẫn còn) — đúng hai chiều "Xoá
+/// Phiên"/"Xoá tag toàn cục" ở spec I/O Matrix.
+static MIGRATIONS: [M; 4] = [
     M::up(
         "CREATE TABLE settings (\n\
              key TEXT PRIMARY KEY,\n\
@@ -75,6 +85,19 @@ static MIGRATIONS: [M; 3] = [
              CHECK (end_sec >= start_sec)\n\
          );",
     ),
+    M::up(
+        "CREATE TABLE tags (\n\
+             id TEXT PRIMARY KEY,\n\
+             name TEXT NOT NULL,\n\
+             name_key TEXT NOT NULL UNIQUE,\n\
+             created_at INTEGER NOT NULL\n\
+         );\n\
+         CREATE TABLE session_tags (\n\
+             session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,\n\
+             tag_id TEXT NOT NULL REFERENCES tags(id) ON DELETE CASCADE,\n\
+             PRIMARY KEY (session_id, tag_id)\n\
+         );",
+    ),
 ];
 
 fn runner() -> Migrations<'static> {
@@ -108,8 +131,8 @@ mod tests {
         let version_after_second: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version_after_first, 3);
-        assert_eq!(version_after_second, 3);
+        assert_eq!(version_after_first, 4);
+        assert_eq!(version_after_second, 4);
     }
 
     #[test]
@@ -255,6 +278,140 @@ mod tests {
             [],
         )
         .unwrap();
+    }
+
+    /// Acceptance Criteria: "Given app khởi động trên DB cũ (3 migration),
+    /// when chạy migration, then có `tags`/`session_tags`, `user_version` =
+    /// 4, dữ liệu cũ giữ nguyên." Dựng một DB dừng lại đúng ở migration thứ 3
+    /// (chưa biết gì về `tags`), chèn một Phiên, rồi chạy `run` (mọi migration,
+    /// bao gồm thứ 4 mới) và kiểm dữ liệu cũ còn nguyên cạnh bảng mới.
+    #[test]
+    fn upgrading_from_three_migrations_adds_tags_tables_and_keeps_old_data() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        Migrations::from_slice(&MIGRATIONS[..3])
+            .to_latest(&mut conn)
+            .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id, kind, title, status, duration_sec, created_at, updated_at) \
+             VALUES ('s1', 'file', 'cuộc họp cũ', 'complete', 1.0, 0, 0)",
+            [],
+        )
+        .unwrap();
+        let version_before: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version_before, 3);
+
+        run(&mut conn).unwrap();
+
+        let version_after: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version_after, 4);
+        assert!(table_exists(&conn, "tags"));
+        assert!(table_exists(&conn, "session_tags"));
+        let title: String = conn
+            .query_row("SELECT title FROM sessions WHERE id = 's1'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(title, "cuộc họp cũ", "dữ liệu cũ phải giữ nguyên");
+    }
+
+    #[test]
+    fn creates_tags_and_session_tags_tables() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run(&mut conn).unwrap();
+        assert!(table_exists(&conn, "tags"));
+        assert!(table_exists(&conn, "session_tags"));
+    }
+
+    #[test]
+    fn tags_name_key_is_unique() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run(&mut conn).unwrap();
+        conn.execute(
+            "INSERT INTO tags (id, name, name_key, created_at) VALUES ('t1', 'DỰ ÁN', 'dự án', 0)",
+            [],
+        )
+        .unwrap();
+        let err = conn
+            .execute(
+                "INSERT INTO tags (id, name, name_key, created_at) VALUES ('t2', 'dự án', 'dự án', 0)",
+                [],
+            )
+            .unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("unique"));
+    }
+
+    #[test]
+    fn deleting_a_session_cascades_to_session_tags_but_keeps_the_tag() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        run(&mut conn).unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id, kind, title, status, duration_sec, created_at, updated_at) \
+             VALUES ('s1', 'file', 't', 'complete', 1.0, 0, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tags (id, name, name_key, created_at) VALUES ('t1', 'A', 'a', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_tags (session_id, tag_id) VALUES ('s1', 't1')",
+            [],
+        )
+        .unwrap();
+
+        conn.execute("DELETE FROM sessions WHERE id = 's1'", [])
+            .unwrap();
+
+        let link_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_tags", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(link_count, 0, "xoá Phiên phải gỡ liên kết session_tags");
+        let tag_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tags", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(tag_count, 1, "xoá Phiên không được đụng tới tag");
+    }
+
+    #[test]
+    fn deleting_a_tag_cascades_to_session_tags_but_keeps_the_session() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        run(&mut conn).unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id, kind, title, status, duration_sec, created_at, updated_at) \
+             VALUES ('s1', 'file', 't', 'complete', 1.0, 0, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tags (id, name, name_key, created_at) VALUES ('t1', 'A', 'a', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_tags (session_id, tag_id) VALUES ('s1', 't1')",
+            [],
+        )
+        .unwrap();
+
+        conn.execute("DELETE FROM tags WHERE id = 't1'", [])
+            .unwrap();
+
+        let link_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_tags", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(link_count, 0, "xoá tag phải gỡ liên kết session_tags");
+        let session_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(session_count, 1, "xoá tag không được đụng tới Phiên");
     }
 
     #[test]

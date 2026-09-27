@@ -440,6 +440,11 @@ pub struct SessionDetail {
     pub source_name: Option<String>,
     pub proxy_path: Option<String>,
     pub transcript: Option<TranscriptDetail>,
+    /// Tag đang gắn với Phiên này (story 3.2) — tên tăng dần
+    /// (`library::tags::list_for_session`). Không phụ thuộc
+    /// tên/transcript: đổi tên hay Chạy lại không đụng tới danh sách này
+    /// (spec Boundaries Always).
+    pub tags: Vec<crate::library::tags::TagSummary>,
 }
 
 fn segment_row_to_detail(row: repo::segments::SegmentRow) -> SegmentDetail {
@@ -503,6 +508,8 @@ pub fn get_detail(
         }))
     })?;
 
+    let tags = crate::library::tags::list_for_session(db, session_id)?;
+
     Ok(Some(SessionDetail {
         session_id: session.id,
         kind: session.kind,
@@ -513,6 +520,7 @@ pub fn get_detail(
         source_name: session.source_name,
         proxy_path,
         transcript,
+        tags,
     }))
 }
 
@@ -2084,6 +2092,43 @@ mod tests {
             transcript.segments[1].gap_reason.as_deref(),
             Some("chunk_failed")
         );
+    }
+
+    #[test]
+    fn get_detail_includes_the_sessions_tags_and_ignores_other_sessions_tags() {
+        let root = tempdir().unwrap();
+        let db = open_db(root.path());
+        let outcome = commit_file_session(
+            &db,
+            root.path(),
+            JobId::new(),
+            SessionId::new(),
+            sample_draft(None),
+            Err(storage_error("no proxy in tags test")),
+        )
+        .unwrap();
+        let other = commit_file_session(
+            &db,
+            root.path(),
+            JobId::new(),
+            SessionId::new(),
+            sample_draft(None),
+            Err(storage_error("no proxy in tags test")),
+        )
+        .unwrap();
+
+        let tag = crate::library::tags::create_or_get(&db, "khách A").unwrap();
+        crate::library::tags::attach_tag(&db, outcome.session_id, tag.id).unwrap();
+
+        let detail = get_detail(&db, root.path(), outcome.session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.tags, vec![tag]);
+
+        let other_detail = get_detail(&db, root.path(), other.session_id)
+            .unwrap()
+            .unwrap();
+        assert!(other_detail.tags.is_empty());
     }
 
     #[test]

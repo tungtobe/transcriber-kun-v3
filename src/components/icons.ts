@@ -25,3 +25,6 @@ export { default as RefreshCwIcon } from '@lucide/svelte/icons/refresh-cw';
 export { default as FolderOpenIcon } from '@lucide/svelte/icons/folder-open';
 export { default as XIcon } from '@lucide/svelte/icons/x';
 export { default as EllipsisVerticalIcon } from '@lucide/svelte/icons/ellipsis-vertical';
+export { default as SearchIcon } from '@lucide/svelte/icons/search';
+export { default as TagIcon } from '@lucide/svelte/icons/tag';
+export { default as Trash2Icon } from '@lucide/svelte/icons/trash-2';

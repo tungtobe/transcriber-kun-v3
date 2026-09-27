@@ -19,6 +19,7 @@ const mocks = vi.hoisted(() => {
     jobsUnsubscribe: vi.fn().mockResolvedValue({ status: 'ok', data: null }),
     jobsCancel: vi.fn(),
     transcribeRerun: vi.fn(),
+    tagsList: vi.fn(),
     clipboardWriteText: vi.fn(),
     settingsStore: { timestampOffsetSec: 0 },
     push: vi.fn(),
@@ -61,6 +62,7 @@ vi.mock('../lib/bindings', () => ({
     jobsUnsubscribe: (...args: unknown[]) => mocks.jobsUnsubscribe(...args),
     jobsCancel: (...args: unknown[]) => mocks.jobsCancel(...args),
     transcribeRerun: (...args: unknown[]) => mocks.transcribeRerun(...args),
+    tagsList: (...args: unknown[]) => mocks.tagsList(...args),
   },
 }));
 
@@ -96,6 +98,7 @@ beforeEach(async () => {
   mocks.librarySessionDelete.mockReset();
   mocks.libraryProxyRelink.mockReset();
   mocks.libraryTranscriptExport.mockReset();
+  mocks.tagsList.mockReset().mockResolvedValue({ status: 'ok', data: [] });
   mocks.clipboardWriteText.mockReset();
   mocks.settingsStore.timestampOffsetSec = 0;
   mocks.libraryTranscriptExport.mockResolvedValue({ status: 'ok', data: { saved: false, hasGaps: false } });
@@ -165,6 +168,7 @@ function detail(overrides: Record<string, unknown> = {}) {
       language: null,
       segments: [textSegment(0, 0, 10, 'xin chào'), textSegment(1, 10, 20, 'các bạn')],
     },
+    tags: [],
     ...overrides,
   };
 }

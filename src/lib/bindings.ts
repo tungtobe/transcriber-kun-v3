@@ -126,6 +126,13 @@ export const commands = {
 	sourceName: string | null,
 	proxyPath: string | null,
 	transcript: TranscriptDetail | null,
+	/**
+	 *  Tag đang gắn với Phiên này (story 3.2) — tên tăng dần
+	 *  (`library::tags::list_for_session`). Không phụ thuộc
+	 *  tên/transcript: đổi tên hay Chạy lại không đụng tới danh sách này
+	 *  (spec Boundaries Always).
+	 */
+	tags: TagSummary[],
 } | null, AppError>(__TAURI_INVOKE("library_session_detail", { sessionId })),
 	/**
 	 *  Export the transcript currently selected in Session detail. Rust reads the
@@ -160,6 +167,31 @@ export const commands = {
 	 *  [`library::store::delete_session`] cho logic xoá DB/media.
 	 */
 	librarySessionDelete: (sessionId: string) => typedError<SessionDeleteOutcome, AppError>(__TAURI_INVOKE("library_session_delete", { sessionId })),
+	/**
+	 *  Mọi tag kèm số Phiên đang gắn (story 3.2, spec Boundaries: "sắp số phiên
+	 *  giảm dần rồi tên") — xem [`library::tags::list_with_counts`] cho logic đọc
+	 *  thật.
+	 */
+	tagsList: () => typedError<TagWithCount[], AppError>(__TAURI_INVOKE("tags_list")),
+	/**
+	 *  Tạo tag mới hoặc trả về tag đã có cùng `name_key` (story 3.2) — xem
+	 *  [`library::tags::create_or_get`] cho chuẩn hoá/validate/idempotent thật.
+	 */
+	tagsCreate: (name: string) => typedError<TagSummary, AppError>(__TAURI_INVOKE("tags_create", { name })),
+	/**
+	 *  Gắn một tag cho một Phiên (story 3.2) — chặn khi `session_id` đang bị
+	 *  `library_session_delete` xoá (spec Code Map: "guard `is_session_deleting`
+	 *  cho attach"), cùng lý do các lệnh khác chạm một Phiên đang xoá dở. Xem
+	 *  [`library::tags::attach_tag`] cho validate giới hạn 20/no-op thật.
+	 */
+	sessionTagsAttach: (sessionId: string, tagId: string) => typedError<null, AppError>(__TAURI_INVOKE("session_tags_attach", { sessionId, tagId })),
+	/**  Gỡ một tag khỏi một Phiên (story 3.2) — xem [`library::tags::detach_tag`]. */
+	sessionTagsDetach: (sessionId: string, tagId: string) => typedError<null, AppError>(__TAURI_INVOKE("session_tags_detach", { sessionId, tagId })),
+	/**
+	 *  Xoá hẳn một tag toàn cục, gỡ khỏi mọi Phiên (story 3.2) — xem
+	 *  [`library::tags::delete_tag`].
+	 */
+	tagsDelete: (tagId: string) => typedError<null, AppError>(__TAURI_INVOKE("tags_delete", { tagId })),
 	/**
 	 *  Người dùng xác nhận đóng app khi registry đang bận (spec Design Notes:
 	 *  "đồng ý → huỷ sạch rồi thoát"): huỷ mọi Job hiện có, chờ tối đa ~4 s để
@@ -441,6 +473,13 @@ export type SessionDetail = {
 	sourceName: string | null,
 	proxyPath: string | null,
 	transcript: TranscriptDetail | null,
+	/**
+	 *  Tag đang gắn với Phiên này (story 3.2) — tên tăng dần
+	 *  (`library::tags::list_for_session`). Không phụ thuộc
+	 *  tên/transcript: đổi tên hay Chạy lại không đụng tới danh sách này
+	 *  (spec Boundaries Always).
+	 */
+	tags: TagSummary[],
 };
 
 /**
@@ -449,7 +488,9 @@ export type SessionDetail = {
  *  dạng `f64` (mili-giây epoch, UTC) chứ không phải `i64`, cùng lý do
  *  `SessionDetail::created_at`: specta-typescript cấm xuất kiểu BigInt.
  *  `missing_gap_count` là `i32` (không phải `i64`), cùng lý do
- *  `SegmentDetail::idx` — không Phiên nào tới gần `i32::MAX` gap.
+ *  `SegmentDetail::idx` — không Phiên nào tới gần `i32::MAX` gap. `tag_ids`
+ *  (story 3.2) là mọi tag đang gắn với Phiên — frontend tra tên qua
+ *  `tagsStore`/`tags_list` đã tải riêng, không kèm tên ở đây.
  */
 export type SessionListItem = {
 	sessionId: string,
@@ -459,6 +500,7 @@ export type SessionListItem = {
 	durationSec: number | null,
 	recovered: boolean,
 	missingGapCount: number,
+	tagIds: string[],
 };
 
 /**
@@ -524,6 +566,27 @@ export type Settings = {
  *  bộ (không phát khi ghi lỗi, spec I/O Matrix).
  */
 export type SettingsChanged = Settings;
+
+/**
+ *  Tag tối giản (id + tên) — dùng cho `tags_create` và `SessionDetail::tags`
+ *  (spec Code Map).
+ */
+export type TagSummary = {
+	id: string,
+	name: string,
+};
+
+/**
+ *  Tag kèm số Phiên đang gắn — dùng cho `tags_list` (spec Boundaries: "trả
+ *  tag kèm số phiên, sắp số phiên giảm dần rồi tên"). `session_count` là
+ *  `i32` (không phải `i64`), cùng quy ước với `SessionListItem::
+ *  missing_gap_count` — specta-typescript cấm xuất kiểu BigInt.
+ */
+export type TagWithCount = {
+	id: string,
+	name: string,
+	sessionCount: number,
+};
 
 /**  `theme: 'system' | 'light' | 'dark'`, mặc định `system` (spec Decisions). */
 export type Theme = "system" | "light" | "dark";

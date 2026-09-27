@@ -29,6 +29,7 @@ const mocks = vi.hoisted(() => {
     jobsUnsubscribe: vi.fn().mockResolvedValue({ status: 'ok', data: null }),
     jobsCancel: vi.fn(),
     keysList: vi.fn(),
+    tagsList: vi.fn(),
     FakeChannel,
   };
 });
@@ -46,6 +47,7 @@ vi.mock('../lib/bindings', () => ({
     jobsUnsubscribe: (...args: unknown[]) => mocks.jobsUnsubscribe(...args),
     jobsCancel: (...args: unknown[]) => mocks.jobsCancel(...args),
     keysList: (...args: unknown[]) => mocks.keysList(...args),
+    tagsList: (...args: unknown[]) => mocks.tagsList(...args),
   },
 }));
 
@@ -69,6 +71,7 @@ function item(sessionId: string, overrides: Partial<Record<string, unknown>> = {
     durationSec: 10,
     recovered: false,
     missingGapCount: 0,
+    tagIds: [],
     ...overrides,
   };
 }
@@ -101,6 +104,7 @@ beforeEach(async () => {
   mocks.jobsUnsubscribe.mockReset().mockResolvedValue({ status: 'ok', data: null });
   mocks.jobsCancel.mockReset();
   mocks.keysList.mockReset().mockResolvedValue({ status: 'ok', data: [] });
+  mocks.tagsList.mockReset().mockResolvedValue({ status: 'ok', data: [] });
   capturedChannel = null;
   mocks.jobsSubscribe.mockImplementation((channel: CapturedChannel) => {
     capturedChannel = channel;

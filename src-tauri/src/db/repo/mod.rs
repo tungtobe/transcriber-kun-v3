@@ -4,4 +4,5 @@ pub mod counters;
 pub mod segments;
 pub mod sessions;
 pub mod settings;
+pub mod tags;
 pub mod transcripts;

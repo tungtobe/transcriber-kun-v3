@@ -7,21 +7,30 @@
   // khác dù UX-DR29 liệt kê thêm cho các story sau.
   import { i18n } from '../i18n/index.svelte';
   import { EllipsisVerticalIcon } from './icons';
+  import { floating } from '../lib/floating';
 
   let {
     onRename,
     onDelete,
+    onTag,
   }: {
     onRename: () => void;
     onDelete: () => void;
+    /** Story 3.2: mục "Gắn tag" tuỳ chọn -- chỉ hiện khi caller truyền
+     * (spec Code Map: "thêm mục tuỳ chọn `onTag`"). */
+    onTag?: () => void;
   } = $props();
 
   let open = $state(false);
   let triggerEl = $state<HTMLButtonElement | null>(null);
+  // Danh sách được `floating` dời lên `document.body` nên không còn nằm
+  // trong `rootEl` -- click-outside phải kiểm cả hai.
+  let listEl = $state<HTMLDivElement | null>(null);
   let rootEl = $state<HTMLDivElement | null>(null);
   let itemEls: (HTMLButtonElement | null)[] = [];
 
   const items = $derived([
+    ...(onTag ? [{ label: i18n.t('sessionMenu.item.tag'), run: onTag }] : []),
     { label: i18n.t('sessionMenu.item.rename'), run: onRename },
     { label: i18n.t('sessionMenu.item.delete'), run: onDelete, danger: true },
   ]);
@@ -83,7 +92,9 @@
   function handleWindowPointerDown(event: PointerEvent): void {
     if (!open) return;
     const target = event.target as Node | null;
-    if (rootEl && target && !rootEl.contains(target)) close();
+    if (!target) return;
+    if (rootEl?.contains(target) || listEl?.contains(target)) return;
+    close();
   }
 </script>
 
@@ -103,7 +114,7 @@
     <EllipsisVerticalIcon size={18} strokeWidth={1.75} aria-hidden="true" />
   </button>
   {#if open}
-    <div class="session-menu-list" role="menu">
+    <div class="session-menu-list" role="menu" bind:this={listEl} use:floating={triggerEl}>
       {#each items as item, index (item.label)}
         <button
           type="button"

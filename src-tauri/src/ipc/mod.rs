@@ -17,7 +17,7 @@ use tauri_specta::{collect_commands, collect_events, Builder, Event};
 
 use crate::consent::{self, ConsentPolicy};
 use crate::core::error::{AppError, Code};
-use crate::core::id::{JobId, SessionId, TranscriptId};
+use crate::core::id::{JobId, SessionId, TagId, TranscriptId};
 use crate::core::paths;
 use crate::db::{repo, Db};
 use crate::diagnostics::{self, DiagnosticsSummary};
@@ -1199,7 +1199,9 @@ async fn library_transcript_export(
 /// dạng `f64` (mili-giây epoch, UTC) chứ không phải `i64`, cùng lý do
 /// `SessionDetail::created_at`: specta-typescript cấm xuất kiểu BigInt.
 /// `missing_gap_count` là `i32` (không phải `i64`), cùng lý do
-/// `SegmentDetail::idx` — không Phiên nào tới gần `i32::MAX` gap.
+/// `SegmentDetail::idx` — không Phiên nào tới gần `i32::MAX` gap. `tag_ids`
+/// (story 3.2) là mọi tag đang gắn với Phiên — frontend tra tên qua
+/// `tagsStore`/`tags_list` đã tải riêng, không kèm tên ở đây.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionListItem {
@@ -1210,6 +1212,7 @@ pub struct SessionListItem {
     pub duration_sec: f64,
     pub recovered: bool,
     pub missing_gap_count: i32,
+    pub tag_ids: Vec<TagId>,
 }
 
 fn session_list_row_to_item(row: repo::sessions::SessionListRow) -> SessionListItem {
@@ -1221,6 +1224,7 @@ fn session_list_row_to_item(row: repo::sessions::SessionListRow) -> SessionListI
         duration_sec: row.duration_sec,
         recovered: row.recovered,
         missing_gap_count: row.missing_gap_count as i32,
+        tag_ids: row.tag_ids,
     }
 }
 
@@ -1462,6 +1466,95 @@ async fn library_session_delete(
     track_ipc_error(&state.db, result).await
 }
 
+/// Mọi tag kèm số Phiên đang gắn (story 3.2, spec Boundaries: "sắp số phiên
+/// giảm dần rồi tên") — xem [`library::tags::list_with_counts`] cho logic đọc
+/// thật.
+#[tauri::command]
+#[specta::specta]
+async fn tags_list(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<library::tags::TagWithCount>, AppError> {
+    let db = state.db.clone();
+    let result = async {
+        let db = db?;
+        blocking(move || library::tags::list_with_counts(&db)).await
+    }
+    .await;
+    track_ipc_error(&state.db, result).await
+}
+
+/// Tạo tag mới hoặc trả về tag đã có cùng `name_key` (story 3.2) — xem
+/// [`library::tags::create_or_get`] cho chuẩn hoá/validate/idempotent thật.
+#[tauri::command]
+#[specta::specta]
+async fn tags_create(
+    state: tauri::State<'_, AppState>,
+    name: String,
+) -> Result<library::tags::TagSummary, AppError> {
+    let db = state.db.clone();
+    let result = async {
+        let db = db?;
+        blocking(move || library::tags::create_or_get(&db, &name)).await
+    }
+    .await;
+    track_ipc_error(&state.db, result).await
+}
+
+/// Gắn một tag cho một Phiên (story 3.2) — chặn khi `session_id` đang bị
+/// `library_session_delete` xoá (spec Code Map: "guard `is_session_deleting`
+/// cho attach"), cùng lý do các lệnh khác chạm một Phiên đang xoá dở. Xem
+/// [`library::tags::attach_tag`] cho validate giới hạn 20/no-op thật.
+#[tauri::command]
+#[specta::specta]
+async fn session_tags_attach(
+    state: tauri::State<'_, AppState>,
+    session_id: SessionId,
+    tag_id: TagId,
+) -> Result<(), AppError> {
+    if is_session_deleting(&state.deleting, session_id) {
+        let result = Err(session_deleting_error());
+        return track_ipc_error(&state.db, result).await;
+    }
+    let db = state.db.clone();
+    let result = async {
+        let db = db?;
+        blocking(move || library::tags::attach_tag(&db, session_id, tag_id)).await
+    }
+    .await;
+    track_ipc_error(&state.db, result).await
+}
+
+/// Gỡ một tag khỏi một Phiên (story 3.2) — xem [`library::tags::detach_tag`].
+#[tauri::command]
+#[specta::specta]
+async fn session_tags_detach(
+    state: tauri::State<'_, AppState>,
+    session_id: SessionId,
+    tag_id: TagId,
+) -> Result<(), AppError> {
+    let db = state.db.clone();
+    let result = async {
+        let db = db?;
+        blocking(move || library::tags::detach_tag(&db, session_id, tag_id)).await
+    }
+    .await;
+    track_ipc_error(&state.db, result).await
+}
+
+/// Xoá hẳn một tag toàn cục, gỡ khỏi mọi Phiên (story 3.2) — xem
+/// [`library::tags::delete_tag`].
+#[tauri::command]
+#[specta::specta]
+async fn tags_delete(state: tauri::State<'_, AppState>, tag_id: TagId) -> Result<(), AppError> {
+    let db = state.db.clone();
+    let result = async {
+        let db = db?;
+        blocking(move || library::tags::delete_tag(&db, tag_id)).await
+    }
+    .await;
+    track_ipc_error(&state.db, result).await
+}
+
 /// Người dùng xác nhận đóng app khi registry đang bận (spec Design Notes:
 /// "đồng ý → huỷ sạch rồi thoát"): huỷ mọi Job hiện có, chờ tối đa ~4 s để
 /// mỗi Job dọn xong (huỷ có hiệu lực ≤ 2 s — spec Always), rồi thoát tiến
@@ -1530,6 +1623,11 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             library_proxy_relink,
             library_session_rename,
             library_session_delete,
+            tags_list,
+            tags_create,
+            session_tags_attach,
+            session_tags_detach,
+            tags_delete,
             app_close_confirm
         ])
         .events(collect_events![SettingsChanged, CloseRequested])

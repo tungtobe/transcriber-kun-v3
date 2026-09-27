@@ -15,11 +15,13 @@
   import { i18n } from '../../i18n/index.svelte';
   import { formatTimestamp } from '../../lib/time';
   import { libraryStore } from '../../lib/stores/library.svelte';
-  import { ArrowLeftIcon } from '../../components/icons';
+  import { ArrowLeftIcon, XIcon } from '../../components/icons';
   import Badge from '../../components/Badge.svelte';
   import SessionMenu from '../../components/SessionMenu.svelte';
   import InlineRename from '../../components/InlineRename.svelte';
   import ConfirmDialog from '../../components/ConfirmDialog.svelte';
+  import TagPicker from '../../components/TagPicker.svelte';
+  import type { TagSummary } from '../../lib/bindings';
 
   let {
     sessionId,
@@ -30,8 +32,10 @@
     segmentTextCount,
     recovered,
     partial,
+    tags,
     onRenamed,
     onDeleted,
+    onTagsChanged,
   }: {
     sessionId: string;
     title: string;
@@ -44,10 +48,15 @@
     segmentTextCount: number;
     recovered: boolean;
     partial: boolean;
+    /** Tag đang gắn với Phiên (story 3.2, `SessionDetail::tags`). */
+    tags: TagSummary[];
     /** Gọi với tên mới đã lưu -- `Session.svelte` cập nhật `view.detail.title`. */
     onRenamed: (title: string) => void;
     /** Gọi khi outcome là `deleted` -- `Session.svelte` điều hướng về `/home`. */
     onDeleted: () => void;
+    /** Gọi với danh sách tag mới sau khi gắn/gỡ/xoá -- `Session.svelte` cập
+     * nhật `view.detail.tags`. */
+    onTagsChanged: (tags: TagSummary[]) => void;
   } = $props();
 
   const LOCALE_TAG: Record<string, string> = { vi: 'vi-VN', en: 'en-US', ja: 'ja-JP' };
@@ -73,6 +82,57 @@
   let deleteConfirming = $state(false);
   let deleteSaving = $state(false);
   let deleteError = $state<string | null>(null);
+
+  let tagPickerOpen = $state(false);
+  let addTagButtonRef = $state<HTMLButtonElement | null>(null);
+
+  function openTagPicker(): void {
+    tagPickerOpen = true;
+  }
+
+  function closeTagPicker(): void {
+    tagPickerOpen = false;
+    addTagButtonRef?.focus();
+  }
+
+  async function toggleHeaderTag(tagId: string) {
+    const attached = tags.some((tag) => tag.id === tagId);
+    if (attached) {
+      const result = await libraryStore.detachTag(sessionId, tagId);
+      if (result.status !== 'ok') {
+        return { status: 'error' as const, message: i18n.t('tagPicker.error.failed') };
+      }
+      onTagsChanged(tags.filter((tag) => tag.id !== tagId));
+      return { status: 'ok' as const };
+    }
+    const result = await libraryStore.attachTag(sessionId, tagId);
+    if (result.status !== 'ok') {
+      const message =
+        result.error.code === 'request' ? i18n.t('tagPicker.error.limit') : i18n.t('tagPicker.error.failed');
+      return { status: 'error' as const, message };
+    }
+    const meta = libraryStore.tags.find((tag) => tag.id === tagId);
+    onTagsChanged([...tags, { id: tagId, name: meta?.name ?? '' }]);
+    return { status: 'ok' as const };
+  }
+
+  async function createHeaderTag(name: string) {
+    const result = await libraryStore.createTag(name);
+    return result.status === 'ok'
+      ? { status: 'ok' as const, id: result.tag.id, name: result.tag.name }
+      : { status: 'error' as const, message: i18n.t('tagPicker.error.failed') };
+  }
+
+  async function deleteHeaderTag(tagId: string) {
+    const result = await libraryStore.deleteTagGlobally(tagId);
+    if (result.status !== 'ok') {
+      return { status: 'error' as const, message: i18n.t('tagPicker.deleteDialog.error') };
+    }
+    if (tags.some((tag) => tag.id === tagId)) {
+      onTagsChanged(tags.filter((tag) => tag.id !== tagId));
+    }
+    return { status: 'ok' as const };
+  }
 
   function openRename(opener: 'title' | 'menu'): void {
     renameOpener = opener;
@@ -179,6 +239,41 @@
       {/if}
       <span>{i18n.t('session.header.segmentCount', { count: segmentTextCount })}</span>
     </p>
+    <div class="session-header-tags">
+      {#each tags as tag (tag.id)}
+        <button
+          type="button"
+          class="session-header-tag-chip"
+          onclick={() => toggleHeaderTag(tag.id)}
+        >
+          <span>{tag.name}</span>
+          <XIcon size={12} strokeWidth={2} aria-hidden="true" />
+          <span class="sr-only">{i18n.t('session.tag.removeLabel', { name: tag.name })}</span>
+        </button>
+      {/each}
+      <div class="session-header-add-tag-wrap">
+        <button
+          type="button"
+          class="session-header-add-tag"
+          bind:this={addTagButtonRef}
+          onclick={openTagPicker}
+        >
+          {i18n.t('session.tag.addButton')}
+        </button>
+        {#if tagPickerOpen}
+          <TagPicker
+            mode="assign"
+            dialogLabel={i18n.t('tagPicker.dialog.assignLabel')}
+            tags={libraryStore.tags}
+            selectedIds={tags.map((tag) => tag.id)}
+            onToggle={toggleHeaderTag}
+            onCreate={createHeaderTag}
+            onDeleteTag={deleteHeaderTag}
+            onClose={closeTagPicker}
+          />
+        {/if}
+      </div>
+    </div>
     {#if deleteError}
       <p class="session-header-inline-notice" role="alert">{deleteError}</p>
     {/if}
@@ -282,5 +377,74 @@
     margin: var(--space-1) 0 0;
     color: var(--color-danger-strong);
     font-size: var(--text-help-size);
+  }
+
+  .session-header-tags {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-2);
+    margin-top: var(--space-2);
+  }
+
+  .session-header-tag-chip {
+    display: inline-flex;
+    height: 24px;
+    align-items: center;
+    gap: 6px;
+    padding: 0 10px;
+    border: 1px solid transparent;
+    border-radius: var(--radius-full);
+    background: var(--color-accent-soft);
+    color: var(--color-accent-hover);
+    font: inherit;
+    font-size: var(--text-help-size);
+    font-weight: 500;
+    cursor: pointer;
+  }
+
+  .session-header-tag-chip:hover {
+    border-color: var(--color-accent-border);
+  }
+
+  .session-header-add-tag-wrap {
+    position: relative;
+    display: inline-flex;
+  }
+
+  .session-header-add-tag {
+    display: inline-flex;
+    height: 24px;
+    align-items: center;
+    padding: 0 10px;
+    border: 1px dashed var(--color-border-strong);
+    border-radius: var(--radius-full);
+    background: transparent;
+    color: var(--color-text-secondary);
+    font: inherit;
+    font-size: var(--text-help-size);
+    font-weight: 500;
+    cursor: pointer;
+  }
+
+  .session-header-add-tag:hover {
+    background: var(--color-surface-sunken);
+  }
+
+  .session-header-tag-chip:focus-visible,
+  .session-header-add-tag:focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 2px;
+  }
+
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
   }
 </style>
