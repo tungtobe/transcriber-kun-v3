@@ -72,6 +72,7 @@ const mocks = vi.hoisted(() => ({
     },
     tags: [] as unknown[],
     tagFilter: { tagIds: [] as string[], untagged: false },
+    nameQuery: '',
     loadTags: vi.fn(() => Promise.resolve()),
     createTag: vi.fn(),
     attachTag: vi.fn(),
@@ -80,6 +81,9 @@ const mocks = vi.hoisted(() => ({
     toggleFilterTag: vi.fn(),
     toggleUntaggedFilter: vi.fn(),
     clearTagFilter: vi.fn(),
+    setNameQuery: vi.fn(),
+    clearNameQuery: vi.fn(),
+    clearAllFilters: vi.fn(),
   },
 }));
 
@@ -114,6 +118,7 @@ beforeEach(() => {
   mocks.libraryStore.remove.mockReset().mockResolvedValue({ status: 'ok', outcome: 'deleted' });
   mocks.libraryStore.tags = [];
   mocks.libraryStore.tagFilter = { tagIds: [], untagged: false };
+  mocks.libraryStore.nameQuery = '';
   mocks.libraryStore.loadTags.mockReset().mockResolvedValue(undefined);
   mocks.libraryStore.createTag.mockReset();
   mocks.libraryStore.attachTag.mockReset();
@@ -122,6 +127,9 @@ beforeEach(() => {
   mocks.libraryStore.toggleFilterTag.mockReset();
   mocks.libraryStore.toggleUntaggedFilter.mockReset();
   mocks.libraryStore.clearTagFilter.mockReset();
+  mocks.libraryStore.setNameQuery.mockReset();
+  mocks.libraryStore.clearNameQuery.mockReset();
+  mocks.libraryStore.clearAllFilters.mockReset();
 });
 
 describe('Home locale rendering', () => {
@@ -411,5 +419,104 @@ describe('Home job card (story 2.9)', () => {
     render(Home);
 
     expect(screen.queryByRole('heading', { name: 'Bắt đầu Live' })).toBeNull();
+  });
+});
+
+describe('Home name search + filter footer (story 3.3)', () => {
+  beforeEach(() => i18n.applyPreference('vi'));
+
+  it('renders the search box and forwards typed input to setNameQuery()', async () => {
+    mocks.libraryStore.sessions = [item('a')];
+    render(Home);
+
+    const input = screen.getByRole('textbox', { name: 'Tìm theo tên' });
+    await fireEvent.input(input, { target: { value: 'họp' } });
+    expect(mocks.libraryStore.setNameQuery).toHaveBeenCalledWith('họp');
+  });
+
+  it('shows the × clear button only when there is a query, and clicking it clears the query', async () => {
+    mocks.libraryStore.sessions = [item('a')];
+    render(Home);
+    expect(screen.queryByRole('button', { name: 'Xoá tìm kiếm' })).toBeNull();
+
+    cleanup();
+    mocks.libraryStore.nameQuery = 'họp';
+    render(Home);
+    await fireEvent.click(screen.getByRole('button', { name: 'Xoá tìm kiếm' }));
+    expect(mocks.libraryStore.clearNameQuery).toHaveBeenCalledTimes(1);
+  });
+
+  it('shows a plain count footer with no "Xoá bộ lọc" button when nothing is filtered', () => {
+    mocks.libraryStore.sessions = [item('a'), item('b')];
+    render(Home);
+
+    expect(screen.getByText('2 phiên')).toBeTruthy();
+    expect(screen.queryByText('Xoá bộ lọc')).toBeNull();
+  });
+
+  it('shows the filtered count + a tag-count note + "Xoá bộ lọc" when a tag filter is active', async () => {
+    mocks.libraryStore.sessions = [item('a'), item('b')];
+    mocks.libraryStore.tagFilter = { tagIds: ['t1'], untagged: false };
+    render(Home);
+
+    expect(screen.getByText(/2 \/ 2 phiên/)).toBeTruthy();
+    expect(screen.getByText(/1 tag/)).toBeTruthy();
+    await fireEvent.click(screen.getByRole('button', { name: 'Xoá bộ lọc' }));
+    expect(mocks.libraryStore.clearAllFilters).toHaveBeenCalledTimes(1);
+  });
+
+  it('shows the filtered count + query note when a name query is active', () => {
+    mocks.libraryStore.sessions = [item('a')];
+    mocks.libraryStore.nameQuery = 'họp';
+    render(Home);
+
+    expect(screen.getByText(/họp/)).toBeTruthy();
+  });
+
+  it('shows the empty-filter state with a "Xoá bộ lọc" button that clears everything', async () => {
+    mocks.libraryStore.sessions = [item('a')];
+    mocks.libraryStore.nameQuery = 'zzz';
+    const original = Object.getOwnPropertyDescriptor(mocks.libraryStore, 'filteredSessions')!;
+    Object.defineProperty(mocks.libraryStore, 'filteredSessions', { configurable: true, get: () => [] });
+    try {
+      render(Home);
+
+      expect(screen.getByText('Không có phiên nào khớp bộ lọc.')).toBeTruthy();
+      const clearButtons = screen.getAllByRole('button', { name: 'Xoá bộ lọc' });
+      expect(clearButtons.length).toBeGreaterThan(0);
+      await fireEvent.click(clearButtons[0]);
+      expect(mocks.libraryStore.clearAllFilters).toHaveBeenCalled();
+    } finally {
+      Object.defineProperty(mocks.libraryStore, 'filteredSessions', original);
+    }
+  });
+
+  it('focuses and selects the search box on Meta+F / Control+F while on Home', async () => {
+    mocks.libraryStore.sessions = [item('a')];
+    render(Home);
+
+    const input = screen.getByRole('textbox', { name: 'Tìm theo tên' }) as HTMLInputElement;
+    const { installKeymap } = await import('../lib/keymap');
+    const removeKeymap = installKeymap(document);
+    input.blur();
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'f', metaKey: true, bubbles: true }));
+    expect(document.activeElement).toBe(input);
+    input.blur();
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'f', ctrlKey: true, bubbles: true }));
+    expect(document.activeElement).toBe(input);
+    removeKeymap();
+  });
+
+  it('does not register the shortcut (or render a search box) in the true empty state', async () => {
+    render(Home);
+    expect(screen.queryByRole('textbox', { name: 'Tìm theo tên' })).toBeNull();
+
+    const { installKeymap } = await import('../lib/keymap');
+    const removeKeymap = installKeymap(document);
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'f', metaKey: true, bubbles: true }));
+    // No search box exists to receive focus; nothing should throw and no
+    // unrelated element should have been focused as a side effect.
+    expect(document.activeElement === document.body || document.activeElement === null).toBe(true);
+    removeKeymap();
   });
 });
