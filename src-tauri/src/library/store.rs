@@ -96,6 +96,11 @@ pub(crate) mod fault {
         /// committed -- proves the DB row is gone and the caller still gets
         /// back a `storage` error (spec I/O Matrix "Xoá lỗi FS").
         DeleteMediaDir,
+        /// Story 3.4: fail the `media/` removal step of [`super::wipe_all`]
+        /// after its DB transaction already committed -- proves `sessions`/
+        /// `tags` are gone and a retry can still finish the FS cleanup (spec
+        /// I/O Matrix "Lỗi FS giữa chừng").
+        WipeMediaDir,
     }
 
     thread_local! {
@@ -817,6 +822,122 @@ pub fn delete_session(db: &Db, root: &Path, session_id: SessionId) -> Result<(),
     }
 
     remove_path_if_exists(&paths::media_dir(root, session_id))
+}
+
+/// Số liệu Settings → Lưu trữ (story 3.4, spec Always): `media_bytes` là
+/// tổng byte đệ quy dưới `<root>/media/`, `db_bytes` là tổng `app.db` +
+/// `app.db-wal` + `app.db-shm` (file thiếu tính `0`), `session_count` là số
+/// dòng `sessions`. `media_bytes`/`db_bytes` giữ dạng `f64` chứ không phải
+/// `i64` -- cùng lý do `SessionListItem::created_at`: specta-typescript cấm
+/// xuất kiểu BigInt, và `f64` biểu diễn chính xác mọi số nguyên byte tới
+/// 2^53 (~8 PB), thừa cho một thư mục dữ liệu người dùng cục bộ.
+/// `session_count` là `i32` (không phải `i64`), cùng quy ước
+/// `SessionListItem::missing_gap_count`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageStats {
+    pub media_bytes: f64,
+    pub db_bytes: f64,
+    pub session_count: i32,
+}
+
+/// Tổng byte đệ quy dưới `path`, bỏ qua chính `path` nếu chưa tồn tại (trả
+/// `0` -- kho rỗng lúc chưa từng transcribe file nào, spec I/O Matrix "Kho
+/// rỗng"). Duyệt bằng một stack tường minh (không đệ quy hàm) để không giới
+/// hạn độ sâu; không có crate `walkdir` trong dependency (Code Map: tránh
+/// thêm crate không cần thiết cho một phép duyệt thư mục đơn giản).
+fn dir_size(path: &Path) -> Result<u64, AppError> {
+    let mut total = 0u64;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(storage_error(&err.to_string())),
+        };
+        for entry in entries {
+            let entry = entry.map_err(|err| storage_error(&err.to_string()))?;
+            let metadata = entry
+                .metadata()
+                .map_err(|err| storage_error(&err.to_string()))?;
+            if metadata.is_dir() {
+                stack.push(entry.path());
+            } else {
+                total += metadata.len();
+            }
+        }
+    }
+    Ok(total)
+}
+
+/// Kích thước một file, `0` nếu không tồn tại (spec Always: "file thiếu =
+/// 0") -- dùng cho `app.db-wal`/`app.db-shm`, vốn chỉ xuất hiện sau lần ghi
+/// đầu tiên ở chế độ WAL.
+fn file_len_or_zero(path: &Path) -> Result<u64, AppError> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.len()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(err) => Err(storage_error(&err.to_string())),
+    }
+}
+
+/// Tổng byte của `app.db` + `app.db-wal` + `app.db-shm` dưới `root` (spec
+/// Always: "DB = tổng `app.db` + `app.db-wal` + `app.db-shm`").
+fn db_file_bytes(root: &Path) -> Result<u64, AppError> {
+    let base = root.join(crate::db::DB_FILE_NAME);
+    let wal = root.join(format!("{}-wal", crate::db::DB_FILE_NAME));
+    let shm = root.join(format!("{}-shm", crate::db::DB_FILE_NAME));
+    Ok(file_len_or_zero(&base)? + file_len_or_zero(&wal)? + file_len_or_zero(&shm)?)
+}
+
+/// Đo số liệu Settings → Lưu trữ hiện tại (story 3.4) -- xem [`StorageStats`]
+/// cho ý nghĩa từng trường. Lỗi đọc thư mục/file quy về category `storage`
+/// (spec I/O Matrix "Xem số liệu": "Lỗi đo → thông báo lỗi `storage`
+/// inline").
+pub fn storage_stats(db: &Db, root: &Path) -> Result<StorageStats, AppError> {
+    let media_bytes = dir_size(&paths::media_root(root))?;
+    let db_bytes = db_file_bytes(root)?;
+    let session_count = db.with_connection(|conn| Ok(repo::sessions::count(conn)?))?;
+    Ok(StorageStats {
+        media_bytes: media_bytes as f64,
+        db_bytes: db_bytes as f64,
+        session_count: session_count as i32,
+    })
+}
+
+/// Xoá toàn bộ dữ liệu họp (story 3.4, spec Boundaries Decision OQ9): mọi
+/// Phiên/Transcript/segment/Proxy/Recording/Ghi chú/Memo/Tag (kể cả tag
+/// không còn Phiên) và thư mục `media/` (kể cả `.staging`) -- **giữ**
+/// `settings`/Consent (bảng `settings`, không đụng ở đây), API key
+/// (Keychain, ngoài phạm vi DB/FS này), Template memo (chưa tồn tại, Epic
+/// sau thêm bảng vào đây theo Design Notes).
+///
+/// Thứ tự (spec Always: "DB trong một transaction ... rồi mới xoá nội dung
+/// `media/`; sau đó `wal_checkpoint(TRUNCATE)`"): xoá `sessions` rồi `tags`
+/// trong một transaction (FK `ON DELETE CASCADE` xoá theo
+/// transcripts/segments/session_tags), sau đó xoá hẳn `media/`, cuối cùng
+/// checkpoint WAL để lần đo `storage_stats` kế tiếp thấy DB nhỏ lại thật sự
+/// thay vì vẫn to từ trước khi xoá. Idempotent theo cả hai chiều, cùng quy
+/// ước [`delete_session`]: DB rỗng xoá `0` dòng, `media/` không còn tồn tại
+/// không lỗi -- gọi lại sau một lần xoá dở (media lỗi FS) dọn tiếp được (spec
+/// I/O Matrix "Lỗi FS giữa chừng": "gọi lại xoá tiếp được").
+pub fn wipe_all(db: &Db, root: &Path) -> Result<(), AppError> {
+    db.with_connection(|conn| {
+        let tx = conn.transaction()?;
+        repo::sessions::delete_all(&tx)?;
+        repo::tags::delete_all(&tx)?;
+        tx.commit()?;
+        Ok(())
+    })?;
+
+    #[cfg(test)]
+    if fault::should_fail(fault::Point::WipeMediaDir) {
+        return Err(storage_error("injected: wipe media dir failure"));
+    }
+
+    remove_path_if_exists(&paths::media_root(root))?;
+
+    db.checkpoint_truncate()
 }
 
 /// Xoá hẳn thư mục staging của một job (huỷ trước commit, hoặc dọn dẹp sau
@@ -2588,5 +2709,134 @@ mod tests {
             .with_connection(|conn| Ok(repo::sessions::get(conn, outcome.session_id)?))
             .unwrap();
         assert!(session.is_none());
+    }
+
+    #[test]
+    fn storage_stats_on_a_fresh_root_is_all_zero() {
+        let root = tempdir().unwrap();
+        let db = open_db(root.path());
+        // `Db::open` đã ghi migration -- `app.db`/`app.db-wal`/`app.db-shm`
+        // đã tồn tại nhưng nhỏ; chỉ khẳng định không lỗi và `session_count`
+        // đúng 0, không khẳng định `db_bytes == 0` (spec I/O Matrix "Kho
+        // rỗng" nói về xoá, không nói DB luôn rỗng byte).
+        let stats = storage_stats(&db, root.path()).unwrap();
+        assert_eq!(stats.media_bytes, 0.0);
+        assert_eq!(stats.session_count, 0);
+        assert!(stats.db_bytes >= 0.0);
+    }
+
+    #[test]
+    fn storage_stats_counts_media_bytes_and_sessions() {
+        let root = tempdir().unwrap();
+        let db = open_db(root.path());
+        let job_id = JobId::new();
+        let staged = stage_fake_proxy(root.path(), job_id);
+        let proxy_len = fs::metadata(&staged).unwrap().len();
+        commit_file_session(
+            &db,
+            root.path(),
+            job_id,
+            SessionId::new(),
+            sample_draft(Some("stats-a")),
+            Ok(staged),
+        )
+        .unwrap();
+
+        let stats = storage_stats(&db, root.path()).unwrap();
+        assert_eq!(stats.media_bytes, proxy_len as f64);
+        assert_eq!(stats.session_count, 1);
+    }
+
+    #[test]
+    fn wipe_all_removes_sessions_tags_and_media_but_keeps_settings() {
+        let root = tempdir().unwrap();
+        let db = open_db(root.path());
+        let job_id = JobId::new();
+        let staged = stage_fake_proxy(root.path(), job_id);
+        let outcome = commit_file_session(
+            &db,
+            root.path(),
+            job_id,
+            SessionId::new(),
+            sample_draft(Some("wipe-a")),
+            Ok(staged),
+        )
+        .unwrap();
+        let tag = crate::library::tags::create_or_get(&db, "a").unwrap();
+        crate::library::tags::attach_tag(&db, outcome.session_id, tag.id).unwrap();
+
+        let settings = crate::settings::Settings {
+            onboarding_completed: true,
+            consent_accepted_version: 7,
+            ..crate::settings::Settings::default()
+        };
+        crate::settings::save(&db, &settings).unwrap();
+
+        wipe_all(&db, root.path()).unwrap();
+
+        db.with_connection(|conn| {
+            let sessions: i64 = conn
+                .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+                .unwrap();
+            let tags: i64 = conn
+                .query_row("SELECT COUNT(*) FROM tags", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(sessions, 0);
+            assert_eq!(tags, 0);
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            !paths::media_root(root.path()).exists(),
+            "media/ phải biến mất hoàn toàn, kể cả .staging"
+        );
+
+        let reloaded = crate::settings::load(&db);
+        assert_eq!(reloaded, settings, "settings phải giữ nguyên sau khi xoá");
+    }
+
+    #[test]
+    fn wipe_all_on_an_empty_store_is_idempotent() {
+        let root = tempdir().unwrap();
+        let db = open_db(root.path());
+        wipe_all(&db, root.path()).unwrap();
+        wipe_all(&db, root.path()).unwrap();
+    }
+
+    #[test]
+    fn wipe_all_fs_failure_still_leaves_db_rows_deleted_and_a_retry_finishes_the_cleanup() {
+        let root = tempdir().unwrap();
+        let db = open_db(root.path());
+        let job_id = JobId::new();
+        let staged = stage_fake_proxy(root.path(), job_id);
+        commit_file_session(
+            &db,
+            root.path(),
+            job_id,
+            SessionId::new(),
+            sample_draft(Some("wipe-b")),
+            Ok(staged),
+        )
+        .unwrap();
+
+        fault::set(Some(fault::Point::WipeMediaDir));
+        let err = wipe_all(&db, root.path()).unwrap_err();
+        fault::set(None);
+        assert_eq!(err.category, crate::core::error::Category::Storage);
+
+        db.with_connection(|conn| {
+            let sessions: i64 = conn
+                .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(sessions, 0, "DB đã commit dù bước xoá media lỗi sau đó");
+            Ok(())
+        })
+        .unwrap();
+        assert!(paths::media_root(root.path()).exists());
+
+        // Gọi lại dọn nốt phần còn lại (spec I/O Matrix "Lỗi FS giữa
+        // chừng": "gọi lại xoá tiếp được").
+        wipe_all(&db, root.path()).unwrap();
+        assert!(!paths::media_root(root.path()).exists());
     }
 }

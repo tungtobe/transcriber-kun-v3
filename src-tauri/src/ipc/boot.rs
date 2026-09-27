@@ -3,6 +3,7 @@
 //! gọi `Db::open`/`core::log::init_file_logging` trực tiếp trong production.
 
 use std::collections::HashSet;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use tauri::Manager;
@@ -43,6 +44,12 @@ pub struct AppState {
     /// cho cùng session trong lúc này bị từ chối bằng `Code::Request` (spec
     /// I/O Matrix "Race Chạy lại/relink").
     pub deleting: Arc<Mutex<HashSet<SessionId>>>,
+    /// Story 3.4: cờ toàn cục "đang xoá toàn bộ dữ liệu" (spec Always: "một
+    /// cờ toàn cục trong `AppState` (chỉ `ipc/` đọc/ghi) làm mọi writer mới
+    /// bị từ chối"). Đặt **trước** khi kiểm Job bận trong `decide_wipe_all`,
+    /// gỡ ở mọi nhánh thoát -- cùng khuôn với `deleting` ở trên nhưng không
+    /// theo từng session vì `library_wipe_all` chạm mọi Phiên cùng lúc.
+    pub wiping: Arc<AtomicBool>,
     // Giữ sống suốt vòng đời app — drop sớm sẽ ngắt worker ghi log không
     // đồng bộ của `tracing-appender`. Không đọc trực tiếp ở đâu khác nên
     // đặt `_` để không bị cảnh báo "chưa dùng", nhưng vẫn public để test có
@@ -151,6 +158,7 @@ pub fn boot<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
         gateway,
         jobs,
         deleting: Arc::new(Mutex::new(HashSet::new())),
+        wiping: Arc::new(AtomicBool::new(false)),
         _log_guard: log_guard,
     }
 }

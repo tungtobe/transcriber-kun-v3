@@ -183,6 +183,16 @@ pub fn delete_tag(conn: &Connection, tag_id: TagId) -> rusqlite::Result<usize> {
     )
 }
 
+/// Xoá mọi tag toàn cục (story 3.4, spec Approach "Xoá toàn bộ dữ liệu"). FK
+/// `ON DELETE CASCADE` xoá luôn mọi `session_tags` còn sót trong cùng lệnh
+/// `DELETE` này -- gọi trong cùng transaction với
+/// [`super::sessions::delete_all`] ở `library::store::wipe_all`, sau khi
+/// `sessions` đã xoá (thứ tự nào cũng đúng vì cả hai FK đều `CASCADE`, nhưng
+/// giữ đúng thứ tự spec liệt kê). Idempotent: kho rỗng xoá `0` dòng.
+pub fn delete_all(conn: &Connection) -> rusqlite::Result<usize> {
+    conn.execute("DELETE FROM tags", [])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

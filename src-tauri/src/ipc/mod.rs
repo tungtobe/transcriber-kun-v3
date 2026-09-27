@@ -59,6 +59,20 @@ fn session_deleting_error() -> AppError {
     AppError::new(Code::Request, "Phiên đang được xoá")
 }
 
+/// Story 3.4: `true` khi `library_wipe_all` đang xoá toàn bộ dữ liệu (spec
+/// Always: "một cờ toàn cục trong `AppState` ... làm mọi writer mới bị từ
+/// chối"). `Ordering::SeqCst` cho cả đọc lẫn ghi (`mark`/`unmark` ở
+/// `decide_wipe_all`) -- một cờ hiếm khi đổi, không cần thứ tự nới lỏng hơn.
+fn is_wiping(wiping: &std::sync::atomic::AtomicBool) -> bool {
+    wiping.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Lỗi từ chối dùng chung cho mọi writer bị `is_wiping` chặn (spec I/O Matrix
+/// "Writer khi đang xoá": "lỗi `Request` 'đang xoá toàn bộ dữ liệu'").
+fn wiping_error() -> AppError {
+    AppError::new(Code::Request, "Đang xoá toàn bộ dữ liệu")
+}
+
 /// Chạy một closure blocking trên `spawn_blocking`, gộp lỗi join thành
 /// `AppError` category `storage` — dùng cho những command story 2.4 có
 /// nhiều bước chạm DB/OS tuần tự (Code Map: mọi I/O chặn chỉ qua
@@ -662,6 +676,9 @@ async fn transcribe_start_inner(
     state: &AppState,
     path: String,
 ) -> Result<TranscribeStartOutcome, AppError> {
+    if is_wiping(&state.wiping) {
+        return Err(wiping_error());
+    }
     let db = state.db.clone()?;
     let settings = blocking({
         let db = db.clone();
@@ -903,6 +920,9 @@ async fn transcribe_rerun_inner(
 ) -> Result<TranscribeRerunOutcome, AppError> {
     if is_session_deleting(&state.deleting, session_id) {
         return Err(session_deleting_error());
+    }
+    if is_wiping(&state.wiping) {
+        return Err(wiping_error());
     }
     let db = state.db.clone()?;
     let data_dir = state.data_dir.clone()?;
@@ -1166,6 +1186,10 @@ async fn library_transcript_export(
         let result = Err(session_deleting_error());
         return track_ipc_error(&state.db, result).await;
     }
+    if is_wiping(&state.wiping) {
+        let result = Err(wiping_error());
+        return track_ipc_error(&state.db, result).await;
+    }
     let result = async {
         let db = state.db.clone()?;
         let rendered = blocking(move || {
@@ -1327,6 +1351,9 @@ async fn library_proxy_relink_inner(
     if is_session_deleting(&state.deleting, session_id) {
         return Err(session_deleting_error());
     }
+    if is_wiping(&state.wiping) {
+        return Err(wiping_error());
+    }
     let db = state.db.clone()?;
     let root = state.data_dir.clone()?;
     let load_db = db.clone();
@@ -1379,6 +1406,10 @@ async fn library_session_rename(
     session_id: SessionId,
     title: String,
 ) -> Result<Option<String>, AppError> {
+    if is_wiping(&state.wiping) {
+        let result = Err(wiping_error());
+        return track_ipc_error(&state.db, result).await;
+    }
     let result = async {
         let db = state.db.clone()?;
         blocking(move || library::store::rename_session(&db, session_id, &title)).await
@@ -1429,6 +1460,9 @@ async fn library_session_delete_inner(
     state: &AppState,
     session_id: SessionId,
 ) -> Result<SessionDeleteOutcome, AppError> {
+    if is_wiping(&state.wiping) {
+        return Err(wiping_error());
+    }
     let db = state.db.clone()?;
     let root = state.data_dir.clone()?;
     let jobs = state.jobs.clone()?;
@@ -1491,6 +1525,10 @@ async fn tags_create(
     state: tauri::State<'_, AppState>,
     name: String,
 ) -> Result<library::tags::TagSummary, AppError> {
+    if is_wiping(&state.wiping) {
+        let result = Err(wiping_error());
+        return track_ipc_error(&state.db, result).await;
+    }
     let db = state.db.clone();
     let result = async {
         let db = db?;
@@ -1513,6 +1551,10 @@ async fn session_tags_attach(
 ) -> Result<(), AppError> {
     if is_session_deleting(&state.deleting, session_id) {
         let result = Err(session_deleting_error());
+        return track_ipc_error(&state.db, result).await;
+    }
+    if is_wiping(&state.wiping) {
+        let result = Err(wiping_error());
         return track_ipc_error(&state.db, result).await;
     }
     let db = state.db.clone();
@@ -1546,12 +1588,124 @@ async fn session_tags_detach(
 #[tauri::command]
 #[specta::specta]
 async fn tags_delete(state: tauri::State<'_, AppState>, tag_id: TagId) -> Result<(), AppError> {
+    if is_wiping(&state.wiping) {
+        let result = Err(wiping_error());
+        return track_ipc_error(&state.db, result).await;
+    }
     let db = state.db.clone();
     let result = async {
         let db = db?;
         blocking(move || library::tags::delete_tag(&db, tag_id)).await
     }
     .await;
+    track_ipc_error(&state.db, result).await
+}
+
+/// Số liệu Settings → Lưu trữ (story 3.4) — xem [`library::store::storage_stats`]
+/// cho logic đo thật (Media đệ quy dưới `media/`, DB = `app.db` +
+/// `-wal`/`-shm`, số Phiên = số dòng `sessions`).
+#[tauri::command]
+#[specta::specta]
+async fn library_storage_stats(
+    state: tauri::State<'_, AppState>,
+) -> Result<library::store::StorageStats, AppError> {
+    let result = async {
+        let db = state.db.clone()?;
+        let root = state.data_dir.clone()?;
+        blocking(move || library::store::storage_stats(&db, &root)).await
+    }
+    .await;
+    track_ipc_error(&state.db, result).await
+}
+
+/// Mở `<data_dir>` bằng trình quản lý file của OS (spec Never: "Không mở
+/// quyền `opener` rộng cho frontend" — gọi thẳng `OpenerExt::open_path` từ
+/// Rust, frontend chỉ nhận `Result<(), AppError>`, không bao giờ thấy đường
+/// dẫn thật). Lỗi mở (OS/plugin) trả category `storage` để UI hiện lỗi
+/// inline (spec Always).
+#[tauri::command]
+#[specta::specta]
+async fn library_open_data_dir(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), AppError> {
+    let result = async {
+        let root = state.data_dir.clone()?;
+        blocking(move || {
+            use tauri_plugin_opener::OpenerExt;
+            app.opener()
+                .open_path(root.to_string_lossy().into_owned(), None::<&str>)
+                .map_err(|err| AppError::new(Code::Storage, err.to_string()))
+        })
+        .await
+    }
+    .await;
+    track_ipc_error(&state.db, result).await
+}
+
+/// Kết quả `library_wipe_all` (spec I/O Matrix "Xoá thành công", "Đang có
+/// Job").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub enum WipeAllOutcome {
+    Wiped,
+    Busy,
+}
+
+/// Pure gate-order decision for `library_wipe_all` — cùng khuôn
+/// [`decide_session_delete`] (spec Design Notes: "Cờ `wiping` toàn cục song
+/// song với `deleting` per-session ... đặt trước khi hỏi Job bận nên Job bắt
+/// đầu sau đó thấy cờ và bị từ chối"). `unmark_wiping` chạy trên mọi nhánh
+/// thoát -- bận, lỗi hỏi bận, hay chính `do_wipe` lỗi -- để cờ không bao giờ
+/// kẹt `true` (spec Always: "gỡ ở mọi nhánh thoát").
+async fn decide_wipe_all<BusyFut, WipeFut>(
+    mark_wiping: impl FnOnce(),
+    any_active_job: impl FnOnce() -> BusyFut,
+    do_wipe: impl FnOnce() -> WipeFut,
+    unmark_wiping: impl FnOnce(),
+) -> Result<WipeAllOutcome, AppError>
+where
+    BusyFut: std::future::Future<Output = Result<bool, AppError>>,
+    WipeFut: std::future::Future<Output = Result<(), AppError>>,
+{
+    mark_wiping();
+
+    let outcome = match any_active_job().await {
+        Ok(true) => Ok(WipeAllOutcome::Busy),
+        Ok(false) => do_wipe().await.map(|()| WipeAllOutcome::Wiped),
+        Err(err) => Err(err),
+    };
+
+    unmark_wiping();
+    outcome
+}
+
+async fn library_wipe_all_inner(state: &AppState) -> Result<WipeAllOutcome, AppError> {
+    let db = state.db.clone()?;
+    let root = state.data_dir.clone()?;
+    let jobs = state.jobs.clone()?;
+    let mark_wiping = state.wiping.clone();
+    let unmark_wiping = state.wiping.clone();
+
+    decide_wipe_all(
+        move || mark_wiping.store(true, std::sync::atomic::Ordering::SeqCst),
+        move || async move {
+            let snapshot = jobs.snapshot().await?;
+            Ok(!snapshot.is_empty())
+        },
+        move || blocking(move || library::store::wipe_all(&db, &root)),
+        move || unmark_wiping.store(false, std::sync::atomic::Ordering::SeqCst),
+    )
+    .await
+}
+
+/// Xoá toàn bộ dữ liệu họp (story 3.4, spec Approach): chặn khi có Job chưa
+/// kết thúc (outcome `Busy`, không xoá gì) — xem [`decide_wipe_all`] cho thứ
+/// tự gate thật và [`library::store::wipe_all`] cho logic xoá DB/media thật.
+#[tauri::command]
+#[specta::specta]
+async fn library_wipe_all(state: tauri::State<'_, AppState>) -> Result<WipeAllOutcome, AppError> {
+    let result = library_wipe_all_inner(&state).await;
     track_ipc_error(&state.db, result).await
 }
 
@@ -1628,6 +1782,9 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             session_tags_attach,
             session_tags_detach,
             tags_delete,
+            library_storage_stats,
+            library_open_data_dir,
+            library_wipe_all,
             app_close_confirm
         ])
         .events(collect_events![SettingsChanged, CloseRequested])
@@ -2992,5 +3149,113 @@ mod tests {
 
         assert!(is_session_deleting(&deleting, session_id));
         assert!(!is_session_deleting(&deleting, SessionId::new()));
+    }
+
+    #[test]
+    fn is_wiping_reflects_the_flag() {
+        let wiping = std::sync::atomic::AtomicBool::new(false);
+        assert!(!is_wiping(&wiping));
+        wiping.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(is_wiping(&wiping));
+    }
+
+    // `decide_wipe_all` (story 3.4) — cùng gate order/unmark-on-every-exit
+    // với `decide_session_delete` ở trên, nhưng không theo session_id.
+
+    #[tokio::test]
+    async fn decide_wipe_all_marks_before_checking_busy_and_unmarks_on_busy() {
+        let marked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let unmarked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let wipe_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+        let result = decide_wipe_all(
+            flagging(marked.clone()),
+            counting_busy(
+                std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                true,
+            ),
+            counting_delete(wipe_calls.clone(), Ok(())),
+            flagging(unmarked.clone()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, WipeAllOutcome::Busy);
+        assert!(marked.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(unmarked.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            wipe_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "bận -> không được xoá gì"
+        );
+    }
+
+    #[tokio::test]
+    async fn decide_wipe_all_wipes_and_unmarks_when_not_busy() {
+        let marked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let unmarked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let busy_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let wipe_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+        let result = decide_wipe_all(
+            flagging(marked.clone()),
+            counting_busy(busy_calls.clone(), false),
+            counting_delete(wipe_calls.clone(), Ok(())),
+            flagging(unmarked.clone()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, WipeAllOutcome::Wiped);
+        assert!(marked.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(unmarked.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(busy_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(wipe_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn decide_wipe_all_unmarks_when_the_busy_check_itself_errors() {
+        let unmarked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let wipe_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+        let err = decide_wipe_all(
+            flagging(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            ))),
+            erroring_busy(std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0))),
+            counting_delete(wipe_calls.clone(), Ok(())),
+            flagging(unmarked.clone()),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.category, crate::core::error::Category::Storage);
+        assert!(unmarked.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(wipe_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn decide_wipe_all_unmarks_when_wipe_itself_errors() {
+        let unmarked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let err = decide_wipe_all(
+            flagging(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            ))),
+            counting_busy(
+                std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                false,
+            ),
+            counting_delete(
+                std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                Err(AppError::new(Code::Storage, "injected: wipe failure")),
+            ),
+            flagging(unmarked.clone()),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.category, crate::core::error::Category::Storage);
+        assert!(unmarked.load(std::sync::atomic::Ordering::SeqCst));
     }
 }

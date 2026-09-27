@@ -193,6 +193,26 @@ export const commands = {
 	 */
 	tagsDelete: (tagId: string) => typedError<null, AppError>(__TAURI_INVOKE("tags_delete", { tagId })),
 	/**
+	 *  Số liệu Settings → Lưu trữ (story 3.4) — xem [`library::store::storage_stats`]
+	 *  cho logic đo thật (Media đệ quy dưới `media/`, DB = `app.db` +
+	 *  `-wal`/`-shm`, số Phiên = số dòng `sessions`).
+	 */
+	libraryStorageStats: () => typedError<StorageStats, AppError>(__TAURI_INVOKE("library_storage_stats")),
+	/**
+	 *  Mở `<data_dir>` bằng trình quản lý file của OS (spec Never: "Không mở
+	 *  quyền `opener` rộng cho frontend" — gọi thẳng `OpenerExt::open_path` từ
+	 *  Rust, frontend chỉ nhận `Result<(), AppError>`, không bao giờ thấy đường
+	 *  dẫn thật). Lỗi mở (OS/plugin) trả category `storage` để UI hiện lỗi
+	 *  inline (spec Always).
+	 */
+	libraryOpenDataDir: () => typedError<null, AppError>(__TAURI_INVOKE("library_open_data_dir")),
+	/**
+	 *  Xoá toàn bộ dữ liệu họp (story 3.4, spec Approach): chặn khi có Job chưa
+	 *  kết thúc (outcome `Busy`, không xoá gì) — xem [`decide_wipe_all`] cho thứ
+	 *  tự gate thật và [`library::store::wipe_all`] cho logic xoá DB/media thật.
+	 */
+	libraryWipeAll: () => typedError<WipeAllOutcome, AppError>(__TAURI_INVOKE("library_wipe_all")),
+	/**
 	 *  Người dùng xác nhận đóng app khi registry đang bận (spec Design Notes:
 	 *  "đồng ý → huỷ sạch rồi thoát"): huỷ mọi Job hiện có, chờ tối đa ~4 s để
 	 *  mỗi Job dọn xong (huỷ có hiệu lực ≤ 2 s — spec Always), rồi thoát tiến
@@ -568,6 +588,23 @@ export type Settings = {
 export type SettingsChanged = Settings;
 
 /**
+ *  Số liệu Settings → Lưu trữ (story 3.4, spec Always): `media_bytes` là
+ *  tổng byte đệ quy dưới `<root>/media/`, `db_bytes` là tổng `app.db` +
+ *  `app.db-wal` + `app.db-shm` (file thiếu tính `0`), `session_count` là số
+ *  dòng `sessions`. `media_bytes`/`db_bytes` giữ dạng `f64` chứ không phải
+ *  `i64` -- cùng lý do `SessionListItem::created_at`: specta-typescript cấm
+ *  xuất kiểu BigInt, và `f64` biểu diễn chính xác mọi số nguyên byte tới
+ *  2^53 (~8 PB), thừa cho một thư mục dữ liệu người dùng cục bộ.
+ *  `session_count` là `i32` (không phải `i64`), cùng quy ước
+ *  `SessionListItem::missing_gap_count`.
+ */
+export type StorageStats = {
+	mediaBytes: number | null,
+	dbBytes: number | null,
+	sessionCount: number,
+};
+
+/**
  *  Tag tối giản (id + tên) — dùng cho `tags_create` và `SessionDetail::tags`
  *  (spec Code Map).
  */
@@ -650,6 +687,12 @@ export type TranscriptExportOutcome = {
  *  Rust chỉ sở hữu giá trị persisted và không đoán locale hệ điều hành.
  */
 export type UiLanguage = "system" | "vi" | "en" | "ja";
+
+/**
+ *  Kết quả `library_wipe_all` (spec I/O Matrix "Xoá thành công", "Đang có
+ *  Job").
+ */
+export type WipeAllOutcome = "wiped" | "busy";
 
 /* Tauri Specta runtime */
 async function typedError<T, E>(result: Promise<T>): Promise<{ status: "ok"; data: T } | { status: "error"; error: E }> {
