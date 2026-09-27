@@ -6,6 +6,7 @@
   import SettingsGeneral from './settings/SettingsGeneral.svelte';
   import SettingsGemini from './settings/SettingsGemini.svelte';
   import SettingsChunking from './settings/SettingsChunking.svelte';
+  import SettingsStorage from './settings/SettingsStorage.svelte';
   import SettingsDiagnostics from './settings/SettingsDiagnostics.svelte';
   import SettingsAbout from './settings/SettingsAbout.svelte';
 
@@ -16,6 +17,7 @@
     { key: 'general', labelKey: 'settings.group.general' },
     { key: 'gemini', labelKey: 'settings.group.gemini' },
     { key: 'chunking', labelKey: 'settings.group.chunking' },
+    { key: 'storage', labelKey: 'settings.group.storage' },
     { key: 'diagnostics', labelKey: 'settings.group.diagnostics' },
     { key: 'about', labelKey: 'settings.group.about' },
   ];
@@ -57,6 +59,8 @@
         <SettingsGemini />
       {:else if group === 'chunking'}
         <SettingsChunking />
+      {:else if group === 'storage'}
+        <SettingsStorage />
       {:else if group === 'diagnostics'}
         <SettingsDiagnostics />
       {:else if group === 'about'}

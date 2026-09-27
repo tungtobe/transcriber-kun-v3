@@ -18,7 +18,11 @@ use rusqlite::Connection;
 
 use crate::core::error::{AppError, Code};
 
-const DB_FILE_NAME: &str = "app.db";
+/// Tên file DB chính dưới `app_data_dir` -- `pub(crate)` (không còn riêng
+/// module này) vì story 3.4's `library::store::storage_stats` cần ghép đúng
+/// tên này với hậu tố `-wal`/`-shm` để đo dung lượng DB mà không lặp lại
+/// chuỗi `"app.db"` ở một nơi thứ hai.
+pub(crate) const DB_FILE_NAME: &str = "app.db";
 
 #[derive(Debug)]
 pub struct Db {
@@ -73,6 +77,20 @@ impl Db {
             .lock()
             .map_err(|_| AppError::new(Code::Storage, "db mutex poisoned"))?;
         f(&mut guard)
+    }
+
+    /// Chạy `PRAGMA wal_checkpoint(TRUNCATE)` (story 3.4, spec Always: "sau
+    /// đó `wal_checkpoint(TRUNCATE)` và đo lại thực tế — không giả định DB =
+    /// 0"). Gọi sau `wipe_all` xoá sạch `sessions`/`tags`: dồn nội dung WAL
+    /// vào `app.db` rồi cắt file `-wal` về gần 0 byte, để lần đo dung lượng
+    /// kế tiếp phản ánh đúng thực tế thay vì vẫn thấy WAL to từ trước khi
+    /// xoá. Giống `PRAGMA journal_mode` ở [`Db::open`], `wal_checkpoint` luôn
+    /// trả một hàng (busy, log, checkpointed) nên phải `query_row`.
+    pub fn checkpoint_truncate(&self) -> Result<(), AppError> {
+        self.with_connection(|conn| {
+            conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_row| Ok(()))?;
+            Ok(())
+        })
     }
 }
 

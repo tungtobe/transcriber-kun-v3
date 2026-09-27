@@ -18,6 +18,7 @@ import {
   type SessionListItem,
   type TagSummary,
   type TagWithCount,
+  type WipeAllOutcome,
 } from '../bindings';
 import { EMPTY_TAG_FILTER, filterSessions, type TagFilterState } from '../session-filter';
 
@@ -65,6 +66,12 @@ const DELETE_TAG_UNAVAILABLE_ERROR: AppError = {
   detailRedacted: 'tag delete unavailable',
 };
 
+const WIPE_ALL_UNAVAILABLE_ERROR: AppError = {
+  category: 'network',
+  code: 'network',
+  detailRedacted: 'library wipe all unavailable',
+};
+
 export type RenameResult =
   | { status: 'ok'; title: string | null }
   | { status: 'error'; error: AppError };
@@ -78,6 +85,10 @@ export type CreateTagResult =
   | { status: 'error'; error: AppError };
 
 export type TagActionResult = { status: 'ok' } | { status: 'error'; error: AppError };
+
+export type WipeAllResult =
+  | { status: 'ok'; outcome: WipeAllOutcome }
+  | { status: 'error'; error: AppError };
 
 export function createLibraryStore() {
   let sessions = $state<SessionListItem[]>([]);
@@ -206,6 +217,28 @@ export function createLibraryStore() {
       return { status: 'ok', outcome: result.data };
     } catch {
       return { status: 'error', error: DELETE_UNAVAILABLE_ERROR };
+    }
+  }
+
+  // Story 3.4: xoá toàn bộ dữ liệu họp (spec Code Map: "reload phiên + tag
+  // sau wipe"). Outcome `wiped` tải lại cả `sessions` lẫn `tags` -- Rust đã
+  // xoá sạch mọi Phiên/Tag trong cùng một transaction nên cả hai danh sách
+  // đều cần làm mới cùng lúc (spec Always: "frontend reload danh sách Phiên
+  // và tag, và cập nhật số liệu"). `busy`/lỗi không đổi gì ở đây --
+  // `SettingsStorage` hiển thị giải thích inline, không mở lỗi chung.
+  async function wipeAll(): Promise<WipeAllResult> {
+    try {
+      const result = await commands.libraryWipeAll();
+      if (result.status !== 'ok') {
+        return { status: 'error', error: result.error };
+      }
+      if (result.data === 'wiped') {
+        void load();
+        void loadTags();
+      }
+      return { status: 'ok', outcome: result.data };
+    } catch {
+      return { status: 'error', error: WIPE_ALL_UNAVAILABLE_ERROR };
     }
   }
 
@@ -411,6 +444,7 @@ export function createLibraryStore() {
     load,
     rename,
     remove,
+    wipeAll,
     loadTags,
     createTag,
     attachTag,

@@ -12,6 +12,7 @@ const mocks = vi.hoisted(() => ({
   sessionTagsAttach: vi.fn(),
   sessionTagsDetach: vi.fn(),
   tagsDelete: vi.fn(),
+  libraryWipeAll: vi.fn(),
 }));
 
 class FakeChannel<T> {
@@ -33,6 +34,7 @@ vi.mock('../bindings', () => ({
     sessionTagsAttach: (...args: unknown[]) => mocks.sessionTagsAttach(...args),
     sessionTagsDetach: (...args: unknown[]) => mocks.sessionTagsDetach(...args),
     tagsDelete: (...args: unknown[]) => mocks.tagsDelete(...args),
+    libraryWipeAll: (...args: unknown[]) => mocks.libraryWipeAll(...args),
   },
 }));
 
@@ -64,6 +66,7 @@ describe('libraryStore', () => {
     mocks.sessionTagsAttach.mockReset();
     mocks.sessionTagsDetach.mockReset();
     mocks.tagsDelete.mockReset();
+    mocks.libraryWipeAll.mockReset();
     capturedChannel = null;
     mocks.jobsSubscribe.mockImplementation((channel: FakeChannel<unknown>) => {
       capturedChannel = channel;
@@ -304,6 +307,64 @@ describe('libraryStore', () => {
       error: { category: 'storage', code: 'storage', detailRedacted: 'fs failed' },
     });
     expect(mocks.librarySessionsList).toHaveBeenCalledTimes(1);
+  });
+
+  // Story 3.4: wipeAll() reloads both sessions and tags on `wiped`.
+
+  it('wipeAll() reloads sessions and tags when the outcome is wiped', async () => {
+    mocks.librarySessionsList
+      .mockResolvedValueOnce({ status: 'ok', data: [item('a')] })
+      .mockResolvedValueOnce({ status: 'ok', data: [] });
+    mocks.tagsList
+      .mockResolvedValueOnce({ status: 'ok', data: [{ id: 't1', name: 'x', sessionCount: 1 }] })
+      .mockResolvedValueOnce({ status: 'ok', data: [] });
+    const { libraryStore: store } = await import('./library.svelte');
+    await store.load();
+    await store.loadTags();
+
+    mocks.libraryWipeAll.mockResolvedValueOnce({ status: 'ok', data: 'wiped' });
+    const result = await store.wipeAll();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(mocks.libraryWipeAll).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({ status: 'ok', outcome: 'wiped' });
+    expect(mocks.librarySessionsList).toHaveBeenCalledTimes(2);
+    expect(mocks.tagsList).toHaveBeenCalledTimes(2);
+    expect(store.sessions).toEqual([]);
+    expect(store.tags).toEqual([]);
+  });
+
+  it('wipeAll() does not reload on a busy outcome', async () => {
+    mocks.librarySessionsList.mockResolvedValueOnce({ status: 'ok', data: [item('a')] });
+    const { libraryStore: store } = await import('./library.svelte');
+    await store.load();
+
+    mocks.libraryWipeAll.mockResolvedValueOnce({ status: 'ok', data: 'busy' });
+    const result = await store.wipeAll();
+
+    expect(result).toEqual({ status: 'ok', outcome: 'busy' });
+    expect(mocks.librarySessionsList).toHaveBeenCalledTimes(1);
+    expect(mocks.tagsList).not.toHaveBeenCalled();
+  });
+
+  it('wipeAll() surfaces a typed error without reloading', async () => {
+    mocks.librarySessionsList.mockResolvedValueOnce({ status: 'ok', data: [item('a')] });
+    const { libraryStore: store } = await import('./library.svelte');
+    await store.load();
+
+    mocks.libraryWipeAll.mockResolvedValueOnce({
+      status: 'error',
+      error: { category: 'storage', code: 'storage', detailRedacted: 'fs failed' },
+    });
+    const result = await store.wipeAll();
+
+    expect(result).toEqual({
+      status: 'error',
+      error: { category: 'storage', code: 'storage', detailRedacted: 'fs failed' },
+    });
+    expect(mocks.librarySessionsList).toHaveBeenCalledTimes(1);
+    expect(mocks.tagsList).not.toHaveBeenCalled();
   });
 
   // Story 3.2: tags + tagFilter + filteredSessions.

@@ -40,6 +40,7 @@ const mocks = vi.hoisted(() => ({
     loadModelList: vi.fn(),
   },
   diagnosticsSummary: vi.fn(),
+  libraryStorageStats: vi.fn(),
 }));
 
 vi.mock('../lib/stores/settings.svelte', () => ({ settingsStore: mocks.settingsStore }));
@@ -51,6 +52,7 @@ vi.mock('../lib/bindings', async (importOriginal) => {
     commands: {
       ...actual.commands,
       diagnosticsSummary: (...args: unknown[]) => mocks.diagnosticsSummary(...args),
+      libraryStorageStats: (...args: unknown[]) => mocks.libraryStorageStats(...args),
     },
   };
 });
@@ -78,6 +80,10 @@ beforeEach(() => {
         { category: 'blocked', count: 0 },
       ],
     },
+  });
+  mocks.libraryStorageStats.mockReset().mockResolvedValue({
+    status: 'ok',
+    data: { mediaBytes: 125_829_120, dbBytes: 40_960, sessionCount: 3 },
   });
 });
 
@@ -108,6 +114,18 @@ describe('Settings group routing', () => {
     expect(screen.queryByRole('checkbox')).toBeNull();
   });
 
+  it('renders real SettingsStorage numbers for the storage group', async () => {
+    render(Settings, { props: { routeParams: { group: 'storage' } } });
+
+    expect(screen.getByText('Media')).toBeTruthy();
+    expect(await screen.findByText('120 MB')).toBeTruthy();
+    expect(screen.getByText('40 KB')).toBeTruthy();
+    expect(screen.getByText('3')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Mở thư mục' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Xoá toàn bộ dữ liệu…' })).toBeTruthy();
+    expect(screen.queryByLabelText(/cache/i)).toBeNull();
+  });
+
   it('renders real SettingsAbout content for the about group', () => {
     render(Settings, { props: { routeParams: { group: 'about' } } });
 
@@ -125,6 +143,7 @@ describe('Settings group routing', () => {
     expect(nav.textContent).toContain('Giới thiệu & Quyền riêng tư');
     expect(nav.textContent).not.toContain('Chung');
     expect(nav.textContent).not.toContain('Gemini');
+    expect(nav.textContent).not.toContain('Lưu trữ');
     expect(nav.textContent).not.toContain('Chẩn đoán');
   });
 });

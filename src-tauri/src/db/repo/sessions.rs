@@ -163,6 +163,23 @@ pub fn delete(conn: &Connection, id: SessionId) -> rusqlite::Result<usize> {
     )
 }
 
+/// Đếm tổng số dòng `sessions` (story 3.4, spec Always: "số Phiên = số dòng
+/// `sessions`") -- dùng bởi `library::store::storage_stats`.
+pub fn count(conn: &Connection) -> rusqlite::Result<i64> {
+    conn.query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+}
+
+/// Xoá mọi Phiên (story 3.4, spec Approach "Xoá toàn bộ dữ liệu"). FK `ON
+/// DELETE CASCADE` xoá luôn `transcripts`/`segments`/`session_tags` của mọi
+/// Phiên trong cùng lệnh `DELETE` này -- không cần xoá tay từng bảng. Gọi
+/// trong cùng transaction với [`super::tags::delete_all`] ở
+/// `library::store::wipe_all` (spec Always: "DB trong một transaction").
+/// Idempotent: kho rỗng xoá `0` dòng, không phải lỗi (spec I/O Matrix "Kho
+/// rỗng").
+pub fn delete_all(conn: &Connection) -> rusqlite::Result<usize> {
+    conn.execute("DELETE FROM sessions", [])
+}
+
 /// Tra một Phiên theo `source_hash` chính xác (spec I/O Matrix "Trùng hash":
 /// `transcribe_start` gọi trước khi tạo Job — trùng thì trả `Existing
 /// { session_id }`, không tạo Job, không gọi Gemini). `source_hash` là
