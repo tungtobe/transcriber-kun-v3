@@ -133,6 +133,12 @@ export const commands = {
 	 *  (spec Boundaries Always).
 	 */
 	tags: TagSummary[],
+	/**
+	 *  `true` khi Phiên có ít nhất một memo đã sinh (story 3.7, spec
+	 *  Boundaries Always: "Badge `memo` trong meta `SessionHeader` khi Phiên
+	 *  có ít nhất một memo") — nguồn cho `SessionHeader`'s badge `memo`.
+	 */
+	hasMemo: boolean,
 } | null, AppError>(__TAURI_INVOKE("library_session_detail", { sessionId })),
 	/**
 	 *  Export the transcript currently selected in Session detail. Rust reads the
@@ -248,6 +254,71 @@ export const commands = {
 	 *  xem [`memo::templates::restore_defaults`].
 	 */
 	memoTemplatesRestoreDefaults: (locale: string) => typedError<MemoTemplate[], AppError>(__TAURI_INVOKE("memo_templates_restore_defaults", { locale })),
+	/**
+	 *  Sinh (hoặc sinh lại) memo của một cặp (Phiên, Template) -- xem
+	 *  [`memo_generate_inner`] cho gate/registry thật và [`memo::generate::run`]
+	 *  cho luồng gọi Gemini/commit thật. Await tới khi xong (≤ 90 s + chờ key,
+	 *  spec Design Notes) -- frontend là một store singleton nên promise vẫn
+	 *  được xử lý sau khi panel Memo unmount (toast thay vì cập nhật UI trực
+	 *  tiếp).
+	 */
+	memoGenerate: (sessionId: string, templateId: string, locale: string) => typedError<MemoGenerateOutcome, AppError>(__TAURI_INVOKE("memo_generate", { sessionId, templateId, locale })),
+	/**
+	 *  Đọc memo đã cache của một cặp (Phiên, Template), không bao giờ gọi
+	 *  Gemini (spec Boundaries Always: "Mở lại memo chỉ đọc DB") — xem
+	 *  [`memo::generate::view`] cho logic đọc + suy hai cờ provenance thật.
+	 */
+	memoGet: (sessionId: string, templateId: string) => typedError<{
+	body: string,
+	/**
+	 *  Mili-giây kể từ Unix epoch (UTC), `f64` -- cùng quy ước
+	 *  `SessionDetail::created_at`.
+	 */
+	createdAt: number | null,
+	/**
+	 *  Chuỗi thô `"complete" | "partial"` của transcript đã dùng để sinh --
+	 *  nguồn cho dòng "Sinh từ bản ... đầy đủ|thiếu".
+	 */
+	transcriptStatus: string,
+	model: string,
+	templateName: string,
+	/**
+	 *  `true` khi template đã dùng để sinh có chứa `{notes}` -- frontend bỏ
+	 *  "+ ghi chú" khỏi dòng nguồn khi `false` (spec Boundaries Always).
+	 */
+	usesNotes: boolean,
+	/**
+	 *  `true` khi transcript primary hiện tại của Phiên khác transcript đã
+	 *  dùng để sinh memo này (Chạy lại tạo `TranscriptId` mới -- so khớp id
+	 *  là đủ, spec Design Notes).
+	 */
+	fromPreviousTranscript: boolean,
+	/**  `true` khi revision ghi chú hiện tại khác revision đã chụp lúc sinh. */
+	notesChanged: boolean,
+} | null, AppError>(__TAURI_INVOKE("memo_get", { sessionId, templateId })),
+	/**
+	 *  Huỷ request `memo_generate` đang chạy của một cặp (Phiên, Template) nếu
+	 *  có -- không lỗi khi không có gì đang chạy (idempotent, spec I/O Matrix
+	 *  "Huỷ": "đang chạy, `memo_cancel` → `Cancelled`, memo cũ giữ"; gọi khi
+	 *  không có gì đang chạy chỉ là no-op vô hại).
+	 */
+	memoCancel: (sessionId: string, templateId: string) => typedError<null, AppError>(__TAURI_INVOKE("memo_cancel", { sessionId, templateId })),
+	/**
+	 *  Tải Copy/Tải `.md` của một memo -- xem [`memo_export_inner`] cho luồng
+	 *  đọc + dialog + ghi thật, cùng mẫu `library_transcript_export`.
+	 */
+	memoExport: (sessionId: string, templateId: string) => typedError<boolean, AppError>(__TAURI_INVOKE("memo_export", { sessionId, templateId })),
+	/**
+	 *  Mở một URL `http(s)` bằng trình mở mặc định của OS (spec Boundaries
+	 *  Always: "chỉ mở URL `http(s)` qua lệnh Rust `open_external_url` dùng
+	 *  opener từ Rust (không nới capability frontend)"; spec Never: "Không nới
+	 *  `opener:allow-open-url` trong capability" -- lệnh này gọi thẳng
+	 *  `OpenerExt::open_url` từ Rust, frontend không bao giờ có quyền
+	 *  `opener:allow-open-url` của riêng nó). Từ chối bất kỳ scheme nào khác
+	 *  `http`/`https` (spec: link trong Markdown chỉ được phép mở URL đó) trước
+	 *  khi chạm opener.
+	 */
+	openExternalUrl: (url: string) => typedError<null, AppError>(__TAURI_INVOKE("open_external_url", { url })),
 	/**
 	 *  Số liệu Settings → Lưu trữ (story 3.4) — xem [`library::store::storage_stats`]
 	 *  cho logic đo thật (Media đệ quy dưới `media/`, DB = `app.db` +
@@ -466,6 +537,15 @@ export type KeyTestResult = {
 };
 
 /**
+ *  Kết quả `memo_generate` (story 3.7, spec Boundaries Always: "Kết quả
+ *  lệnh: `Generated(Memo) | Cancelled | AlreadyRunning`; lỗi trả `AppError`
+ *  đúng category"). `AlreadyRunning` chỉ quyết định được ở đây (registry của
+ *  `ipc::`), không ở `memo::generate::run` (spec: "registry ... chỉ `ipc/`
+ *  điều phối") -- đó là lý do nó không nằm trong `memo::generate::GenerateOutcome`.
+ */
+export type MemoGenerateOutcome = { kind: "generated"; memo: MemoView } | { kind: "cancelled" } | { kind: "alreadyRunning" };
+
+/**
  *  Một Template memo qua IPC (spec Code Map: `MemoTemplate { id, name,
  *  prompt, isDefault, locale, defaultKey }`). `locale`/`defaultKey` là `None`
  *  cho mẫu người dùng.
@@ -477,6 +557,40 @@ export type MemoTemplate = {
 	isDefault: boolean,
 	locale: string | null,
 	defaultKey: string | null,
+};
+
+/**
+ *  Một memo qua IPC (`memo_generate`/`memo_get`) -- `body` là Markdown thô,
+ *  chưa sanitize (spec Boundaries Always: "Render Markdown bằng `marked` rồi
+ *  `DOMPurify.sanitize`" ở frontend, không phải ở đây).
+ */
+export type MemoView = {
+	body: string,
+	/**
+	 *  Mili-giây kể từ Unix epoch (UTC), `f64` -- cùng quy ước
+	 *  `SessionDetail::created_at`.
+	 */
+	createdAt: number | null,
+	/**
+	 *  Chuỗi thô `"complete" | "partial"` của transcript đã dùng để sinh --
+	 *  nguồn cho dòng "Sinh từ bản ... đầy đủ|thiếu".
+	 */
+	transcriptStatus: string,
+	model: string,
+	templateName: string,
+	/**
+	 *  `true` khi template đã dùng để sinh có chứa `{notes}` -- frontend bỏ
+	 *  "+ ghi chú" khỏi dòng nguồn khi `false` (spec Boundaries Always).
+	 */
+	usesNotes: boolean,
+	/**
+	 *  `true` khi transcript primary hiện tại của Phiên khác transcript đã
+	 *  dùng để sinh memo này (Chạy lại tạo `TranscriptId` mới -- so khớp id
+	 *  là đủ, spec Design Notes).
+	 */
+	fromPreviousTranscript: boolean,
+	/**  `true` khi revision ghi chú hiện tại khác revision đã chụp lúc sinh. */
+	notesChanged: boolean,
 };
 
 /**  Safe model metadata returned to the frontend and later feature modules. */
@@ -605,6 +719,12 @@ export type SessionDetail = {
 	 *  (spec Boundaries Always).
 	 */
 	tags: TagSummary[],
+	/**
+	 *  `true` khi Phiên có ít nhất một memo đã sinh (story 3.7, spec
+	 *  Boundaries Always: "Badge `memo` trong meta `SessionHeader` khi Phiên
+	 *  có ít nhất một memo") — nguồn cho `SessionHeader`'s badge `memo`.
+	 */
+	hasMemo: boolean,
 };
 
 /**

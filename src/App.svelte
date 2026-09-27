@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import { Router } from '@keenmate/svelte-spa-router';
   import AppShell from './components/AppShell.svelte';
+  import ToastHost from './components/ToastHost.svelte';
   import { installKeymap } from './lib/keymap';
   import { redirectUnknownRoute, routes } from './lib/router';
   import { appStore } from './lib/stores/app.svelte';
@@ -20,3 +21,4 @@
 <AppShell>
   <Router {routes} restoreScrollState onNotFound={redirectUnknownRoute} />
 </AppShell>
+<ToastHost />

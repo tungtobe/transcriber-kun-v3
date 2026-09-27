@@ -32,6 +32,7 @@
     segmentTextCount,
     recovered,
     partial,
+    hasMemo,
     tags,
     onRenamed,
     onDeleted,
@@ -48,6 +49,9 @@
     segmentTextCount: number;
     recovered: boolean;
     partial: boolean;
+    /** `SessionDetail::hasMemo` (story 3.7) -- badge `memo` trong meta khi
+     * Phiên có ít nhất một memo đã sinh. */
+    hasMemo: boolean;
     /** Tag đang gắn với Phiên (story 3.2, `SessionDetail::tags`). */
     tags: TagSummary[];
     /** Gọi với tên mới đã lưu -- `Session.svelte` cập nhật `view.detail.title`. */
@@ -238,6 +242,9 @@
         <span>{durationLabel}</span>
       {/if}
       <span>{i18n.t('session.header.segmentCount', { count: segmentTextCount })}</span>
+      {#if hasMemo}
+        <Badge variant="memo" label={i18n.t('session.badge.memo')} />
+      {/if}
     </p>
     <div class="session-header-tags">
       {#each tags as tag (tag.id)}

@@ -81,7 +81,11 @@ pub fn display_seconds(seconds: f64, offset_sec: f64) -> f64 {
     }
 }
 
-fn padded_timestamp(seconds: f64) -> String {
+/// `pub(crate)` (not private) so `memo::generate` (story 3.7) reuses the
+/// exact same `[mm:ss]`/`[hh:mm:ss]` formatting for the transcript block it
+/// substitutes into `{transcript}` (spec Boundaries Always: "dùng offset
+/// hiển thị như export 2.10").
+pub(crate) fn padded_timestamp(seconds: f64) -> String {
     let rounded = display_seconds(seconds, 0.0).round() as u64;
     let hours = rounded / 3_600;
     let minutes = (rounded % 3_600) / 60;

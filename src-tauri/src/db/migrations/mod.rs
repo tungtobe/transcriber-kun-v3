@@ -47,7 +47,22 @@ use rusqlite_migration::{Migrations, M};
 /// (`ensure_default`) và khôi phục qua `... DO UPDATE` (`restore_default`) --
 /// SQLite coi nhiều dòng `(NULL, NULL)` là không trùng nhau nên ràng buộc
 /// này không giới hạn số mẫu người dùng.
-static MIGRATIONS: [M; 6] = [
+///
+/// `memos` (story 3.7, spec Boundaries Always): cache theo cặp `(session_id,
+/// template_id)` -- `PRIMARY KEY(session_id, template_id)` nên
+/// `memo::generate` chỉ cần một `INSERT ... ON CONFLICT(session_id,
+/// template_id) DO UPDATE` để "sinh lại" thay đúng dòng cũ. `session_id` là
+/// FK `ON DELETE CASCADE` (xoá Phiên/xoá toàn bộ dọn theo memo của nó, cùng
+/// khuôn `notes`). `template_id` **không** FK (cột `TEXT` trần, spec: "memo
+/// sống sót khi template bị xoá") -- `template_name`/`template_prompt` chụp
+/// lại nội dung mẫu lúc sinh nên một memo vẫn đọc được đầy đủ dù
+/// `memo_templates` đã xoá dòng đó. `transcript_id` cũng cố ý không FK cùng
+/// lý do: Chạy lại (`repo::transcripts::replace_primary`) xoá hẳn transcript
+/// `primary` cũ trong cùng transaction, và `memo::generate` cần so khớp
+/// `transcript_id` đã lưu với transcript `primary` hiện tại để suy
+/// `fromPreviousTranscript` -- một FK ở đây sẽ chặn chính transaction xoá
+/// đó. `notes_revision` để `NULL` khi Phiên chưa từng có ghi chú lúc sinh.
+static MIGRATIONS: [M; 7] = [
     M::up(
         "CREATE TABLE settings (\n\
              key TEXT PRIMARY KEY,\n\
@@ -134,6 +149,21 @@ static MIGRATIONS: [M; 6] = [
              UNIQUE (locale, default_key)\n\
          );",
     ),
+    M::up(
+        "CREATE TABLE memos (\n\
+             session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,\n\
+             template_id TEXT NOT NULL,\n\
+             body TEXT NOT NULL,\n\
+             created_at INTEGER NOT NULL,\n\
+             transcript_id TEXT NOT NULL,\n\
+             transcript_status TEXT NOT NULL CHECK (transcript_status IN ('complete', 'partial')),\n\
+             notes_revision INTEGER,\n\
+             template_name TEXT NOT NULL,\n\
+             template_prompt TEXT NOT NULL,\n\
+             model TEXT NOT NULL,\n\
+             PRIMARY KEY (session_id, template_id)\n\
+         );",
+    ),
 ];
 
 fn runner() -> Migrations<'static> {
@@ -167,8 +197,8 @@ mod tests {
         let version_after_second: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version_after_first, 6);
-        assert_eq!(version_after_second, 6);
+        assert_eq!(version_after_first, 7);
+        assert_eq!(version_after_second, 7);
     }
 
     #[test]
@@ -343,7 +373,7 @@ mod tests {
         let version_after: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version_after, 6);
+        assert_eq!(version_after, 7);
         assert!(table_exists(&conn, "tags"));
         assert!(table_exists(&conn, "session_tags"));
         let title: String = conn
@@ -583,6 +613,99 @@ mod tests {
             .execute(
                 "INSERT INTO memo_templates (id, name, prompt, is_default, locale, default_key, created_at, updated_at) \
                  VALUES ('t1', 'a', '{transcript}', 2, NULL, NULL, 0, 0)",
+                [],
+            )
+            .unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("check"));
+    }
+
+    #[test]
+    fn creates_memos_table() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run(&mut conn).unwrap();
+        assert!(table_exists(&conn, "memos"));
+    }
+
+    /// Story 3.7 spec Boundaries Always: `PRIMARY KEY(session_id,
+    /// template_id)` -- một cặp Phiên/Template tối đa một dòng memo.
+    #[test]
+    fn memos_primary_key_is_the_session_template_pair() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        run(&mut conn).unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id, kind, title, status, duration_sec, created_at, updated_at) \
+             VALUES ('s1', 'file', 't', 'complete', 1.0, 0, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO memos (session_id, template_id, body, created_at, transcript_id, \
+             transcript_status, notes_revision, template_name, template_prompt, model) \
+             VALUES ('s1', 'tmpl-1', 'nội dung', 0, 't1', 'complete', 3, 'Biên bản họp', '{transcript}', 'gemini-flash-lite-latest')",
+            [],
+        )
+        .unwrap();
+        let err = conn
+            .execute(
+                "INSERT INTO memos (session_id, template_id, body, created_at, transcript_id, \
+                 transcript_status, notes_revision, template_name, template_prompt, model) \
+                 VALUES ('s1', 'tmpl-1', 'nội dung khác', 1, 't2', 'partial', NULL, 'Tên khác', '{transcript}', 'model-b')",
+                [],
+            )
+            .unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("unique"));
+    }
+
+    /// Story 3.7 spec Boundaries Always: xoá Phiên dọn theo memo của nó qua
+    /// `ON DELETE CASCADE` -- `template_id` sống sót (không FK) dù template
+    /// đã bị xoá trước đó không đụng gì tới dòng memo.
+    #[test]
+    fn deleting_a_session_cascades_to_its_memos_but_template_id_is_not_a_foreign_key() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        run(&mut conn).unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id, kind, title, status, duration_sec, created_at, updated_at) \
+             VALUES ('s1', 'file', 't', 'complete', 1.0, 0, 0)",
+            [],
+        )
+        .unwrap();
+        // `template_id = 'template-da-bi-xoa'` không tồn tại ở `memo_templates`
+        // -- vẫn chèn được vì cột này không phải FK.
+        conn.execute(
+            "INSERT INTO memos (session_id, template_id, body, created_at, transcript_id, \
+             transcript_status, notes_revision, template_name, template_prompt, model) \
+             VALUES ('s1', 'template-da-bi-xoa', 'nội dung', 0, 't1', 'complete', NULL, 'Tên', '{transcript}', 'm')",
+            [],
+        )
+        .unwrap();
+
+        conn.execute("DELETE FROM sessions WHERE id = 's1'", [])
+            .unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memos", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "xoá Phiên phải xoá theo memo của nó");
+    }
+
+    #[test]
+    fn memos_transcript_status_check_rejects_values_outside_complete_or_partial() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        run(&mut conn).unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id, kind, title, status, duration_sec, created_at, updated_at) \
+             VALUES ('s1', 'file', 't', 'complete', 1.0, 0, 0)",
+            [],
+        )
+        .unwrap();
+        let err = conn
+            .execute(
+                "INSERT INTO memos (session_id, template_id, body, created_at, transcript_id, \
+                 transcript_status, notes_revision, template_name, template_prompt, model) \
+                 VALUES ('s1', 'tmpl-1', 'x', 0, 't1', 'bogus', NULL, 'Tên', '{transcript}', 'm')",
                 [],
             )
             .unwrap_err();

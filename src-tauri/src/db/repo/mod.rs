@@ -2,6 +2,7 @@
 
 pub mod counters;
 pub mod memo_templates;
+pub mod memos;
 pub mod notes;
 pub mod segments;
 pub mod sessions;
