@@ -22,6 +22,8 @@ use crate::core::error::{AppError, Code};
 mod cpal_backend;
 #[cfg(target_os = "macos")]
 mod macos_tap;
+#[cfg(any(target_os = "windows", test))]
+mod windows_loopback;
 
 pub const OUTPUT_SAMPLE_RATE: u32 = 16_000;
 pub const OUTPUT_CHANNELS: u16 = 1;
@@ -504,9 +506,9 @@ fn validate_prepared(
             .iter()
             .any(|input| input.side == InputSide::System)
         {
-            "If macOS denied system-audio access, allow it in System Settings > Privacy & Security > Screen & System Audio Recording, then retry."
+            system_capture_guidance()
         } else {
-            "Check microphone permission and device availability."
+            microphone_capture_guidance()
         };
         return Err(AppError::new(
             Code::Permission,
@@ -522,9 +524,9 @@ fn validate_prepared(
             .iter()
             .any(|input| input.side == InputSide::System)
         {
-            "If macOS denied system-audio access, allow it in System Settings > Privacy & Security > Screen & System Audio Recording, then retry."
+            system_capture_guidance()
         } else {
-            "Check microphone permission and device availability."
+            microphone_capture_guidance()
         };
         return Err(AppError::new(
             Code::Permission,
@@ -645,12 +647,8 @@ impl AudioPipeline {
         {
             if active {
                 let guidance = match input.format.side {
-                    InputSide::System => {
-                        "If macOS denied system-audio access, allow it in System Settings > Privacy & Security > Screen & System Audio Recording, then retry."
-                    }
-                    InputSide::Microphone => {
-                        "Check device availability and allow microphone access in System Settings."
-                    }
+                    InputSide::System => system_capture_guidance(),
+                    InputSide::Microphone => microphone_capture_guidance(),
                 };
                 self.pending_errors.push(AudioSourceError {
                     source: input.format.source.clone(),
@@ -681,12 +679,8 @@ impl AudioPipeline {
         }
         if let Some(input) = self.inputs.iter().find(|input| input.format.side == side) {
             let guidance = match side {
-                InputSide::System => {
-                    "If macOS denied system-audio access, allow it in System Settings > Privacy & Security > Screen & System Audio Recording, then retry. Silence alone does not indicate a permission failure."
-                }
-                InputSide::Microphone => {
-                    "Check device availability and allow microphone access in System Settings."
-                }
+                InputSide::System => system_source_error_guidance(),
+                InputSide::Microphone => microphone_capture_guidance(),
             };
             self.pending_errors.push(AudioSourceError {
                 source: input.format.source.clone(),
@@ -839,6 +833,44 @@ fn permission_error(detail: impl AsRef<str>) -> AppError {
     AppError::new(Code::Permission, detail)
 }
 
+fn system_capture_guidance() -> &'static str {
+    #[cfg(target_os = "windows")]
+    {
+        return "Check that a default Windows playback device is connected and available, then retry.";
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return "If macOS denied system-audio access, allow it in System Settings > Privacy & Security > Screen & System Audio Recording, then retry.";
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        "Check device availability and select a supported audio source."
+    }
+}
+
+fn system_source_error_guidance() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        return "If macOS denied system-audio access, allow it in System Settings > Privacy & Security > Screen & System Audio Recording, then retry. Silence alone does not indicate a permission failure.";
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        system_capture_guidance()
+    }
+}
+
+fn microphone_capture_guidance() -> &'static str {
+    microphone_capture_guidance_for(cfg!(target_os = "windows"))
+}
+
+fn microphone_capture_guidance_for(windows: bool) -> &'static str {
+    if windows {
+        "Allow microphone access in Windows Settings > Privacy & security > Microphone (ms-settings:privacy-microphone), then retry."
+    } else {
+        "Allow microphone access in System Settings and check that the device is available."
+    }
+}
+
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 #[derive(Default)]
 struct UnsupportedBackend;
@@ -944,6 +976,25 @@ mod tests {
             assert_eq!(chunk.samples.len(), 1_600);
             assert_eq!(chunk.start_sample, 0);
         }
+    }
+
+    #[test]
+    fn system_only_source_does_not_request_a_microphone_input() {
+        let inputs = CaptureSource::System.inputs();
+        assert_eq!(
+            inputs,
+            [SourceInput {
+                side: InputSide::System,
+                source: "system".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn windows_microphone_permission_guidance_opens_privacy_settings() {
+        let guidance = microphone_capture_guidance_for(true);
+        assert!(guidance.contains("Windows Settings > Privacy & security > Microphone"));
+        assert!(guidance.contains("ms-settings:privacy-microphone"));
     }
 
     #[test]
@@ -1129,6 +1180,7 @@ mod tests {
             first.source_errors[0].error.category,
             crate::core::error::Category::Permission
         );
+        assert!(first.samples.iter().any(|sample| *sample != 0));
         assert_eq!(first.start_sample, 0);
         assert_eq!(second.start_sample, 1_600);
     }
@@ -1142,6 +1194,19 @@ mod tests {
         let error = controller.set_source("mic:bad-device").unwrap_err();
         assert_eq!(error.category, crate::core::error::Category::Permission);
         assert!(error.detail_redacted.to_lowercase().contains("permission"));
+        assert_eq!(controller.active_source().as_deref(), Some("system"));
+    }
+
+    #[test]
+    fn failed_stream_start_keeps_the_current_source_selected() {
+        let backend = Arc::new(FakeBackend::default());
+        let controller = CaptureController::new(backend.clone());
+        controller.set_source("system").unwrap();
+        backend.fail_start.store(true, Ordering::SeqCst);
+
+        let error = controller.set_source("mic:Built-in").unwrap_err();
+
+        assert_eq!(error.category, crate::core::error::Category::Permission);
         assert_eq!(controller.active_source().as_deref(), Some("system"));
     }
 
@@ -1205,6 +1270,7 @@ mod tests {
     #[derive(Default)]
     struct FakeBackend {
         fail_prepare: AtomicBool,
+        fail_start: Arc<AtomicBool>,
         prepare_count: AtomicUsize,
         start_count: Arc<AtomicUsize>,
         drop_count: Arc<AtomicUsize>,
@@ -1271,6 +1337,7 @@ mod tests {
                             ),
                             start_count: self.start_count.clone(),
                             drop_count: self.drop_count.clone(),
+                            fail_start: self.fail_start.clone(),
                         }),
                         format,
                     })
@@ -1300,11 +1367,15 @@ mod tests {
         block: InputBlock,
         start_count: Arc<AtomicUsize>,
         drop_count: Arc<AtomicUsize>,
+        fail_start: Arc<AtomicBool>,
     }
 
     impl PreparedStream for FakeStream {
         fn start(&mut self) -> Result<(), AppError> {
             self.start_count.fetch_add(1, Ordering::SeqCst);
+            if self.fail_start.load(Ordering::SeqCst) {
+                return Err(permission_error("fake stream startup failure"));
+            }
             (self.on_audio)(self.block.clone());
             Ok(())
         }

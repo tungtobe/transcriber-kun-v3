@@ -25,20 +25,54 @@ impl CaptureBackend for CpalBackend {
             .default_input_device()
             .and_then(|device| device.id().ok())
             .map(|id| id.to_string());
-        let devices = host
-            .input_devices()
-            .map_err(|err| permission_error(format!(
-                "Could not enumerate microphone devices: {err}. Check microphone permission and device availability."
-            )))?;
+        let devices = match host.input_devices() {
+            Ok(devices) => devices.collect::<Vec<_>>(),
+            #[cfg(target_os = "windows")]
+            Err(error) => {
+                tracing::warn!(error = %error, "could not enumerate Windows microphone devices");
+                Vec::new()
+            }
+            #[cfg(not(target_os = "windows"))]
+            Err(err) => {
+                return Err(permission_error(format!(
+                    "Could not enumerate microphone devices: {err}. {}",
+                    super::microphone_capture_guidance()
+                )));
+            }
+        };
 
         let mut microphones = Vec::new();
         for device in devices {
-            let id = device.id().map_err(|err| permission_error(format!(
-                "Could not identify a microphone device: {err}. Check microphone permission and device availability."
-            )))?.to_string();
-            let description = device.description().map_err(|err| permission_error(format!(
-                "Could not read a microphone device name: {err}. Check microphone permission and device availability."
-            )))?;
+            let id = match device.id() {
+                Ok(id) => id.to_string(),
+                #[cfg(target_os = "windows")]
+                Err(error) => {
+                    tracing::warn!(error = %error, "could not identify a Windows microphone device");
+                    continue;
+                }
+                #[cfg(not(target_os = "windows"))]
+                Err(err) => {
+                    return Err(permission_error(format!(
+                        "Could not identify a microphone device: {err}. {}",
+                        super::microphone_capture_guidance()
+                    )));
+                }
+            };
+            let description = match device.description() {
+                Ok(description) => description,
+                #[cfg(target_os = "windows")]
+                Err(error) => {
+                    tracing::warn!(error = %error, "could not read a Windows microphone device name");
+                    continue;
+                }
+                #[cfg(not(target_os = "windows"))]
+                Err(err) => {
+                    return Err(permission_error(format!(
+                        "Could not read a microphone device name: {err}. {}",
+                        super::microphone_capture_guidance()
+                    )));
+                }
+            };
             microphones.push(LiveMicrophone {
                 source: format!("mic:{id}"),
                 name: description.name().to_owned(),
@@ -59,7 +93,9 @@ impl CaptureBackend for CpalBackend {
 
         #[cfg(target_os = "macos")]
         let system_available = super::macos_tap::supported_by_os();
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "windows")]
+        let system_available = super::windows_loopback::system_available();
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         let system_available = false;
 
         Ok(LiveSources {
@@ -86,7 +122,13 @@ impl CaptureBackend for CpalBackend {
                         on_audio.clone(),
                         on_error.clone(),
                     )?);
-                    #[cfg(not(target_os = "macos"))]
+                    #[cfg(target_os = "windows")]
+                    prepared.push(super::windows_loopback::prepare(
+                        generation,
+                        on_audio.clone(),
+                        on_error.clone(),
+                    )?);
+                    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
                     return Err(system_unavailable_error());
                 }
                 InputSide::Microphone => prepared.push(prepare_microphone(
@@ -102,9 +144,10 @@ impl CaptureBackend for CpalBackend {
 }
 
 fn system_unavailable_error() -> AppError {
-    permission_error(
-        "System audio capture is not available on this platform yet. Check device availability and select a microphone source.",
-    )
+    permission_error(format!(
+        "System audio capture is not available on this platform. {}",
+        super::system_capture_guidance()
+    ))
 }
 
 fn prepare_microphone(
@@ -117,25 +160,37 @@ fn prepare_microphone(
     let requested_id = device_id.strip_prefix("mic:").unwrap_or(device_id);
     let device = host
         .input_devices()
-        .map_err(|err| permission_error(format!(
-            "Could not enumerate microphone devices: {err}. Check microphone permission and device availability."
-        )))?
+        .map_err(|err| {
+            permission_error(format!(
+                "Could not enumerate microphone devices: {err}. {}",
+                super::microphone_capture_guidance()
+            ))
+        })?
         .find(|device| {
             device
                 .id()
                 .map(|id| id.to_string() == requested_id)
                 .unwrap_or(false)
         })
-        .ok_or_else(|| permission_error(format!(
-            "Microphone device “{requested_id}” is unavailable. Check that it is connected and that microphone access is allowed."
-        )))?;
-    let description = device.description().map_err(|err| permission_error(format!(
-        "Could not read the microphone device name: {err}. Check microphone permission and device availability."
-    )))?;
+        .ok_or_else(|| {
+            permission_error(format!(
+                "Microphone device “{requested_id}” is unavailable. {}",
+                super::microphone_capture_guidance()
+            ))
+        })?;
+    let description = device.description().map_err(|err| {
+        permission_error(format!(
+            "Could not read the microphone device name: {err}. {}",
+            super::microphone_capture_guidance()
+        ))
+    })?;
     let display_name = description.name().to_owned();
-    let supported = device.default_input_config().map_err(|err| permission_error(format!(
-        "Could not open microphone “{display_name}”: {err}. Allow microphone access in system settings and check that the device is available."
-    )))?;
+    let supported = device.default_input_config().map_err(|err| {
+        permission_error(format!(
+            "Could not open microphone “{display_name}”: {err}. {}",
+            super::microphone_capture_guidance()
+        ))
+    })?;
     let sample_rate = supported.sample_rate();
     let channels = supported.channels();
     let sample_format = supported.sample_format();
@@ -154,9 +209,12 @@ fn prepare_microphone(
         on_audio,
         on_error,
     )
-    .map_err(|err| permission_error(format!(
-        "Could not prepare microphone “{display_name}”: {err}. Allow microphone access in system settings and check that the device is available."
-    )))?;
+    .map_err(|err| {
+        permission_error(format!(
+            "Could not prepare microphone “{display_name}”: {err}. {}",
+            super::microphone_capture_guidance()
+        ))
+    })?;
 
     Ok(PreparedInput {
         format: InputFormat {
@@ -223,19 +281,16 @@ fn prepare_system(
 
 fn system_capture_error(detail: impl AsRef<str>) -> AppError {
     permission_error(format!(
-        "Could not prepare system audio capture: {}. If macOS denied access, allow it in System Settings > Privacy & Security > Screen & System Audio Recording, then retry.",
-        detail.as_ref()
+        "Could not prepare system audio capture: {}. {}",
+        detail.as_ref(),
+        super::system_capture_guidance()
     ))
 }
 
 fn stream_error_guidance(side: InputSide) -> &'static str {
     match side {
-        InputSide::System => {
-            "If macOS denied access, allow it in System Settings > Privacy & Security > Screen & System Audio Recording, then retry."
-        }
-        InputSide::Microphone => {
-            "Allow microphone access in System Settings and check that the device is available."
-        }
+        InputSide::System => super::system_capture_guidance(),
+        InputSide::Microphone => super::microphone_capture_guidance(),
     }
 }
 
