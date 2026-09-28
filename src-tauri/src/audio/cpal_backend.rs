@@ -10,6 +10,11 @@ use super::{
 };
 use crate::core::error::AppError;
 
+#[cfg(target_os = "macos")]
+type TapResource = Option<super::macos_tap::TapAggregate>;
+#[cfg(not(target_os = "macos"))]
+type TapResource = Option<()>;
+
 #[derive(Default)]
 pub(super) struct CpalBackend;
 
@@ -52,12 +57,15 @@ impl CaptureBackend for CpalBackend {
             .find(|microphone| microphone.is_default)
             .map(|microphone| microphone.source.clone());
 
-        // Story 4.1 deliberately registers no system-audio adapter. Stories
-        // 4.2/4.3 add platform adapters by extending this backend seam.
+        #[cfg(target_os = "macos")]
+        let system_available = super::macos_tap::supported_by_os();
+        #[cfg(not(target_os = "macos"))]
+        let system_available = false;
+
         Ok(LiveSources {
             microphones,
             default_microphone,
-            system_available: false,
+            system_available,
         })
     }
 
@@ -71,7 +79,16 @@ impl CaptureBackend for CpalBackend {
         let mut prepared = Vec::with_capacity(inputs.len());
         for input in inputs {
             match input.side {
-                InputSide::System => return Err(system_unavailable_error()),
+                InputSide::System => {
+                    #[cfg(target_os = "macos")]
+                    prepared.push(prepare_system(
+                        generation,
+                        on_audio.clone(),
+                        on_error.clone(),
+                    )?);
+                    #[cfg(not(target_os = "macos"))]
+                    return Err(system_unavailable_error());
+                }
                 InputSide::Microphone => prepared.push(prepare_microphone(
                     &input.source,
                     generation,
@@ -130,6 +147,7 @@ fn prepare_microphone(
         config,
         sample_format,
         generation,
+        InputSide::Microphone,
         channels,
         sample_rate,
         error_source,
@@ -147,8 +165,78 @@ fn prepare_microphone(
             sample_rate,
             channels,
         },
-        stream: Box::new(CpalPreparedStream { stream }),
+        stream: Box::new(CpalPreparedStream {
+            stream,
+            side: InputSide::Microphone,
+            started: false,
+            _tap: None,
+        }),
     })
+}
+
+#[cfg(target_os = "macos")]
+fn prepare_system(
+    generation: u64,
+    on_audio: InputCallback,
+    on_error: InputErrorCallback,
+) -> Result<PreparedInput, AppError> {
+    if !super::macos_tap::supported_by_os() {
+        return Err(system_unavailable_error());
+    }
+    let (device, tap) = super::macos_tap::TapAggregate::create()?;
+    let supported = device
+        .default_input_config()
+        .map_err(|error| system_capture_error(format!("could not read the tap format: {error}")))?;
+    let sample_rate = supported.sample_rate();
+    let channels = supported.channels();
+    let sample_format = supported.sample_format();
+    let config: StreamConfig = supported.into();
+    let stream = build_stream(
+        &device,
+        config,
+        sample_format,
+        generation,
+        InputSide::System,
+        channels,
+        sample_rate,
+        "system".to_owned(),
+        on_audio,
+        on_error,
+    )
+    .map_err(system_capture_error)?;
+
+    Ok(PreparedInput {
+        format: InputFormat {
+            side: InputSide::System,
+            source: "system".to_owned(),
+            sample_rate,
+            channels,
+        },
+        stream: Box::new(CpalPreparedStream {
+            stream,
+            side: InputSide::System,
+            started: false,
+            _tap: Some(tap),
+        }),
+    })
+}
+
+fn system_capture_error(detail: impl AsRef<str>) -> AppError {
+    permission_error(format!(
+        "Could not prepare system audio capture: {}. If macOS denied access, allow it in System Settings > Privacy & Security > Screen & System Audio Recording, then retry.",
+        detail.as_ref()
+    ))
+}
+
+fn stream_error_guidance(side: InputSide) -> &'static str {
+    match side {
+        InputSide::System => {
+            "If macOS denied access, allow it in System Settings > Privacy & Security > Screen & System Audio Recording, then retry."
+        }
+        InputSide::Microphone => {
+            "Allow microphone access in System Settings and check that the device is available."
+        }
+    }
 }
 
 fn build_stream(
@@ -156,6 +244,7 @@ fn build_stream(
     config: StreamConfig,
     sample_format: SampleFormat,
     generation: u64,
+    side: InputSide,
     channels: u16,
     sample_rate: u32,
     source: String,
@@ -168,6 +257,7 @@ fn build_stream(
                 device,
                 config,
                 generation,
+                side,
                 channels,
                 sample_rate,
                 source,
@@ -192,9 +282,9 @@ fn build_stream(
         SampleFormat::F32 => build!(f32),
         SampleFormat::F64 => build!(f64),
         SampleFormat::DsdU8 | SampleFormat::DsdU16 | SampleFormat::DsdU32 => {
-            Err("DSD microphone samples are not supported".to_owned())
+            Err("DSD audio samples are not supported".to_owned())
         }
-        _ => Err("microphone sample format is not supported".to_owned()),
+        _ => Err("audio sample format is not supported".to_owned()),
     }
 }
 
@@ -202,6 +292,7 @@ fn build_typed_stream<T>(
     device: &cpal::Device,
     config: StreamConfig,
     generation: u64,
+    side: InputSide,
     channels: u16,
     sample_rate: u32,
     source: String,
@@ -222,31 +313,39 @@ where
                 .collect::<Vec<_>>();
             on_audio(InputBlock {
                 generation,
-                side: InputSide::Microphone,
+                side,
                 sample_rate,
                 channels,
                 samples,
             });
         },
-        move |err| {
-            on_error(
-                generation,
-                InputSide::Microphone,
-                format!("{stream_error_source}: {err}"),
-            )
-        },
+        move |err| on_error(generation, side, format!("{stream_error_source}: {err}")),
         Some(Duration::from_millis(750)),
     )
 }
 
 struct CpalPreparedStream {
     stream: Stream,
+    side: InputSide,
+    started: bool,
+    // Keep the tap and aggregate alive until after the CPAL stream has been
+    // dropped. Rust drops fields in declaration order.
+    _tap: TapResource,
 }
 
 impl PreparedStream for CpalPreparedStream {
     fn start(&mut self) -> Result<(), AppError> {
-        self.stream.play().map_err(|err| permission_error(format!(
-            "Could not start microphone capture: {err}. Allow microphone access in system settings and check that the device is available."
-        )))
+        if self.started {
+            return Ok(());
+        }
+        self.stream.play().map_err(|err| {
+            permission_error(format!(
+                "Could not start {} audio capture: {err}. {}",
+                self.side.name(),
+                stream_error_guidance(self.side)
+            ))
+        })?;
+        self.started = true;
+        Ok(())
     }
 }

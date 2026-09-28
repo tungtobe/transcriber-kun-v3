@@ -20,6 +20,8 @@ use crate::core::error::{AppError, Code};
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod cpal_backend;
+#[cfg(target_os = "macos")]
+mod macos_tap;
 
 pub const OUTPUT_SAMPLE_RATE: u32 = 16_000;
 pub const OUTPUT_CHANNELS: u16 = 1;
@@ -216,6 +218,7 @@ struct ControllerInner {
     pipeline: Mutex<AudioPipeline>,
     active_source: Mutex<Option<String>>,
     opened: Mutex<HashMap<String, OpenedInput>>,
+    failed_inputs: Mutex<HashSet<(u64, InputSide)>>,
     source_switch: Mutex<()>,
     next_generation: AtomicU64,
     output: broadcast::Sender<PcmChunk>,
@@ -242,6 +245,7 @@ impl CaptureController {
             pipeline: Mutex::new(AudioPipeline::default()),
             active_source: Mutex::new(None),
             opened: Mutex::new(HashMap::new()),
+            failed_inputs: Mutex::new(HashSet::new()),
             source_switch: Mutex::new(()),
             next_generation: AtomicU64::new(1),
             output,
@@ -284,23 +288,57 @@ impl CaptureController {
     pub fn set_source(&self, source: &str) -> Result<(), AppError> {
         let source = CaptureSource::parse(source)?;
         let source_key = source.key();
+        let requested = source.inputs();
         let _switch = self
             .inner
             .source_switch
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if self.active_source().as_deref() == Some(source_key.as_str()) {
-            return Ok(());
-        }
-
-        let requested = source.inputs();
-        let generation = self.inner.next_generation.fetch_add(1, Ordering::Relaxed);
-        let missing = {
+        let retry_failed_input = {
             let opened = self
                 .inner
                 .opened
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let failed_inputs = self
+                .inner
+                .failed_inputs
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            requested.iter().any(|input| {
+                opened.get(&input.source).is_none_or(|opened_input| {
+                    failed_inputs.contains(&(opened_input.generation, opened_input.format.side))
+                })
+            })
+        };
+        if self.active_source().as_deref() == Some(source_key.as_str()) && !retry_failed_input {
+            return Ok(());
+        }
+
+        let generation = self.inner.next_generation.fetch_add(1, Ordering::Relaxed);
+        let missing = {
+            let mut opened = self
+                .inner
+                .opened
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut failed_inputs = self
+                .inner
+                .failed_inputs
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let failed_sources = requested
+                .iter()
+                .filter_map(|input| {
+                    let opened_input = opened.get(&input.source)?;
+                    failed_inputs
+                        .remove(&(opened_input.generation, opened_input.format.side))
+                        .then(|| input.source.clone())
+                })
+                .collect::<Vec<_>>();
+            for failed_source in failed_sources {
+                opened.remove(&failed_source);
+            }
             requested
                 .iter()
                 .filter(|input| !opened.contains_key(&input.source))
@@ -340,11 +378,19 @@ impl CaptureController {
             }
             drop(staged);
             if let Some(inner) = error_pipeline.upgrade() {
-                inner
+                let mut pipeline = inner
                     .pipeline
                     .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .note_source_error(generation, side, detail);
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if pipeline.active_inputs.contains(&(generation, side)) {
+                    pipeline.note_source_error(generation, side, detail);
+                    drop(pipeline);
+                    inner
+                        .failed_inputs
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .insert((generation, side));
+                }
             }
         });
 
@@ -403,6 +449,11 @@ impl CaptureController {
             pipeline.ingest(block);
         }
         while let Some((generation, side, detail)) = staged.errors.pop_front() {
+            self.inner
+                .failed_inputs
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert((generation, side));
             pipeline.note_source_error(generation, side, detail);
         }
         drop(staged);
@@ -449,9 +500,17 @@ fn validate_prepared(
         InputSide::Microphone => 1,
     });
     if actual != expected {
+        let guidance = if requested
+            .iter()
+            .any(|input| input.side == InputSide::System)
+        {
+            "If macOS denied system-audio access, allow it in System Settings > Privacy & Security > Screen & System Audio Recording, then retry."
+        } else {
+            "Check microphone permission and device availability."
+        };
         return Err(AppError::new(
             Code::Permission,
-            "The selected live audio source is not available. Check microphone and system-audio permissions.",
+            format!("The selected live audio source is not available. {guidance}"),
         ));
     }
     if prepared.inputs.iter().any(|input| {
@@ -459,9 +518,17 @@ fn validate_prepared(
             || input.format.channels == 0
             || input.format.source.is_empty()
     }) {
+        let guidance = if requested
+            .iter()
+            .any(|input| input.side == InputSide::System)
+        {
+            "If macOS denied system-audio access, allow it in System Settings > Privacy & Security > Screen & System Audio Recording, then retry."
+        } else {
+            "Check microphone permission and device availability."
+        };
         return Err(AppError::new(
             Code::Permission,
-            "The audio device returned an invalid stream format. Check device availability and microphone permission.",
+            format!("The audio device returned an invalid stream format. {guidance}"),
         ));
     }
     Ok(())
@@ -577,11 +644,19 @@ impl AudioPipeline {
             || block.channels == 0
         {
             if active {
+                let guidance = match input.format.side {
+                    InputSide::System => {
+                        "If macOS denied system-audio access, allow it in System Settings > Privacy & Security > Screen & System Audio Recording, then retry."
+                    }
+                    InputSide::Microphone => {
+                        "Check device availability and allow microphone access in System Settings."
+                    }
+                };
                 self.pending_errors.push(AudioSourceError {
                     source: input.format.source.clone(),
-                    error: permission_error(
-                        "The audio device changed its stream format while capturing. Check device availability and microphone permission.",
-                    ),
+                    error: permission_error(format!(
+                        "The audio device changed its stream format while capturing. {guidance}"
+                    )),
                 });
             }
             return;
@@ -605,11 +680,19 @@ impl AudioPipeline {
             return;
         }
         if let Some(input) = self.inputs.iter().find(|input| input.format.side == side) {
+            let guidance = match side {
+                InputSide::System => {
+                    "If macOS denied system-audio access, allow it in System Settings > Privacy & Security > Screen & System Audio Recording, then retry. Silence alone does not indicate a permission failure."
+                }
+                InputSide::Microphone => {
+                    "Check device availability and allow microphone access in System Settings."
+                }
+            };
             self.pending_errors.push(AudioSourceError {
                 source: input.format.source.clone(),
                 error: permission_error(format!(
-                    "The {} audio source stopped: {detail}. Check device availability and microphone permission.",
-                    side.name()
+                    "The {} audio source stopped: {detail}. {guidance}",
+                    side.name(),
                 )),
             });
         }
@@ -1080,6 +1163,24 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_active_source_can_be_selected_again_to_retry_capture() {
+        let backend = Arc::new(FakeBackend::default());
+        let controller = CaptureController::new(backend.clone());
+        controller.set_source("system").unwrap();
+        backend.report_system_error();
+        backend.fail_prepare.store(true, Ordering::SeqCst);
+        assert!(controller.set_source("system").is_err());
+        backend.fail_prepare.store(false, Ordering::SeqCst);
+
+        controller.set_source("system").unwrap();
+
+        assert_eq!(backend.prepare_count.load(Ordering::SeqCst), 3);
+        assert_eq!(backend.start_count.load(Ordering::SeqCst), 2);
+        assert_eq!(backend.drop_count.load(Ordering::SeqCst), 1);
+        assert_eq!(controller.active_source().as_deref(), Some("system"));
+    }
+
+    #[test]
     fn samples_received_before_the_swap_are_kept_for_the_new_source() {
         let controller = CaptureController::new(Arc::new(FakeBackend::default()));
         controller.set_source("system").unwrap();
@@ -1107,6 +1208,7 @@ mod tests {
         prepare_count: AtomicUsize,
         start_count: Arc<AtomicUsize>,
         drop_count: Arc<AtomicUsize>,
+        last_system_error: Arc<Mutex<Option<(InputErrorCallback, u64)>>>,
     }
 
     impl CaptureBackend for FakeBackend {
@@ -1134,7 +1236,7 @@ mod tests {
             inputs: &[SourceInput],
             generation: u64,
             on_audio: InputCallback,
-            _on_error: InputErrorCallback,
+            on_error: InputErrorCallback,
         ) -> Result<PreparedSourceSet, AppError> {
             self.prepare_count.fetch_add(1, Ordering::SeqCst);
             if self.fail_prepare.load(Ordering::SeqCst) {
@@ -1146,6 +1248,13 @@ mod tests {
                 .iter()
                 .map(|input| input_format(input.side, &input.source, 16_000, 1))
                 .collect::<Vec<_>>();
+            if inputs.iter().any(|input| input.side == InputSide::System) {
+                *self
+                    .last_system_error
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                    Some((on_error.clone(), generation));
+            }
             Ok(PreparedSourceSet {
                 inputs: formats
                     .into_iter()
@@ -1167,6 +1276,22 @@ mod tests {
                     })
                     .collect(),
             })
+        }
+    }
+
+    impl FakeBackend {
+        fn report_system_error(&self) {
+            let callback = self
+                .last_system_error
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+                .expect("system stream has been prepared");
+            (callback.0)(
+                callback.1,
+                InputSide::System,
+                "fake Core Audio tap denial".to_owned(),
+            );
         }
     }
 

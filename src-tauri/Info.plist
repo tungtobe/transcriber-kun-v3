@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>trans-kun captures audio from other apps when you select System or Mixed as the live audio source.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>trans-kun captures microphone audio when you select a microphone or Mixed as the live audio source.</string>
+</dict>
+</plist>
