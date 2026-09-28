@@ -10,6 +10,17 @@ export const commands = {
 	 *  (`CARGO_PKG_VERSION`, đọc lúc biên dịch) — không có nơi thứ hai giữ version.
 	 */
 	appVersion: () => typedError<string, AppError>(__TAURI_INVOKE("app_version")),
+	/**
+	 *  List microphones, the default microphone, and system-audio availability.
+	 *  Device enumeration is repeated on each call so a refresh observes newly
+	 *  connected or removed devices.
+	 */
+	liveSources: (refresh: boolean) => typedError<LiveSources, AppError>(__TAURI_INVOKE("live_sources", { refresh })),
+	/**
+	 *  Prepare and switch the shared live capture source. `source` is one of
+	 *  `system`, `mic:<name>`, or `mixed:<mic>` as returned by `live_sources`.
+	 */
+	liveSetSource: (source: string) => typedError<null, AppError>(__TAURI_INVOKE("live_set_source", { source })),
 	/**  Đọc toàn bộ settings hiện tại — xem [`get_settings`] cho logic thật. */
 	settingsGet: () => typedError<Settings, AppError>(__TAURI_INVOKE("settings_get")),
 	/**
@@ -534,6 +545,26 @@ export type KeyMetadata = {
 export type KeyTestResult = {
 	keyId: KeyId,
 	valid: boolean,
+};
+
+/**
+ *  A microphone visible to the frontend. `source` is the opaque value passed
+ *  to `live_set_source`; `name` is for display.
+ */
+export type LiveMicrophone = {
+	source: string,
+	name: string,
+	isDefault: boolean,
+};
+
+/**
+ *  Live-capture availability. Device enumeration is refreshed on every call,
+ *  so callers can request a refresh after connecting a microphone.
+ */
+export type LiveSources = {
+	microphones: LiveMicrophone[],
+	defaultMicrophone: string | null,
+	systemAvailable: boolean,
 };
 
 /**

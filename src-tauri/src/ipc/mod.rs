@@ -15,6 +15,7 @@ use specta::Type;
 use tauri::Manager;
 use tauri_specta::{collect_commands, collect_events, Builder, Event};
 
+use crate::audio::{CaptureController, LiveSources};
 use crate::consent::{self, ConsentPolicy};
 use crate::core::error::{AppError, Code};
 use crate::core::id::{JobId, MemoTemplateId, SessionId, TagId, TranscriptId};
@@ -138,6 +139,39 @@ async fn blocking<T: Send + 'static>(
 #[specta::specta]
 fn app_version() -> Result<String, AppError> {
     Ok(env!("CARGO_PKG_VERSION").to_string())
+}
+
+/// List microphones, the default microphone, and system-audio availability.
+/// Device enumeration is repeated on each call so a refresh observes newly
+/// connected or removed devices.
+#[tauri::command]
+#[specta::specta]
+async fn live_sources(
+    refresh: bool,
+    state: tauri::State<'_, AppState>,
+) -> Result<LiveSources, AppError> {
+    let capture = state.capture.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || capture.live_sources(refresh))
+        .await
+        .map_err(|err| AppError::new(Code::Storage, err.to_string()))
+        .and_then(|inner| inner);
+    track_ipc_error(&state.db, result).await
+}
+
+/// Prepare and switch the shared live capture source. `source` is one of
+/// `system`, `mic:<name>`, or `mixed:<mic>` as returned by `live_sources`.
+#[tauri::command]
+#[specta::specta]
+async fn live_set_source(
+    source: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), AppError> {
+    let capture: Arc<CaptureController> = state.capture.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || capture.set_source(&source))
+        .await
+        .map_err(|err| AppError::new(Code::Storage, err.to_string()))
+        .and_then(|inner| inner);
+    track_ipc_error(&state.db, result).await
 }
 
 /// Đọc settings qua `db` (kết quả boot đã lưu trong `AppState`). `db` là
@@ -2213,6 +2247,8 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
     Builder::<tauri::Wry>::new()
         .commands(collect_commands![
             app_version,
+            live_sources,
+            live_set_source,
             settings_get,
             settings_save,
             consent_policy,

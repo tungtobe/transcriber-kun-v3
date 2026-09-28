@@ -20,6 +20,9 @@ use crate::transcribe::registry::{self, GatewayTranscriber, JobRegistryHandle};
 /// app vẫn khởi động bình thường, mọi command chạm DB trả lại đúng lỗi này
 /// (spec I/O Matrix: "App vẫn khởi động; ... trả AppError category storage").
 pub struct AppState {
+    /// Story 4.1: process-wide live capture controller shared by IPC, the
+    /// future Live transport, and durable recording.
+    pub capture: Arc<crate::audio::CaptureController>,
     pub db: Result<Arc<Db>, AppError>,
     /// Cùng gốc `app_data_dir` dùng bởi `db`/`registry::channel` (Proxy nằm
     /// dưới `<data_dir>/media/<session-id>/proxy.<ext>` -- spec 2.5: Chạy lại
@@ -161,6 +164,7 @@ pub fn boot<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
         .map_err(|err| AppError::new(Code::Storage, err.to_string()));
 
     AppState {
+        capture: Arc::new(crate::audio::CaptureController::production()),
         db,
         data_dir,
         secrets,
