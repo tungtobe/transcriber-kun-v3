@@ -107,6 +107,21 @@ pub fn insert(
     Ok(())
 }
 
+/// Appends a contiguous batch using caller-provided first index. The caller
+/// owns the SQLite transaction so transcript rows, segments, and session
+/// duration can be committed together.
+pub fn insert_ordered_batch(
+    conn: &Connection,
+    transcript_id: TranscriptId,
+    first_idx: i64,
+    drafts: &[SegmentDraft],
+) -> rusqlite::Result<()> {
+    for (offset, draft) in drafts.iter().enumerate() {
+        insert(conn, transcript_id, first_idx + offset as i64, draft)?;
+    }
+    Ok(())
+}
+
 /// Đọc mọi đoạn của một transcript, theo đúng thứ tự `idx`.
 pub fn list_for_transcript(
     conn: &Connection,

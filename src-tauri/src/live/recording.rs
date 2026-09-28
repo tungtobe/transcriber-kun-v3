@@ -31,6 +31,13 @@ const WAV_SPEC: hound::WavSpec = hound::WavSpec {
 const CHECKPOINT_BYTES: u64 = 160_000;
 const CHECKPOINT_PERIOD: Duration = Duration::from_secs(5);
 const POLL_PERIOD: Duration = Duration::from_millis(10);
+const SOURCE_STOP_GRACE: Duration = Duration::from_millis(50);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StopMode {
+    Immediate,
+    AfterCaptureStops,
+}
 
 type RecordingWriter = hound::WavWriter<BufWriter<File>>;
 
@@ -38,7 +45,7 @@ type RecordingWriter = hound::WavWriter<BufWriter<File>>;
 /// and watch `terminal_errors()` independently from the WebSocket state.
 pub struct RecordingHandle {
     session_id: SessionId,
-    stop_tx: Option<Sender<()>>,
+    stop_tx: Option<Sender<StopMode>>,
     terminal_errors: watch::Receiver<Option<AppError>>,
     worker: Option<JoinHandle<Result<(), AppError>>>,
 }
@@ -58,13 +65,25 @@ impl RecordingHandle {
     /// caller controls capture shutdown so it can order both operations with
     /// the rest of Live finalization.
     pub fn stop(mut self) -> Result<(), AppError> {
-        self.signal_stop();
+        self.request_stop();
         self.join_worker()
     }
 
-    fn signal_stop(&mut self) {
+    /// Signals an intentional shutdown without blocking on the writer thread.
+    /// The consumer drains already-published PCM before finalizing the WAV.
+    pub fn request_stop(&mut self) {
+        self.signal_stop(StopMode::Immediate);
+    }
+
+    /// Marks an intentional Live shutdown before the capture source is closed.
+    /// The writer keeps consuming until capture stops, then drains queued PCM.
+    pub fn begin_shutdown(&mut self) {
+        self.signal_stop(StopMode::AfterCaptureStops);
+    }
+
+    fn signal_stop(&mut self, mode: StopMode) {
         if let Some(stop_tx) = self.stop_tx.take() {
-            let _ = stop_tx.send(());
+            let _ = stop_tx.send(mode);
         }
     }
 
@@ -83,7 +102,7 @@ impl RecordingHandle {
 
 impl Drop for RecordingHandle {
     fn drop(&mut self) {
-        self.signal_stop();
+        self.signal_stop(StopMode::Immediate);
     }
 }
 
@@ -113,11 +132,64 @@ pub fn start_with_locale(
     ui_language: UiLanguage,
     resolved_ui_locale: Option<&str>,
 ) -> Result<RecordingHandle, AppError> {
-    start_inner(capture, db, data_dir, ui_language, resolved_ui_locale, None)
+    let receiver = capture.subscribe();
+    start_inner_with_receiver(
+        capture,
+        receiver,
+        db,
+        data_dir,
+        ui_language,
+        resolved_ui_locale,
+        None,
+    )
 }
 
+/// Starts Recording with a receiver subscribed before capture opens. The
+/// LiveSession actor uses this to retain the first capture chunk while source
+/// initialization completes.
+pub fn start_with_receiver(
+    capture: Arc<CaptureController>,
+    receiver: broadcast::Receiver<PcmChunk>,
+    db: &Db,
+    data_dir: &Path,
+    ui_language: UiLanguage,
+    resolved_ui_locale: Option<&str>,
+) -> Result<RecordingHandle, AppError> {
+    start_inner_with_receiver(
+        capture,
+        receiver,
+        db,
+        data_dir,
+        ui_language,
+        resolved_ui_locale,
+        None,
+    )
+}
+
+#[cfg(test)]
 fn start_inner(
     capture: Arc<CaptureController>,
+    db: &Db,
+    data_dir: &Path,
+    ui_language: UiLanguage,
+    resolved_ui_locale: Option<&str>,
+    fail_after_samples: Option<u32>,
+) -> Result<RecordingHandle, AppError> {
+    let receiver = capture.subscribe();
+    start_inner_with_receiver(
+        capture,
+        receiver,
+        db,
+        data_dir,
+        ui_language,
+        resolved_ui_locale,
+        fail_after_samples,
+    )
+}
+
+fn start_inner_with_receiver(
+    capture: Arc<CaptureController>,
+    receiver: broadcast::Receiver<PcmChunk>,
     db: &Db,
     data_dir: &Path,
     ui_language: UiLanguage,
@@ -131,10 +203,9 @@ fn start_inner(
         ));
     }
 
-    // Subscribe before opening the file and writing the row. Any chunks which
-    // arrive during initialization are buffered independently; overflow is
-    // detected as a storage failure rather than silently hidden.
-    let receiver = capture.subscribe();
+    // The caller subscribes before opening the file and writing the row. Any
+    // chunks which arrive during initialization are buffered independently;
+    // overflow is detected as a storage failure rather than silently hidden.
     let session_id = SessionId::new();
     let session_dir = paths::media_dir(data_dir, session_id);
     let recording_path = paths::recording_path(data_dir, session_id);
@@ -223,7 +294,7 @@ fn initialize_session(
 
 fn run_consumer(
     mut receiver: broadcast::Receiver<PcmChunk>,
-    stop_rx: Receiver<()>,
+    stop_rx: Receiver<StopMode>,
     mut writer: RecordingWriter,
     sync_file: File,
     capture: Option<Arc<CaptureController>>,
@@ -234,29 +305,42 @@ fn run_consumer(
     let mut expected_sample = None;
     let mut uncheckpointed_bytes = 0_u64;
     let mut last_checkpoint = Instant::now();
+    let mut stop_mode = None;
 
     loop {
-        match stop_rx.try_recv() {
-            Ok(()) | Err(TryRecvError::Disconnected) => break,
-            Err(TryRecvError::Empty) => {}
+        if stop_mode.is_none() {
+            match stop_rx.try_recv() {
+                Ok(mode) => stop_mode = Some(mode),
+                Err(TryRecvError::Disconnected) => stop_mode = Some(StopMode::Immediate),
+                Err(TryRecvError::Empty) => {}
+            }
         }
 
-        if capture
+        let source_stopped = capture
             .as_ref()
-            .is_some_and(|controller| controller.active_source().is_none())
-        {
-            let err = AppError::new(
-                Code::Permission,
-                "Audio capture stopped while the Live Recording was running",
-            );
-            return fail_recording(
-                &mut writer,
-                &sync_file,
-                capture.as_ref(),
-                &terminal_tx,
-                err,
-                true,
-            );
+            .is_some_and(|controller| controller.active_source().is_none());
+        if stop_mode.is_none() && source_stopped {
+            // A device can disappear independently of Live stop. Give the
+            // actor's intentional shutdown signal a short window to arrive.
+            thread::sleep(SOURCE_STOP_GRACE);
+            match stop_rx.try_recv() {
+                Ok(mode) => stop_mode = Some(mode),
+                Err(TryRecvError::Disconnected) => stop_mode = Some(StopMode::Immediate),
+                Err(TryRecvError::Empty) => {
+                    let err = AppError::new(
+                        Code::Permission,
+                        "Audio capture stopped while the Live Recording was running",
+                    );
+                    return fail_recording(
+                        &mut writer,
+                        &sync_file,
+                        capture.as_ref(),
+                        &terminal_tx,
+                        err,
+                        true,
+                    );
+                }
+            }
         }
 
         match receiver.try_recv() {
@@ -357,7 +441,11 @@ fn run_consumer(
                 );
             }
             Err(broadcast::error::TryRecvError::Closed) => break,
-            Err(broadcast::error::TryRecvError::Empty) => thread::sleep(POLL_PERIOD),
+            Err(broadcast::error::TryRecvError::Empty) => match stop_mode {
+                Some(StopMode::Immediate) => break,
+                Some(StopMode::AfterCaptureStops) if source_stopped => break,
+                Some(StopMode::AfterCaptureStops) | None => thread::sleep(POLL_PERIOD),
+            },
         }
     }
 
@@ -479,6 +567,7 @@ mod tests {
     use crate::audio::{
         CaptureBackend, InputBlock, InputCallback, InputErrorCallback, InputFormat, LiveMicrophone,
         LiveSources, PreparedInput, PreparedSourceSet, PreparedStream, SourceInput,
+        OUTPUT_CHUNK_SAMPLES,
     };
     use crate::db::repo;
     use std::io::{BufRead, BufReader, Read};
@@ -590,6 +679,107 @@ mod tests {
         assert!(wav.duration() >= 1_600);
         assert!(wav.samples::<i16>().any(|sample| sample.unwrap() != 0));
         assert_eq!(capture.active_source().as_deref(), Some("mic:Built-in"));
+    }
+
+    #[test]
+    fn pre_subscribed_recording_receiver_writes_the_first_capture_chunk() {
+        let root = tempdir().unwrap();
+        let db = Db::open(root.path()).unwrap();
+        let capture = Arc::new(CaptureController::new(Arc::new(TestBackend::default())));
+        let recording_receiver = capture.subscribe();
+        let mut observer = capture.subscribe();
+        capture.set_source("mic:Built-in").unwrap();
+
+        // Wait until the first output-clock tick has published the synchronous
+        // TestStream input. The recording receiver was subscribed before open.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let first_chunk = loop {
+            match observer.try_recv() {
+                Ok(chunk) => break chunk,
+                Err(broadcast::error::TryRecvError::Lagged(count)) => {
+                    panic!("observer unexpectedly lagged by {count} chunks")
+                }
+                Err(broadcast::error::TryRecvError::Closed) => panic!("capture closed"),
+                Err(broadcast::error::TryRecvError::Empty) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(broadcast::error::TryRecvError::Empty) => {
+                    panic!("capture did not publish its first chunk")
+                }
+            }
+        };
+        assert_eq!(first_chunk.start_sample, 0);
+        assert!(first_chunk.samples.iter().any(|sample| *sample != 0));
+
+        let handle = start_with_receiver(
+            capture.clone(),
+            recording_receiver,
+            &db,
+            root.path(),
+            UiLanguage::En,
+            None,
+        )
+        .unwrap();
+        let id = handle.session_id();
+        let mut handle = handle;
+        handle.begin_shutdown();
+        capture.stop_capture();
+        handle.stop().unwrap();
+
+        let mut wav = hound::WavReader::open(paths::recording_path(root.path(), id)).unwrap();
+        let wav_samples = wav.samples::<i16>().map(Result::unwrap).collect::<Vec<_>>();
+        assert!(wav_samples.len() >= OUTPUT_CHUNK_SAMPLES);
+        assert_eq!(
+            &wav_samples[..OUTPUT_CHUNK_SAMPLES],
+            first_chunk.samples.as_slice(),
+            "WAV must begin with the chunk published during source initialization"
+        );
+    }
+
+    #[test]
+    fn writer_keeps_all_thirty_six_thousand_chunks_independent_of_live_ring_outage() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("sixty-minute-continuous.wav");
+        let (writer, sync_file) = new_test_writer(&path);
+        let (tx, rx) = broadcast::channel(36_001);
+        for index in 0..36_000_u64 {
+            tx.send(PcmChunk {
+                start_sample: index * crate::audio::OUTPUT_CHUNK_SAMPLES as u64,
+                sample_rate: OUTPUT_SAMPLE_RATE,
+                channels: OUTPUT_CHANNELS,
+                samples: vec![index as i16; crate::audio::OUTPUT_CHUNK_SAMPLES],
+                source_errors: Vec::new(),
+            })
+            .unwrap();
+        }
+        // The production writer has its own capture receiver. Dropping this
+        // sender closes only that synthetic stream after its full backlog is
+        // drained; the Gemini ring's 600-chunk eviction is tested separately.
+        drop(tx);
+        let (_stop_tx, stop_rx) = mpsc::channel();
+        let (terminal_tx, _terminal_rx) = watch::channel(None);
+        let written_samples = Arc::new(AtomicU64::new(0));
+        let worker_samples = written_samples.clone();
+        let result = thread::spawn(move || {
+            run_consumer(
+                rx,
+                stop_rx,
+                writer,
+                sync_file,
+                None,
+                terminal_tx,
+                None,
+                worker_samples,
+            )
+        })
+        .join()
+        .unwrap();
+
+        result.unwrap();
+        let expected_samples = 36_000 * crate::audio::OUTPUT_CHUNK_SAMPLES as u64;
+        assert_eq!(written_samples.load(Ordering::Acquire), expected_samples);
+        let wav = hound::WavReader::open(path).unwrap();
+        assert_eq!(wav.duration() as u64, expected_samples);
     }
 
     #[test]

@@ -21,6 +21,21 @@ export const commands = {
 	 *  `system`, `mic:<name>`, or `mixed:<mic>` as returned by `live_sources`.
 	 */
 	liveSetSource: (source: string) => typedError<null, AppError>(__TAURI_INVOKE("live_set_source", { source })),
+	/**
+	 *  Starts the one process-wide Live session. Consent and model preferences
+	 *  are captured from the durable Rust settings snapshot before capture opens.
+	 */
+	liveStart: (source: string, language: TranscribeLanguage, locale: string) => typedError<string, AppError>(__TAURI_INVOKE("live_start", { source, language, locale })),
+	/**
+	 *  Stop capture, drain the old gateway generation, flush the last transcript
+	 *  text and leave the session at the `finalizing` state for Story 4.9.
+	 */
+	liveStop: () => typedError<null, AppError>(__TAURI_INVOKE("live_stop")),
+	/**
+	 *  Register a live event Channel and send its state snapshot atomically with
+	 *  registration through the LiveSession actor.
+	 */
+	liveSubscribe: (onEvent: Channel<LiveEvent>) => typedError<null, AppError>(__TAURI_INVOKE("live_subscribe", { onEvent })),
 	/**  Đọc toàn bộ settings hiện tại — xem [`get_settings`] cho logic thật. */
 	settingsGet: () => typedError<Settings, AppError>(__TAURI_INVOKE("settings_get")),
 	/**
@@ -414,6 +429,8 @@ export type Code = "quota" | "auth" | "model" | "request" | "shape" | "timeout" 
  */
 "noaudio";
 
+export type ConnectionState = { type: "connecting" } | { type: "connected" } | { type: "reconnecting"; sinceMs: number } | { type: "stopped" };
+
 /**
  *  Rust-owned metadata needed to render the consent step. The accepted
  *  version and declined bit are included so the frontend never needs a
@@ -548,6 +565,12 @@ export type KeyTestResult = {
 };
 
 /**
+ *  Typed Live stream. The ready variant carries the snapshot and cursor sent
+ *  by the actor in the same command that registers the Channel.
+ */
+export type LiveEvent = { type: "ready"; seq: number; snapshot: LiveSnapshot } | { type: "delta"; seq: number; text: string } | { type: "turn"; seq: number } | { type: "segment"; seq: number; segment: LiveSegment } | { type: "gap"; seq: number; startSec: number | null; endSec: number | null; reason: string } | { type: "recording"; seq: number; state: RecordingState } | { type: "connection"; seq: number; state: ConnectionState } | { type: "log"; seq: number; message: string } | { type: "error"; seq: number; error: AppError } | { type: "done"; seq: number } | { type: "final"; seq: number; sessionId: string; transcriptId: string; durationSec: number | null };
+
+/**
  *  A microphone visible to the frontend. `source` is the opaque value passed
  *  to `live_set_source`; `name` is for display.
  */
@@ -555,6 +578,20 @@ export type LiveMicrophone = {
 	source: string,
 	name: string,
 	isDefault: boolean,
+};
+
+export type LiveSegment = {
+	startSec: number | null,
+	endSec: number | null,
+	text: string,
+};
+
+export type LiveSnapshot = {
+	sessionId: string | null,
+	transcriptId: string | null,
+	recording: RecordingState,
+	connection: ConnectionState,
+	durationSec: number | null,
 };
 
 /**
@@ -674,6 +711,8 @@ export type NotesSaveOutcome = { kind: "saved"; revision: number; updatedAt: num
  *  UI (spec I/O Matrix "Phiên live thiếu Proxy").
  */
 export type ProxyRelinkOutcome = "relinked" | "hashMismatch" | "cancelled" | "liveUnsupported";
+
+export type RecordingState = "active" | "stopped" | "failed";
 
 /**
  *  Phạm vi Chạy lại nhận từ `transcribe_rerun` (spec Approach: `scope ∈

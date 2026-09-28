@@ -150,6 +150,23 @@ pub fn set_title(
     )
 }
 
+/// Updates only a live session's sample-derived duration and lifecycle state.
+/// Returns false when the row is missing or is not a Live session.
+pub fn update_live_progress(
+    conn: &Connection,
+    id: SessionId,
+    duration_sec: f64,
+    status: &str,
+    updated_at: i64,
+) -> rusqlite::Result<bool> {
+    let changed = conn.execute(
+        "UPDATE sessions SET duration_sec = MAX(duration_sec, ?1), status = ?2, updated_at = ?3 \
+         WHERE id = ?4 AND kind = 'live'",
+        params![duration_sec.max(0.0), status, updated_at, id.to_string()],
+    )?;
+    Ok(changed == 1)
+}
+
 /// Xoá một Phiên (story 3.1, spec Approach). FK `ON DELETE CASCADE` (migration)
 /// xoá luôn mọi `transcripts`/`segments` của nó -- `Db::open` đã bật
 /// `foreign_keys` nên việc này chạy trong đúng lệnh `DELETE` này, không cần

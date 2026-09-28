@@ -284,6 +284,17 @@ impl CaptureController {
             .clone()
     }
 
+    /// Current offset of the process-wide capture sample clock. It advances
+    /// only when capture publishes a chunk, so Live timestamps never depend on
+    /// when an event is received or replayed by the WebSocket task.
+    pub fn sample_clock(&self) -> u64 {
+        self.inner
+            .pipeline
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clock_samples
+    }
+
     /// Stops capture and releases every opened device stream. Callbacks from
     /// the released generation are ignored because the pipeline has no active
     /// inputs when this method returns.

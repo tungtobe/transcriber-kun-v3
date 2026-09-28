@@ -1,7 +1,7 @@
 //! Gemini Live's raw WebSocket transport.
 //!
-//! This module owns setup, reconnect and audio replay. The later LiveSession
-//! actor consumes only [`LiveEvent`]s and the [`LiveGateway::run`] port.
+//! This module owns setup, reconnect and audio replay. The LiveSession actor
+//! consumes [`LiveEvent`]s through the [`LiveGateway::run`] port.
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -72,8 +72,30 @@ pub struct LiveTransportError;
 /// deliberately absent from this type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LiveEvent {
-    InputTranscription { text: Sensitive<String> },
-    AudioGap { start_sample: u64, end_sample: u64 },
+    InputTranscription {
+        text: Sensitive<String>,
+        sample_start: u64,
+        sample_end: u64,
+    },
+    AudioGap {
+        start_sample: u64,
+        end_sample: u64,
+    },
+    TurnComplete {
+        sample_start: u64,
+        sample_end: u64,
+    },
+    ConnectionChanged {
+        state: LiveConnectionState,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveConnectionState {
+    Connecting,
+    Connected,
+    Reconnecting,
+    Stopped,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -193,6 +215,17 @@ mod tests {
         KeyMaterial::new(KeyId::from_opaque(id), secret.to_owned())
     }
 
+    async fn receive_input_transcription(
+        events: &mut mpsc::Receiver<LiveEvent>,
+    ) -> Option<LiveEvent> {
+        while let Some(event) = events.recv().await {
+            if matches!(event, LiveEvent::InputTranscription { .. }) {
+                return Some(event);
+            }
+        }
+        None
+    }
+
     fn chunk(start_sample: u64, sample: i16) -> PcmChunk {
         PcmChunk {
             start_sample,
@@ -290,6 +323,7 @@ mod tests {
         assert!(parsed.setup_complete);
         assert!(parsed.go_away);
         assert_eq!(parsed.input_transcription.as_deref(), Some("spoken words"));
+        assert!(!parsed.turn_complete);
         assert_eq!(parsed.resumption_handle, Some(Some("resume-1".to_owned())));
         assert_eq!(
             parse_server_message(r#"{"sessionResumptionUpdate":{"resumable":true}}"#)
@@ -305,6 +339,16 @@ mod tests {
             Some(None),
             "a non-resumable update clears the saved handle"
         );
+    }
+
+    #[test]
+    fn parser_recognizes_turn_complete_without_reading_output_payloads() {
+        let parsed = parse_server_message(
+            r#"{"serverContent":{"turnComplete":{},"inputTranscription":{"text":"done."},"outputTranscription":{"text":"ignored"}}}"#,
+        )
+        .unwrap();
+        assert!(parsed.turn_complete);
+        assert_eq!(parsed.input_transcription.as_deref(), Some("done."));
     }
 
     #[test]
@@ -326,6 +370,91 @@ mod tests {
                 end: 1_600,
             })
         );
+    }
+
+    #[test]
+    fn healthy_sixty_minute_sample_clock_does_not_create_disconnect_gaps() {
+        let mut ring = AudioRing::default();
+        for index in 0..36_000_u64 {
+            ring.push(chunk(index * OUTPUT_CHUNK_SAMPLES as u64, index as i16));
+            ring.mark_sent(index);
+        }
+        assert_eq!(ring.chunks.len(), MAX_UNCONFIRMED_CHUNKS);
+        assert!(ring.gaps.is_empty());
+        assert_eq!(
+            ring.observed_end,
+            Some(36_000 * OUTPUT_CHUNK_SAMPLES as u64)
+        );
+    }
+
+    #[test]
+    fn outage_retains_six_hundred_and_reports_exactly_twelve_hundred_unsent_chunks() {
+        let mut ring = AudioRing::default();
+        for index in 0..MAX_UNCONFIRMED_CHUNKS as u64 {
+            ring.push(chunk(index * OUTPUT_CHUNK_SAMPLES as u64, index as i16));
+            ring.mark_sent(index);
+        }
+        for index in MAX_UNCONFIRMED_CHUNKS as u64..2_400_u64 {
+            ring.push(chunk(index * OUTPUT_CHUNK_SAMPLES as u64, index as i16));
+        }
+
+        assert_eq!(ring.chunks.len(), 600);
+        assert_eq!(
+            ring.chunks.front().unwrap().chunk.start_sample,
+            1_800 * 1_600
+        );
+        assert_eq!(
+            ring.chunks.back().unwrap().chunk.start_sample,
+            2_399 * 1_600
+        );
+        assert_eq!(ring.gaps.len(), 1);
+        assert_eq!(
+            ring.gaps[0],
+            GapRange {
+                start: 600 * 1_600,
+                end: 1_800 * 1_600,
+            }
+        );
+    }
+
+    #[test]
+    fn sixty_minute_matrix_has_six_disconnects_and_only_unsent_outage_gap() {
+        let outages = [
+            (1_000_u64, 4_u64),
+            (4_000, 1),
+            (8_000, 1_800),
+            (12_000, 3),
+            (16_000, 1),
+            (20_000, 2),
+            (30_000, 1),
+        ];
+        let reconnects = outages
+            .iter()
+            .map(|(start, len)| start + len)
+            .collect::<std::collections::HashSet<_>>();
+        let mut ring = AudioRing::default();
+        let mut disconnect_count = 0;
+        for index in 0..36_000_u64 {
+            if reconnects.contains(&index) {
+                for item in &mut ring.chunks {
+                    item.ever_sent = true;
+                }
+                disconnect_count += 1;
+            }
+            ring.push(chunk(index * 1_600, index as i16));
+            if !outages
+                .iter()
+                .any(|(start, len)| (*start..start + len).contains(&index))
+            {
+                ring.mark_sent(index);
+            }
+        }
+
+        assert!(disconnect_count >= 6);
+        assert_eq!(ring.chunks.len(), 600);
+        assert_eq!(ring.gaps.len(), 1);
+        assert_eq!(ring.gaps[0].end - ring.gaps[0].start, 1_200 * 1_600);
+        assert_eq!(ring.gaps[0].start, 8_000 * 1_600);
     }
 
     #[test]
@@ -532,6 +661,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn buffered_audio_does_not_starve_socket_close_or_connection_transition() {
+        let socket = FakeSocket::with_incoming([
+            Ok(LiveReceiveMessage::Text(
+                r#"{"setupComplete":{}}"#.to_owned(),
+            )),
+            Ok(LiveReceiveMessage::Closed { code: Some(1000) }),
+        ]);
+        let sent = socket.sent.clone();
+        let connector = FakeConnector::new([ConnectStep::Socket(socket), ConnectStep::Pending]);
+        let pool = test_pool(vec![key("one", "secret-one")]).await;
+        let clock = FakeClock::new(0, true);
+        let gateway = LiveGateway::with_clock(connector, pool, clock);
+        let (audio_tx, audio_rx) = broadcast::channel(1_201);
+        for index in 0..1_200_u64 {
+            audio_tx
+                .send(chunk(index * OUTPUT_CHUNK_SAMPLES as u64, index as i16))
+                .unwrap();
+        }
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let cancellation = CancellationToken::new();
+        let running = tokio::spawn({
+            let cancellation = cancellation.clone();
+            async move {
+                gateway
+                    .run(
+                        run_config(),
+                        ConsentSnapshot::new(1, false),
+                        audio_rx,
+                        event_tx,
+                        cancellation,
+                    )
+                    .await
+            }
+        });
+
+        let reconnect = tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(event) = event_rx.recv().await {
+                if matches!(
+                    event,
+                    LiveEvent::ConnectionChanged {
+                        state: LiveConnectionState::Reconnecting
+                    }
+                ) {
+                    return event;
+                }
+            }
+            panic!("gateway stopped before reconnecting");
+        })
+        .await
+        .expect("a queued close is polled despite buffered audio");
+        assert!(matches!(
+            reconnect,
+            LiveEvent::ConnectionChanged {
+                state: LiveConnectionState::Reconnecting
+            }
+        ));
+        assert_eq!(sent.lock().unwrap().len(), 2, "setup plus one audio chunk");
+        cancellation.cancel();
+        assert_eq!(running.await.unwrap(), Err(LiveFailure::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn setup_complete_and_transcription_emit_connected_before_delta() {
+        let (mut socket, _sent, _received) = FakeSocket::new([
+            r#"{"setupComplete":{},"serverContent":{"inputTranscription":{"text":"ready"}}}"#,
+        ]);
+        socket.pending_receive = true;
+        let connector = FakeConnector::new([ConnectStep::Socket(socket)]);
+        let pool = test_pool(vec![key("one", "secret-one")]).await;
+        let gateway = LiveGateway::new(connector, pool);
+        let (_audio_tx, audio_rx) = broadcast::channel(1);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let cancellation = CancellationToken::new();
+        let running = tokio::spawn({
+            let cancellation = cancellation.clone();
+            async move {
+                gateway
+                    .run(
+                        run_config(),
+                        ConsentSnapshot::new(1, false),
+                        audio_rx,
+                        event_tx,
+                        cancellation,
+                    )
+                    .await
+            }
+        });
+
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(LiveEvent::ConnectionChanged {
+                state: LiveConnectionState::Connecting
+            })
+        ));
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(LiveEvent::ConnectionChanged {
+                state: LiveConnectionState::Connected
+            })
+        ));
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(LiveEvent::InputTranscription { ref text, .. }) if text.expose() == "ready"
+        ));
+        cancellation.cancel();
+        assert_eq!(running.await.unwrap(), Err(LiveFailure::Cancelled));
+    }
+
+    #[tokio::test]
     async fn quota_rotation_goaway_resumption_replay_transcript_and_output_drop() {
         let (first_socket, first_sent, _first_received) = FakeSocket::new([
             r#"{"setupComplete":{}}"#,
@@ -569,7 +807,12 @@ mod tests {
                     .await
             }
         });
-        let event = match tokio::time::timeout(Duration::from_secs(2), event_rx.recv()).await {
+        let event = match tokio::time::timeout(
+            Duration::from_secs(2),
+            receive_input_transcription(&mut event_rx),
+        )
+        .await
+        {
             Ok(Some(event)) => event,
             _ => {
                 cancellation.cancel();
@@ -585,7 +828,7 @@ mod tests {
         };
         assert!(matches!(
             event,
-            LiveEvent::InputTranscription { ref text } if text.expose() == "hello"
+            LiveEvent::InputTranscription { ref text, .. } if text.expose() == "hello"
         ));
         cancellation.cancel();
         assert_eq!(running.await.unwrap(), Err(LiveFailure::Cancelled));
@@ -614,7 +857,9 @@ mod tests {
             second[0]["setup"]["sessionResumption"]["handle"],
             "resume-new"
         );
-        assert!(event_rx.try_recv().is_err());
+        // The gateway's final Stopped notification is best-effort so a full
+        // event queue cannot block cancellation. The actor also sets Stopped
+        // authoritatively when it receives GatewayEnded.
         assert!(clock.delays.lock().unwrap().len() >= 1);
     }
 
@@ -627,7 +872,7 @@ mod tests {
         let pool = test_pool(vec![key("one", "secret-one")]).await;
         let gateway = LiveGateway::with_clock(connector.clone(), pool, clock);
         let (_audio_tx, audio_rx) = broadcast::channel(1);
-        let (event_tx, _event_rx) = mpsc::channel(1);
+        let (event_tx, _event_rx) = mpsc::channel(32);
         let result = gateway
             .run(
                 run_config(),
@@ -653,7 +898,7 @@ mod tests {
         let pool = test_pool(vec![key("one", "secret-one")]).await;
         let gateway = LiveGateway::with_clock(connector.clone(), pool, clock);
         let (_audio_tx, audio_rx) = broadcast::channel(1);
-        let (event_tx, _event_rx) = mpsc::channel(1);
+        let (event_tx, _event_rx) = mpsc::channel(32);
 
         let result = gateway
             .run(
@@ -710,12 +955,15 @@ mod tests {
             }
         });
 
-        let event = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
-            .await
-            .unwrap();
+        let event = tokio::time::timeout(
+            Duration::from_secs(2),
+            receive_input_transcription(&mut event_rx),
+        )
+        .await
+        .unwrap();
         assert!(matches!(
             event,
-            Some(LiveEvent::InputTranscription { ref text }) if text.expose() == "ready"
+            Some(LiveEvent::InputTranscription { ref text, .. }) if text.expose() == "ready"
         ));
         cancellation.cancel();
         assert_eq!(running.await.unwrap(), Err(LiveFailure::Cancelled));
@@ -759,12 +1007,15 @@ mod tests {
             }
         });
 
-        let event = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
-            .await
-            .unwrap();
+        let event = tokio::time::timeout(
+            Duration::from_secs(2),
+            receive_input_transcription(&mut event_rx),
+        )
+        .await
+        .unwrap();
         assert!(matches!(
             event,
-            Some(LiveEvent::InputTranscription { ref text }) if text.expose() == "ready"
+            Some(LiveEvent::InputTranscription { ref text, .. }) if text.expose() == "ready"
         ));
         cancellation.cancel();
         assert_eq!(running.await.unwrap(), Err(LiveFailure::Cancelled));
@@ -815,12 +1066,15 @@ mod tests {
             }
         });
 
-        let event = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
-            .await
-            .unwrap();
+        let event = tokio::time::timeout(
+            Duration::from_secs(2),
+            receive_input_transcription(&mut event_rx),
+        )
+        .await
+        .unwrap();
         assert!(matches!(
             event,
-            Some(LiveEvent::InputTranscription { ref text }) if text.expose() == "ready"
+            Some(LiveEvent::InputTranscription { ref text, .. }) if text.expose() == "ready"
         ));
         cancellation.cancel();
         assert_eq!(running.await.unwrap(), Err(LiveFailure::Cancelled));
@@ -860,12 +1114,15 @@ mod tests {
             }
         });
 
-        let event = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
-            .await
-            .unwrap();
+        let event = tokio::time::timeout(
+            Duration::from_secs(2),
+            receive_input_transcription(&mut event_rx),
+        )
+        .await
+        .unwrap();
         assert!(matches!(
             event,
-            Some(LiveEvent::InputTranscription { ref text }) if text.expose() == "ready"
+            Some(LiveEvent::InputTranscription { ref text, .. }) if text.expose() == "ready"
         ));
         cancellation.cancel();
         assert_eq!(running.await.unwrap(), Err(LiveFailure::Cancelled));
@@ -879,7 +1136,7 @@ mod tests {
         let pool = test_pool(vec![key("one", "secret-one")]).await;
         let gateway = LiveGateway::new(connector, pool);
         let (_audio_tx, audio_rx) = broadcast::channel(1);
-        let (event_tx, _event_rx) = mpsc::channel(1);
+        let (event_tx, _event_rx) = mpsc::channel(32);
         let cancellation = CancellationToken::new();
         let running = tokio::spawn({
             let cancellation = cancellation.clone();
@@ -904,7 +1161,7 @@ mod tests {
         let pool = test_pool(vec![key("one", "secret-one")]).await;
         let gateway = LiveGateway::with_clock(connector, pool, clock.clone());
         let (_audio_tx, audio_rx) = broadcast::channel(1);
-        let (event_tx, _event_rx) = mpsc::channel(1);
+        let (event_tx, _event_rx) = mpsc::channel(32);
         let cancellation = CancellationToken::new();
         let running = tokio::spawn({
             let cancellation = cancellation.clone();
@@ -930,7 +1187,7 @@ mod tests {
         let pool = test_pool(vec![key("one", "secret-one")]).await;
         let gateway = LiveGateway::new(connector.clone(), pool);
         let (_audio_tx, audio_rx) = broadcast::channel(1);
-        let (event_tx, _event_rx) = mpsc::channel(1);
+        let (event_tx, _event_rx) = mpsc::channel(32);
         let cancellation = CancellationToken::new();
         let running = tokio::spawn({
             let cancellation = cancellation.clone();
@@ -1011,9 +1268,12 @@ mod tests {
                 }
             });
             assert!(matches!(
-                tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
-                    .await
-                    .unwrap(),
+                tokio::time::timeout(
+                    Duration::from_secs(2),
+                    receive_input_transcription(&mut event_rx),
+                )
+                .await
+                .unwrap(),
                 Some(LiveEvent::InputTranscription { .. })
             ));
             cancellation.cancel();
@@ -1056,7 +1316,11 @@ mod tests {
                     .await
             }
         });
-        let received = tokio::time::timeout(Duration::from_secs(2), event_rx.recv()).await;
+        let received = tokio::time::timeout(
+            Duration::from_secs(2),
+            receive_input_transcription(&mut event_rx),
+        )
+        .await;
         if received.is_err() {
             cancellation.cancel();
             let outcome = running.await.unwrap();
@@ -1121,10 +1385,13 @@ impl LiveGateway {
         );
 
         let result = self
-            .run_loop(&config, ring, ring_changed, &events, cancellation)
+            .run_loop(&config, ring, ring_changed, &events, cancellation.clone())
             .await;
         ingest_stop.cancel();
         let _ = ingest.await;
+        let _ = events.try_send(LiveEvent::ConnectionChanged {
+            state: LiveConnectionState::Stopped,
+        });
         result
     }
 
@@ -1140,6 +1407,11 @@ impl LiveGateway {
         let mut next_lease: Option<KeyLease> = None;
         let mut setup_rejections = 0_u8;
         let mut backoff_attempt = 0_u32;
+        let mut transcript_sample_cursor = 0_u64;
+
+        if !emit_connection(events, LiveConnectionState::Connecting, &cancellation).await {
+            return Err(LiveFailure::Cancelled);
+        }
 
         loop {
             if cancellation.is_cancelled() {
@@ -1181,9 +1453,29 @@ impl LiveGateway {
                     match self.key_pool.report(lease, outcome).await {
                         Ok(ReportAction::Retry(next)) => {
                             next_lease = Some(next);
+                            if !emit_connection(
+                                events,
+                                LiveConnectionState::Reconnecting,
+                                &cancellation,
+                            )
+                            .await
+                            {
+                                return Err(LiveFailure::Cancelled);
+                            }
                             continue;
                         }
-                        Ok(ReportAction::Complete) => continue,
+                        Ok(ReportAction::Complete) => {
+                            if !emit_connection(
+                                events,
+                                LiveConnectionState::Reconnecting,
+                                &cancellation,
+                            )
+                            .await
+                            {
+                                return Err(LiveFailure::Cancelled);
+                            }
+                            continue;
+                        }
                         Err(error) => return Err(error.into()),
                     }
                 }
@@ -1193,6 +1485,11 @@ impl LiveGateway {
                     if setup_rejections >= 5 {
                         return Err(LiveFailure::SetupRejected);
                     }
+                    if !emit_connection(events, LiveConnectionState::Reconnecting, &cancellation)
+                        .await
+                    {
+                        return Err(LiveFailure::Cancelled);
+                    }
                     if self.wait_before_retry(backoff_attempt, &cancellation).await {
                         return Err(LiveFailure::Cancelled);
                     }
@@ -1201,6 +1498,11 @@ impl LiveGateway {
                 }
                 Err(_) => {
                     let _ = self.key_pool.cancel(lease.request_id.clone()).await;
+                    if !emit_connection(events, LiveConnectionState::Reconnecting, &cancellation)
+                        .await
+                    {
+                        return Err(LiveFailure::Cancelled);
+                    }
                     if self.wait_before_retry(backoff_attempt, &cancellation).await {
                         return Err(LiveFailure::Cancelled);
                     }
@@ -1219,6 +1521,7 @@ impl LiveGateway {
                             events,
                             cancellation.clone(),
                             last_handle.take(),
+                            &mut transcript_sample_cursor,
                         )
                         .await?;
 
@@ -1246,6 +1549,11 @@ impl LiveGateway {
                             }
                         }
                     }
+                    if !emit_connection(events, LiveConnectionState::Reconnecting, &cancellation)
+                        .await
+                    {
+                        return Err(LiveFailure::Cancelled);
+                    }
                     if self.wait_before_retry(backoff_attempt, &cancellation).await {
                         return Err(LiveFailure::Cancelled);
                     }
@@ -1265,6 +1573,7 @@ impl LiveGateway {
         events: &mpsc::Sender<LiveEvent>,
         cancellation: CancellationToken,
         mut handle: Option<Sensitive<String>>,
+        transcript_sample_cursor: &mut u64,
     ) -> Result<SocketEnd, LiveFailure> {
         let mut lease = Some(lease);
         if tokio::select! {
@@ -1288,6 +1597,7 @@ impl LiveGateway {
 
         let mut established = false;
         let mut last_sent_sequence = None;
+        let mut last_sent_sample_end = None;
         let setup_timeout = tokio::time::sleep(self.setup_timeout);
         tokio::pin!(setup_timeout);
         loop {
@@ -1330,6 +1640,7 @@ impl LiveGateway {
                 }
                 continue;
             }
+            let mut sent_audio = false;
             if let Some((sequence, chunk)) = next_audio {
                 let message = build_audio_message(&chunk)?;
                 let send_failed = tokio::select! {
@@ -1352,8 +1663,16 @@ impl LiveGateway {
                 }
                 // This cursor prevents duplicate sends inside one socket only.
                 // The ring still retains the chunk because send is not a model ACK.
+                ring.lock()
+                    .expect("audio ring poisoned")
+                    .mark_sent(sequence);
                 last_sent_sequence = Some(sequence);
-                continue;
+                last_sent_sample_end = Some(
+                    chunk
+                        .start_sample
+                        .saturating_add(chunk.samples.len() as u64),
+                );
+                sent_audio = true;
             }
 
             let incoming = tokio::select! {
@@ -1374,8 +1693,16 @@ impl LiveGateway {
                         established: false,
                     });
                 }
-                result = socket.receive_text() => result,
-                _ = ring_changed.notified() => continue,
+                result = socket.receive_text() => Some(result),
+                _ = ring_changed.notified(), if !sent_audio => continue,
+                // When the ring is continuously full, poll the socket once
+                // after each audio send instead of taking the `continue` path
+                // forever. This keeps close/goAway/transcript events flowing
+                // while preserving a nonblocking audio producer.
+                _ = tokio::time::sleep(Duration::ZERO), if sent_audio => None,
+            };
+            let Some(incoming) = incoming else {
+                continue;
             };
             let message = match incoming {
                 Ok(LiveReceiveMessage::Text(message)) => message,
@@ -1423,11 +1750,30 @@ impl LiveGateway {
             if let Some(next) = parsed.resumption_handle {
                 handle = next.map(Sensitive::new);
             }
+            if parsed.setup_complete && !established {
+                let active_lease = lease.take().expect("setup lease exists until complete");
+                self.key_pool
+                    .report(active_lease, RequestOutcome::Success)
+                    .await?;
+                established = true;
+                if !emit_connection(events, LiveConnectionState::Connected, &cancellation).await {
+                    if let Some(lease) = lease.take() {
+                        let _ = self.key_pool.cancel(lease.request_id).await;
+                    }
+                    return Ok(SocketEnd::Cancelled);
+                }
+            }
             if let Some(text) = parsed.input_transcription {
+                let sample_end = last_sent_sample_end
+                    .or_else(|| ring.lock().expect("audio ring poisoned").observed_end)
+                    .unwrap_or(*transcript_sample_cursor)
+                    .max(*transcript_sample_cursor);
                 if !emit_event(
                     events,
                     LiveEvent::InputTranscription {
                         text: Sensitive::new(text),
+                        sample_start: *transcript_sample_cursor,
+                        sample_end,
                     },
                     &cancellation,
                 )
@@ -1439,12 +1785,27 @@ impl LiveGateway {
                     return Ok(SocketEnd::Cancelled);
                 }
             }
-            if parsed.setup_complete && !established {
-                let active_lease = lease.take().expect("setup lease exists until complete");
-                self.key_pool
-                    .report(active_lease, RequestOutcome::Success)
-                    .await?;
-                established = true;
+            if parsed.turn_complete {
+                let sample_end = last_sent_sample_end
+                    .or_else(|| ring.lock().expect("audio ring poisoned").observed_end)
+                    .unwrap_or(*transcript_sample_cursor)
+                    .max(*transcript_sample_cursor);
+                if !emit_event(
+                    events,
+                    LiveEvent::TurnComplete {
+                        sample_start: *transcript_sample_cursor,
+                        sample_end,
+                    },
+                    &cancellation,
+                )
+                .await
+                {
+                    if let Some(lease) = lease.take() {
+                        let _ = self.key_pool.cancel(lease.request_id).await;
+                    }
+                    return Ok(SocketEnd::Cancelled);
+                }
+                *transcript_sample_cursor = sample_end;
             }
             if let Some(status) = parsed.error_status.filter(|_| !established) {
                 if let Some(outcome) = outcome_for_status(status) {
@@ -1509,6 +1870,7 @@ enum SocketEnd {
 #[derive(Default)]
 struct ParsedServerMessage {
     setup_complete: bool,
+    turn_complete: bool,
     go_away: bool,
     error_status: Option<u16>,
     input_transcription: Option<String>,
@@ -1522,6 +1884,10 @@ fn parse_server_message(raw: &str) -> Option<ParsedServerMessage> {
     let mut parsed = ParsedServerMessage::default();
     parsed.setup_complete = value.setup_complete.is_some();
     parsed.go_away = value.go_away.is_some();
+    parsed.turn_complete = value
+        .server_content
+        .as_ref()
+        .is_some_and(|content| content.turn_complete.is_some());
     if let Some(update) = value.session_resumption_update {
         let resumable = update.resumable.unwrap_or(true);
         parsed.resumption_handle = if resumable {
@@ -1569,6 +1935,8 @@ struct WireResumptionUpdate {
 struct WireServerContent {
     #[serde(default)]
     input_transcription: Option<WireTranscription>,
+    #[serde(default)]
+    turn_complete: Option<serde::de::IgnoredAny>,
 }
 
 #[derive(Deserialize)]
@@ -1731,6 +2099,14 @@ async fn emit_event(
     }
 }
 
+async fn emit_connection(
+    events: &mpsc::Sender<LiveEvent>,
+    state: LiveConnectionState,
+    cancellation: &CancellationToken,
+) -> bool {
+    emit_event(events, LiveEvent::ConnectionChanged { state }, cancellation).await
+}
+
 fn spawn_audio_ingest(
     mut receiver: broadcast::Receiver<PcmChunk>,
     ring: Arc<Mutex<AudioRing>>,
@@ -1761,6 +2137,7 @@ fn spawn_audio_ingest(
 struct BufferedChunk {
     sequence: u64,
     chunk: PcmChunk,
+    ever_sent: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1802,18 +2179,28 @@ impl AudioRing {
 
         if self.chunks.len() == MAX_UNCONFIRMED_CHUNKS {
             if let Some(dropped) = self.chunks.pop_front() {
-                self.push_gap(GapRange {
-                    start: dropped.chunk.start_sample,
-                    end: dropped
-                        .chunk
-                        .start_sample
-                        .saturating_add(dropped.chunk.samples.len() as u64),
-                });
+                // A send attempt is not an ACK, so retain recent sent chunks
+                // for replay. If an older sent chunk ages out of this bounded
+                // window, do not call it a known disconnect gap; only chunks
+                // that never reached any socket are known to be unreplayable.
+                if !dropped.ever_sent {
+                    self.push_gap(GapRange {
+                        start: dropped.chunk.start_sample,
+                        end: dropped
+                            .chunk
+                            .start_sample
+                            .saturating_add(dropped.chunk.samples.len() as u64),
+                    });
+                }
             }
         }
         let sequence = self.next_sequence;
         self.next_sequence = self.next_sequence.wrapping_add(1);
-        self.chunks.push_back(BufferedChunk { sequence, chunk });
+        self.chunks.push_back(BufferedChunk {
+            sequence,
+            chunk,
+            ever_sent: false,
+        });
     }
 
     fn push_gap(&mut self, gap: GapRange) {
@@ -1834,6 +2221,16 @@ impl AudioRing {
             .iter()
             .find(|item| sequence.is_none_or(|last| item.sequence > last))
             .map(|item| (item.sequence, item.chunk.clone()))
+    }
+
+    fn mark_sent(&mut self, sequence: u64) {
+        if let Some(item) = self
+            .chunks
+            .iter_mut()
+            .find(|item| item.sequence == sequence)
+        {
+            item.ever_sent = true;
+        }
     }
 }
 

@@ -107,7 +107,7 @@ flowchart TD
 
 - **Binds:** `live/`, `audio/`, `media/wav`, FR-17, FR-20, FR-22, FR-23
 - **Prevents:** mất mạng hoặc restart WS làm dừng/đứt Recording; WS chậm làm nghẽn capture; UI gộp trạng thái ghi với trạng thái kết nối.
-- **Rule:** Phiên live bắt đầu (tạo dòng `sessions` + file Recording) khi mở thiết bị capture thành công, kể cả lúc offline; WS nối sau theo backoff. Lỗi trước khi capture mở → dọn sạch, không để dòng hay file. Capture fan-out tới (1) WAV writer, chỉ dừng khi người dùng Dừng hoặc thiết bị lỗi, và (2) WS sender có ring buffer 60 s; không nhánh nào block capture. Audio bị đẩy khỏi buffer thành gap `disconnected` (AD-16). Restart dùng `LiveGeneration { id, … }`: event mang id cũ bị bỏ, generation cũ drain ≤ 1 s. `LiveEvent` tách `recording { state }` và `connection { connecting | reconnecting { sinceMs } | stopped }`. TTS audio đi thẳng `audio::playback`, không qua IPC; UI chỉ nhận `speaking: bool`. Đổi Nguồn audio là gate mềm trong capture.
+- **Rule:** Phiên live bắt đầu (tạo dòng `sessions` + file Recording) khi mở thiết bị capture thành công, kể cả lúc offline; WS nối sau theo backoff. Lỗi trước khi capture mở → dọn sạch, không để dòng hay file. Capture fan-out tới (1) WAV writer, chỉ dừng khi người dùng Dừng hoặc thiết bị lỗi, và (2) WS sender có ring buffer 60 s; không nhánh nào block capture. Audio bị đẩy khỏi buffer thành gap `disconnected` (AD-16). Restart dùng `LiveGeneration { id, … }`: event mang id cũ bị bỏ, generation cũ drain ≤ 1 s. `LiveEvent` tách `recording { state }` và `connection { connecting | connected | reconnecting { sinceMs } | stopped }`; `connected` chỉ sau `setupComplete`, socket mất thì rời trạng thái ngay. TTS audio đi thẳng `audio::playback`, không qua IPC; UI chỉ nhận `speaking: bool`. Đổi Nguồn audio là gate mềm trong capture.
 
 ### AD-11 — Đồng thời: Job file tuần tự, Live song song [ADOPTED]
 
@@ -169,7 +169,7 @@ flowchart TD
 |---|---|
 | Tên command IPC | `snake_case` `<domain>_<action>` (`library_list`, `live_start`, `live_subscribe`, `settings_recommended_apply`); binding TS sinh bằng tauri-specta, không viết tay |
 | Serde qua IPC | `rename_all = "camelCase"`; enum tag `{ type, … }` |
-| Event trên Channel | enum `LiveEvent` / `JobEvent`, biến thể theo addendum §H + `recording`, `connection`, `gap`, `waitingQuota`; mọi event có `seq` |
+| Event trên Channel | enum `LiveEvent` / `JobEvent`, biến thể theo addendum §H + `recording`, `connection` (`connecting | connected | reconnecting | stopped`), `gap`, `waitingQuota`; mọi event có `seq` |
 | Lỗi | `Result<T, AppError>` ở mọi command (AD-7) |
 | Module Rust | Mỗi feature có `mod.rs` public tối thiểu; SQL chỉ trong `db/repo/<entity>.rs` |
 | Frontend | Route `/onboarding`, `/home`, `/session/:id`, `/live`, `/settings/:group`; i18n key `<màn>.<khối>.<nhãn>`, 3 ngôn ngữ cùng key set, CI chặn thiếu |

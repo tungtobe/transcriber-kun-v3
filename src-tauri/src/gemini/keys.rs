@@ -318,6 +318,20 @@ impl KeyPoolHandle {
         response.await.ok().flatten()
     }
 
+    /// Returns whether at least one configured key is currently eligible for
+    /// use. This is a local KeyPool snapshot: it neither acquires a lease nor
+    /// sends a request to Gemini. Auth-rejected keys remain ineligible until
+    /// a successful explicit key test clears their quarantine.
+    pub async fn has_eligible_key(&self) -> Result<bool, AppError> {
+        self.wait_initialized().await?;
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::HasEligibleKey { reply })
+            .await
+            .map_err(|_| actor_error())?;
+        response.await.map_err(|_| actor_error())
+    }
+
     pub async fn cancel(&self, request_id: impl Into<String>) -> Result<(), AppError> {
         let (reply, response) = oneshot::channel();
         self.commands
@@ -369,6 +383,9 @@ enum Command {
     Ordinal {
         key_id: KeyId,
         reply: oneshot::Sender<Option<u32>>,
+    },
+    HasEligibleKey {
+        reply: oneshot::Sender<bool>,
     },
 }
 
@@ -555,6 +572,9 @@ impl KeyPoolActor {
                     .position(|key| key.material.id == key_id)
                     .map(|index| (index + 1) as u32);
                 let _ = reply.send(ordinal);
+            }
+            Command::HasEligibleKey { reply } => {
+                let _ = reply.send(self.keys.iter().any(|key| !key.disabled));
             }
         }
     }
@@ -1021,6 +1041,31 @@ mod tests {
         };
         let error = pool.report(second, RequestOutcome::Auth).await.unwrap_err();
         assert_eq!(error.code, Code::Auth);
+    }
+
+    #[tokio::test]
+    async fn live_eligibility_excludes_auth_quarantine_but_ignores_quota_cooldown() {
+        let (quota_pool, _provider, _clock) = pool(vec![material("quota", "Q")]).await;
+        assert!(quota_pool.has_eligible_key().await.unwrap());
+        let lease = quota_pool.acquire(Priority::Live).await.unwrap();
+        let report_pool = quota_pool.clone();
+        let quota_report =
+            tokio::spawn(async move { report_pool.report(lease, RequestOutcome::Quota).await });
+        tokio::task::yield_now().await;
+        assert!(quota_pool.has_eligible_key().await.unwrap());
+        quota_report.abort();
+
+        let (auth_pool, _provider, _clock) = pool(vec![material("auth", "A")]).await;
+        let lease = auth_pool.acquire(Priority::Live).await.unwrap();
+        assert_eq!(
+            auth_pool
+                .report(lease, RequestOutcome::Auth)
+                .await
+                .unwrap_err()
+                .code,
+            Code::Auth
+        );
+        assert!(!auth_pool.has_eligible_key().await.unwrap());
     }
 
     #[tokio::test]

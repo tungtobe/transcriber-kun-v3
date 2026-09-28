@@ -102,6 +102,64 @@ pub fn create_live_session(db: &Db, id: SessionId, title: &str) -> Result<(), Ap
     })
 }
 
+/// Creates the durable empty primary transcript for a Live session after its
+/// Recording worker has started. If this fails, the caller stops capture and
+/// finalizes the WAV while retaining the session row and recording file for
+/// recovery.
+pub fn create_live_transcript(
+    db: &Db,
+    session_id: SessionId,
+    model: &str,
+    language: Option<&str>,
+) -> Result<TranscriptId, AppError> {
+    let transcript_id = TranscriptId::new();
+    db.with_connection(|conn| {
+        let tx = conn.transaction()?;
+        repo::transcripts::insert_with_segments(
+            &tx,
+            transcript_id,
+            session_id,
+            Variant::Primary,
+            model,
+            language,
+            &[],
+            now_ms(),
+        )?;
+        tx.commit()?;
+        Ok(transcript_id)
+    })
+}
+
+/// Commits one ordered Live segment batch and its sample-clock duration in a
+/// single transaction. Empty batches still checkpoint session duration.
+pub fn append_live_batch(
+    db: &Db,
+    session_id: SessionId,
+    transcript_id: TranscriptId,
+    segments: &[SegmentDraft],
+    duration_sec: f64,
+    status: &str,
+) -> Result<(), AppError> {
+    db.with_connection(|conn| {
+        let tx = conn.transaction()?;
+        let transcript = repo::transcripts::get(&tx, transcript_id)?;
+        if !transcript
+            .is_some_and(|row| row.session_id == session_id && row.variant == Variant::Primary)
+        {
+            return Err(AppError::new(
+                Code::Storage,
+                "Live transcript no longer belongs to its session",
+            ));
+        }
+        repo::transcripts::append_ordered_batch(&tx, transcript_id, segments)?;
+        if !repo::sessions::update_live_progress(&tx, session_id, duration_sec, status, now_ms())? {
+            return Err(AppError::new(Code::Storage, "Live session row is missing"));
+        }
+        tx.commit()?;
+        Ok(())
+    })
+}
+
 /// Compensates a newly inserted Live row if the dedicated Recording worker
 /// cannot be started. Existing sessions and file sessions are not affected.
 pub fn delete_live_session(db: &Db, id: SessionId) -> Result<(), AppError> {

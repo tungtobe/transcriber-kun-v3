@@ -24,9 +24,10 @@ use crate::db::{repo, Db};
 use crate::diagnostics::{self, DiagnosticsSummary};
 use crate::gemini::{CancellationToken, ConsentSnapshot, KeyTestResult, ModelInfo, ModelKind};
 use crate::library;
+use crate::live::{LiveEvent, LiveStartParams};
 use crate::memo;
 use crate::secrets::{KeyId, KeyMetadata};
-use crate::settings::{self, Settings, SettingsChanged};
+use crate::settings::{self, Settings, SettingsChanged, TranscribeLanguage};
 use crate::transcribe::job::{CancelOutcome, JobEvent};
 use crate::transcribe::registry::{self, RerunOutcome, RerunParams};
 use crate::transcribe::rerun::{self, RerunScope};
@@ -171,6 +172,64 @@ async fn live_set_source(
         .await
         .map_err(|err| AppError::new(Code::Storage, err.to_string()))
         .and_then(|inner| inner);
+    track_ipc_error(&state.db, result).await
+}
+
+/// Starts the one process-wide Live session. Consent and model preferences
+/// are captured from the durable Rust settings snapshot before capture opens.
+#[tauri::command]
+#[specta::specta]
+async fn live_start(
+    source: String,
+    language: TranscribeLanguage,
+    locale: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<SessionId, AppError> {
+    let result = async {
+        let db = state.db.clone()?;
+        let settings = settings::load(&db);
+        let live = state.live.clone()?;
+        live.start(LiveStartParams {
+            source,
+            language,
+            locale: Some(locale),
+            ui_language: settings.ui_language,
+            model: settings.live_model,
+            consent: ConsentSnapshot::new(
+                settings.consent_accepted_version,
+                settings.consent_declined,
+            ),
+        })
+        .await
+    }
+    .await;
+    track_ipc_error(&state.db, result).await
+}
+
+/// Stop capture, drain the old gateway generation, flush the last transcript
+/// text and leave the session at the `finalizing` state for Story 4.9.
+#[tauri::command]
+#[specta::specta]
+async fn live_stop(state: tauri::State<'_, AppState>) -> Result<(), AppError> {
+    let result = match state.live.clone() {
+        Ok(live) => live.stop().await,
+        Err(error) => Err(error),
+    };
+    track_ipc_error(&state.db, result).await
+}
+
+/// Register a live event Channel and send its state snapshot atomically with
+/// registration through the LiveSession actor.
+#[tauri::command]
+#[specta::specta]
+async fn live_subscribe(
+    on_event: tauri::ipc::Channel<LiveEvent>,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), AppError> {
+    let result = match state.live.clone() {
+        Ok(live) => live.subscribe(on_event).await,
+        Err(error) => Err(error),
+    };
     track_ipc_error(&state.db, result).await
 }
 
@@ -2249,6 +2308,9 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             app_version,
             live_sources,
             live_set_source,
+            live_start,
+            live_stop,
+            live_subscribe,
             settings_get,
             settings_save,
             consent_policy,
@@ -2314,6 +2376,17 @@ mod tests {
         specta_builder()
             .export(Typescript::default(), "../src/lib/bindings.ts")
             .expect("failed to export typescript bindings");
+        let bindings_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../src/lib/bindings.ts");
+        let bindings = std::fs::read_to_string(bindings_path).unwrap();
+        assert!(
+            bindings.contains("sinceMs: number"),
+            "reconnecting sinceMs must stay a JavaScript number in the generated contract"
+        );
+        assert!(
+            bindings.contains("seq: number"),
+            "Live sequence counters must stay JavaScript numbers in the generated contract"
+        );
     }
 
     #[test]

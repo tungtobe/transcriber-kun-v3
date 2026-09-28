@@ -12,19 +12,29 @@ Story 4.4 uses the documented Gemini Live WebSocket protocol with a bounded
 cancellable reconnects. It replays retained audio after reconnect. A successful
 WebSocket send is not treated as server acknowledgement, and no server event
 is treated as an audio-chunk acknowledgement unless Google documents that
-meaning and the S3 spike confirms it.
+meaning and the S3 spike confirms it. The ring tracks whether a chunk was ever
+sent to any socket only to distinguish local replay backlog from chunks that
+never reached a socket; that bit is not an acknowledgement.
 
-When the ring evicts unconfirmed chunks, the transport emits their sample
-interval as an audio gap. Until the S3 evidence below exists, this code makes
-no claim that reconnect replay is loss-free or duplicate-free.
+When the ring evicts a chunk that was never sent to any socket, the transport
+emits its original sample interval as a `disconnected` gap. Older sent-but-
+unconfirmed chunks may age out silently so a healthy 60-minute stream does not
+manufacture gaps after its first minute. This means an outage longer than the
+60-second local ring can only report the unsent portion that aged out; the
+retained newest 600 chunks are replayed on reconnect. Sent-but-unconfirmed audio
+may have been received, lost, or duplicated by the server. Until the S3 evidence
+below exists, this code makes no claim that reconnect replay is loss-free or
+duplicate-free.
 
 ## Evidence available
 
 The local fake-transport tests cover exact setup JSON, language mapping,
 little-endian 16 kHz PCM encoding, all-part input parsing with output audio
-discarded, 600-chunk eviction and gap reporting, reconnect backoff, key-pool
-rotation, resumption-handle reuse, replay after `goAway`, setup-rejection
-counting, and cancellation while connecting, sending, receiving, or sleeping.
+discarded, healthy 36,000-chunk/60-minute simulation without false gaps,
+1,800-chunk outage eviction with an exact 1,200-chunk gap and 600 retained
+chunks, reconnect backoff, key-pool rotation, resumption-handle reuse, replay
+after `goAway`, setup-rejection counting, and cancellation while connecting,
+sending, receiving, or sleeping.
 These tests establish client behavior against scripted messages only; they do
 not establish server acknowledgement or deduplication semantics.
 

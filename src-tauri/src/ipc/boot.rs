@@ -34,6 +34,9 @@ pub struct AppState {
     /// One process-wide HTTP client/gateway. A client-construction failure is
     /// retained as a typed error so boot still reaches the UI.
     pub gateway: Result<Arc<GeminiGateway>, AppError>,
+    /// One LiveSession actor for the process. It owns the live generation and
+    /// seq stream; capture/Recording remain available when its socket is down.
+    pub live: Result<crate::live::LiveSessionHandle, AppError>,
     /// Story 2.4: the one in-memory sequential Job queue for file
     /// transcription. `Err` only when `db`/`gateway` themselves failed to
     /// initialize — `transcribe_start` surfaces that same storage error
@@ -163,13 +166,30 @@ pub fn boot<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
         .app_data_dir()
         .map_err(|err| AppError::new(Code::Storage, err.to_string()));
 
+    let capture = Arc::new(crate::audio::CaptureController::production());
+    let live = match (&db, &data_dir) {
+        (Ok(db), Ok(data_dir)) => {
+            let (handle, actor) = crate::live::channel(
+                capture.clone(),
+                db.clone(),
+                data_dir.clone(),
+                key_pool.clone(),
+                crate::gemini::live::LiveGateway::production(key_pool.clone()),
+            );
+            tauri::async_runtime::spawn(actor.run());
+            Ok(handle)
+        }
+        (Err(error), _) | (_, Err(error)) => Err(error.clone()),
+    };
+
     AppState {
-        capture: Arc::new(crate::audio::CaptureController::production()),
+        capture,
         db,
         data_dir,
         secrets,
         key_pool,
         gateway,
+        live,
         jobs,
         deleting: Arc::new(Mutex::new(HashSet::new())),
         wiping: Arc::new(AtomicBool::new(false)),

@@ -103,7 +103,7 @@ Một chủ sở hữu schema (Rust), migration versioned chỉ tiến. Không i
 ## H. IPC gợi ý (doc 04 §3.6)
 
 Tên command theo spine: `snake_case` `<domain>_<action>`, binding TS sinh bằng tauri-specta. Nhóm: `settings_get/save`, `settings_recommended_preview/apply`, `keys_set/test`, `models_list(kind)`, `library_list/search/get/rename/delete`, `tags_set/list/delete`, `notes_save`, `memo_templates_*`, `memo_generate`, `transcribe_start` (trùng hash → trả `Existing { session_id }`)/`transcribe_cancel`, `jobs_subscribe`, `live_sources`, `live_start/stop/set_source/set_target/redetect/set_tts`, `live_subscribe`, `export_*`, `diagnostics_export/clear`, `ads_next/report`.
-Đồng bộ UI: `*_subscribe(channel)` trả `Snapshot { seq, … }` rồi stream qua `Channel` (spine AD-3); mọi event có `seq`. `LiveEvent`: ready, delta, turn, segment, delta_translated, segment_translated, gap, recording `{state}`, connection `{connecting | reconnecting{sinceMs} | stopped}`, speaking, log, error, done, final. `JobEvent`: progress, log, waitingQuota, result, error, cancelled. Lỗi qua IPC là `AppError { category, code, detail_redacted }`. TTS audio không đi qua IPC.
+Đồng bộ UI: `*_subscribe(channel)` trả `Snapshot { seq, … }` rồi stream qua `Channel` (spine AD-3); mọi event có `seq`. `LiveEvent`: ready, delta, turn, segment, delta_translated, segment_translated, gap, recording `{state}`, connection `{connecting | connected | reconnecting{sinceMs} | stopped}`, speaking, log, error, done, final. `connected` chỉ sau `setupComplete`; khi socket bị đóng trạng thái đổi khỏi `connected` ngay. `JobEvent`: progress, log, waitingQuota, result, error, cancelled. Lỗi qua IPC là `AppError { category, code, detail_redacted }`. TTS audio không đi qua IPC.
 
 ## I. Ad slot (doc 03 §3)
 

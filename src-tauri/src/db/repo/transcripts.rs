@@ -119,6 +119,33 @@ pub fn insert_with_segments(
     Ok(status)
 }
 
+/// Appends the next ordered batch to an existing transcript. The unique
+/// primary transcript belongs to its session and remains `partial` only if a
+/// `chunk_failed` gap is present; disconnected live-audio gaps do not change
+/// that status.
+pub fn append_ordered_batch(
+    conn: &Connection,
+    id: TranscriptId,
+    segment_drafts: &[SegmentDraft],
+) -> rusqlite::Result<()> {
+    if segment_drafts.is_empty() {
+        return Ok(());
+    }
+    let first_idx = conn.query_row(
+        "SELECT COALESCE(MAX(idx) + 1, 0) FROM segments WHERE transcript_id = ?1",
+        params![id.to_string()],
+        |row| row.get::<_, i64>(0),
+    )?;
+    segments::insert_ordered_batch(conn, id, first_idx, segment_drafts)?;
+    if derive_status(segment_drafts) == Status::Partial {
+        conn.execute(
+            "UPDATE transcripts SET status = 'partial' WHERE id = ?1",
+            params![id.to_string()],
+        )?;
+    }
+    Ok(())
+}
+
 /// Chạy lại (retranscribe): xoá hẳn transcript `primary` hiện có của
 /// `session_id` (kéo theo xoá segments của nó qua `ON DELETE CASCADE`), rồi
 /// chèn bản `primary` mới — trong cùng transaction của caller (spec Design
