@@ -277,6 +277,7 @@ Kết nối tới model được duy trì qua giới hạn thời gian phía ser
 Recording WAV ghi liên tục vào Container, header vá định kỳ (~5 s) để file luôn phát được; khi dừng, finalize và tạo Proxy phát lại.
 **Hệ quả:**
 - Recording và đồng hồ Phiên không phụ thuộc trạng thái mạng: mất mạng, mất kết nối model, hết key hay lỗi Gemini đều không dừng ghi và không tạo khoảng trống trong file; chỉ người dùng bấm Dừng hoặc lỗi thiết bị audio mới dừng Recording.
+- Ngoại lệ lỗi lưu trữ vật lý: nếu Recording không thể tiếp tục ghi bền (ví dụ đĩa đầy, lỗi ghi/flush, consumer audio bị trễ hoặc mất mẫu), app dừng capture an toàn, báo lỗi category `storage`, giữ Phiên cùng phần WAV đã ghi bền để finalize/phục hồi; không tiếp tục báo đang ghi. Ngoại lệ này không áp dụng cho lỗi mạng, model, key hoặc Gemini.
 - Force-quit giữa chừng → file phát được tới mốc ≤ 5 s trước khi chết.
 - Phiên và file Recording được tạo khi mở thiết bị capture thành công, kể cả khi offline (Live bắt đầu được khi chưa có mạng; kết nối model nối sau theo FR-22). Lỗi trước khi capture mở → dọn sạch, không để dòng Phiên hay file chỉ có header.
 

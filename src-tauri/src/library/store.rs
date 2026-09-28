@@ -74,6 +74,45 @@ pub struct CommitOutcome {
     pub proxy_error: Option<AppError>,
 }
 
+/// Atomically inserts the initial durable metadata for a Live session.
+/// `live::recording` creates and checkpoints `recording.wav` first, then calls
+/// this function; on an insert error its caller removes the just-created
+/// session directory so no header-only recording is left behind.
+pub fn create_live_session(db: &Db, id: SessionId, title: &str) -> Result<(), AppError> {
+    db.with_connection(|conn| {
+        let tx = conn.transaction()?;
+        repo::sessions::insert(
+            &tx,
+            repo::sessions::NewSession {
+                id,
+                kind: "live",
+                title,
+                source_hash: None,
+                source_name: None,
+                status: "recording",
+                recovered: false,
+                duration_sec: 0.0,
+                proxy_ext: None,
+                created_at: now_ms(),
+                updated_at: now_ms(),
+            },
+        )?;
+        tx.commit()?;
+        Ok(())
+    })
+}
+
+/// Compensates a newly inserted Live row if the dedicated Recording worker
+/// cannot be started. Existing sessions and file sessions are not affected.
+pub fn delete_live_session(db: &Db, id: SessionId) -> Result<(), AppError> {
+    db.with_connection(|conn| {
+        let tx = conn.transaction()?;
+        repo::sessions::delete_live(&tx, id)?;
+        tx.commit()?;
+        Ok(())
+    })
+}
+
 // ---------------------------------------------------------------------
 // Điểm tiêm lỗi cho test (spec Tasks: "điểm lỗi tiêm được (cfg(test)) tại
 // ghi file/rename/commit/dọn"). `thread_local` vì test chạy song song trên
@@ -1003,8 +1042,8 @@ fn remove_path_any(session_id: Option<SessionId>, path: &Path) {
 ///    lạ).
 /// 3. Với mỗi thư mục Phiên có dòng DB: nếu `proxy_ext` trỏ tới một file
 ///    không còn tồn tại, null hoá `proxy_ext` (DB tham chiếu Proxy đã mất);
-///    mọi entry khác trong thư mục đó ngoài đúng tên Proxy hiện tại (`.partial`
-///    hay tên lạ) đều bị xoá.
+///    giữ đúng tên Proxy hiện tại, đồng thời giữ `recording.wav` chỉ cho Phiên
+///    live; mọi entry lạ khác (`.partial`, file tạm) đều bị xoá.
 ///
 /// Chạy lại nhiều lần cho cùng kết quả: sau lần đầu, không còn gì để dọn nên
 /// các lần sau là no-op (spec Always: "Reconcile chạy lại nhiều lần cho cùng
@@ -1019,8 +1058,12 @@ pub fn reconcile(db: &Db, root: &Path) -> Result<(), AppError> {
         Err(err) => return Err(storage_error(&err.to_string())),
     };
 
-    let known: HashMap<SessionId, Option<String>> = db
-        .with_connection(|conn| Ok(repo::sessions::list_media_refs(conn)?.into_iter().collect()))?;
+    let known: HashMap<SessionId, (String, Option<String>)> = db.with_connection(|conn| {
+        Ok(repo::sessions::list_media_refs(conn)?
+            .into_iter()
+            .map(|(id, kind, proxy_ext)| (id, (kind, proxy_ext)))
+            .collect())
+    })?;
 
     for entry in entries {
         let entry = match entry {
@@ -1048,11 +1091,12 @@ pub fn reconcile(db: &Db, root: &Path) -> Result<(), AppError> {
         };
         match known.get(&session_id) {
             None => remove_path_any(Some(session_id), &path),
-            Some(proxy_ext) if path.is_dir() => {
+            Some((kind, proxy_ext)) if path.is_dir() => {
                 // An error reconciling one session directory is logged and
                 // the loop continues -- it never aborts the other sessions
                 // (spec Always).
-                if let Err(err) = reconcile_session_dir(db, session_id, proxy_ext.as_deref(), &path)
+                if let Err(err) =
+                    reconcile_session_dir(db, session_id, kind, proxy_ext.as_deref(), &path)
                 {
                     tracing::warn!(
                         session_id = %session_id,
@@ -1090,6 +1134,7 @@ fn find_proxy_file_ext(dir: &Path) -> Option<String> {
 fn reconcile_session_dir(
     db: &Db,
     session_id: SessionId,
+    kind: &str,
     proxy_ext: Option<&str>,
     dir: &Path,
 ) -> Result<(), AppError> {
@@ -1106,11 +1151,15 @@ fn reconcile_session_dir(
         })?;
     }
 
-    let mut keep_name = if proxy_file_exists {
-        expected_name
-    } else {
-        None
-    };
+    let mut keep_names = Vec::new();
+    if proxy_file_exists {
+        if let Some(name) = expected_name {
+            keep_names.push(name);
+        }
+    }
+    if kind == "live" && dir.join("recording.wav").is_file() {
+        keep_names.push("recording.wav".to_owned());
+    }
 
     // `proxy_ext` is NULL (never set, or a `relink_proxy` DB write that
     // failed even after its retry) but a proxy file exists on disk -- repair
@@ -1122,7 +1171,7 @@ fn reconcile_session_dir(
                 repo::sessions::set_proxy_ext(conn, session_id, Some(&found_ext), now_ms())?;
                 Ok(())
             })?;
-            keep_name = Some(format!("proxy.{found_ext}"));
+            keep_names.push(format!("proxy.{found_ext}"));
         }
     }
 
@@ -1132,10 +1181,9 @@ fn reconcile_session_dir(
         Err(err) => return Err(storage_error(&err.to_string())),
     };
     for entry in entries.flatten() {
-        let is_kept = keep_name
-            .as_deref()
-            .map(|keep| entry.file_name().to_str() == Some(keep))
-            .unwrap_or(false);
+        let is_kept = keep_names
+            .iter()
+            .any(|keep| entry.file_name().to_str() == Some(keep.as_str()));
         if !is_kept {
             remove_path_any(Some(session_id), &entry.path());
         }
@@ -2026,6 +2074,62 @@ mod tests {
 
         assert!(dir.join("proxy.flac").is_file(), "Proxy đang dùng vẫn còn");
         assert!(!dir.join("proxy-leftover.flac.partial").exists());
+    }
+
+    #[test]
+    fn reconcile_preserves_recording_only_for_live_sessions_and_removes_other_strays() {
+        let root = tempdir().unwrap();
+        let db = open_db(root.path());
+        let live_id = SessionId::new();
+        let file_id = SessionId::new();
+        db.with_connection(|conn| {
+            for (id, kind) in [(live_id, "live"), (file_id, "file")] {
+                repo::sessions::insert(
+                    conn,
+                    repo::sessions::NewSession {
+                        id,
+                        kind,
+                        title: "session",
+                        source_hash: None,
+                        source_name: None,
+                        status: if kind == "live" {
+                            "recording"
+                        } else {
+                            "complete"
+                        },
+                        recovered: false,
+                        duration_sec: 0.0,
+                        proxy_ext: None,
+                        created_at: 1,
+                        updated_at: 1,
+                    },
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        let live_dir = paths::media_dir(root.path(), live_id);
+        let file_dir = paths::media_dir(root.path(), file_id);
+        fs::create_dir_all(&live_dir).unwrap();
+        fs::create_dir_all(&file_dir).unwrap();
+        fs::write(live_dir.join("recording.wav"), b"live wav bytes").unwrap();
+        fs::write(file_dir.join("recording.wav"), b"stray file-session data").unwrap();
+        fs::write(live_dir.join("unrelated.tmp"), b"stray").unwrap();
+
+        reconcile(&db, root.path()).unwrap();
+
+        assert!(live_dir.join("recording.wav").is_file());
+        assert!(!live_dir.join("unrelated.tmp").exists());
+        assert!(!file_dir.join("recording.wav").exists());
+        db.with_connection(|conn| {
+            assert_eq!(
+                repo::sessions::get(conn, live_id)?.unwrap().status,
+                "recording"
+            );
+            Ok(())
+        })
+        .unwrap();
     }
 
     #[test]

@@ -52,6 +52,7 @@ symphonia = { version = "=0.6.1", default-features = false, features = ["aac", "
 rubato = "=5.0.0"
 flacenc = "=0.5.1"
 hound = "=3.5.1"
+chrono = "=0.4.45"
 sha2 = "=0.10.9"
 base64 = "=0.22.1"
 

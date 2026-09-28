@@ -30,6 +30,11 @@ pub fn proxy_path(root: &Path, session_id: SessionId, ext: &str) -> PathBuf {
     media_dir(root, session_id).join(format!("proxy.{ext}"))
 }
 
+/// Đường dẫn Recording WAV cố định của một Phiên live.
+pub fn recording_path(root: &Path, session_id: SessionId) -> PathBuf {
+    media_dir(root, session_id).join("recording.wav")
+}
+
 /// Thư mục gốc chứa staging của mọi job: `<root>/media/.staging`.
 pub fn staging_root(root: &Path) -> PathBuf {
     media_root(root).join(".staging")
@@ -65,6 +70,16 @@ mod tests {
         let id = SessionId::new();
         let path = proxy_path(root, id, "flac");
         assert_eq!(path, media_dir(root, id).join("proxy.flac"));
+    }
+
+    #[test]
+    fn recording_path_is_a_fixed_name_under_the_session_media_dir() {
+        let root = Path::new("/data");
+        let id = SessionId::new();
+        assert_eq!(
+            recording_path(root, id),
+            media_dir(root, id).join("recording.wav")
+        );
     }
 
     #[test]

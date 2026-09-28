@@ -9,9 +9,8 @@ use crate::core::id::{SessionId, TagId};
 
 /// Tham số chèn một Phiên mới. `kind`/`status` là chuỗi thô khớp CHECK ở
 /// migration (`"file"`/`"live"`, `"recording"`/`"finalizing"`/`"complete"`) —
-/// story này chỉ bao giờ truyền `kind = "file"`, `status = "complete"`
-/// (`library::store::commit_file_session`); Phiên live (Epic 4) sẽ truyền
-/// biến thể còn lại qua cùng hàm này sau.
+/// Phiên file và live đều đi qua cùng repo helper; các ràng buộc nghiệp vụ
+/// (bao gồm trạng thái hợp lệ theo từng loại) thuộc về `library::store`.
 #[derive(Debug, Clone, Copy)]
 pub struct NewSession<'a> {
     pub id: SessionId,
@@ -163,6 +162,15 @@ pub fn delete(conn: &Connection, id: SessionId) -> rusqlite::Result<usize> {
     )
 }
 
+/// Xoá một Phiên live khi khởi tạo Recording thất bại trước khi trả handle.
+/// Điều kiện `kind = 'live'` giữ cleanup khỏi chạm nhầm Phiên file.
+pub fn delete_live(conn: &Connection, id: SessionId) -> rusqlite::Result<usize> {
+    conn.execute(
+        "DELETE FROM sessions WHERE id = ?1 AND kind = 'live'",
+        params![id.to_string()],
+    )
+}
+
 /// Đếm tổng số dòng `sessions` (story 3.4, spec Always: "số Phiên = số dòng
 /// `sessions`") -- dùng bởi `library::store::storage_stats`.
 pub fn count(conn: &Connection) -> rusqlite::Result<i64> {
@@ -270,20 +278,24 @@ pub fn list_for_home(conn: &Connection) -> rusqlite::Result<Vec<SessionListRow>>
     Ok(rows)
 }
 
-/// Đọc `(id, proxy_ext)` của mọi Phiên — dùng bởi `library::store::reconcile`
-/// để biết thư mục `media/<id>` nào có dòng DB tham chiếu và Proxy nào đang
+/// Đọc `(id, kind, proxy_ext)` của mọi Phiên — dùng bởi
+/// `library::store::reconcile` để biết thư mục `media/<id>` nào có dòng DB
+/// tham chiếu, loại Phiên nào được phép giữ Recording, và Proxy nào đang
 /// được tham chiếu, không cần toàn bộ cột khác của [`SessionRow`].
-pub fn list_media_refs(conn: &Connection) -> rusqlite::Result<Vec<(SessionId, Option<String>)>> {
-    let mut stmt = conn.prepare("SELECT id, proxy_ext FROM sessions")?;
+pub fn list_media_refs(
+    conn: &Connection,
+) -> rusqlite::Result<Vec<(SessionId, String, Option<String>)>> {
+    let mut stmt = conn.prepare("SELECT id, kind, proxy_ext FROM sessions")?;
     let rows = stmt.query_map([], |row| {
         let id: String = row.get(0)?;
-        let proxy_ext: Option<String> = row.get(1)?;
-        Ok((id, proxy_ext))
+        let kind: String = row.get(1)?;
+        let proxy_ext: Option<String> = row.get(2)?;
+        Ok((id, kind, proxy_ext))
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (id, proxy_ext) = row?;
-        out.push((parse_session_id(&id)?, proxy_ext));
+        let (id, kind, proxy_ext) = row?;
+        out.push((parse_session_id(&id)?, kind, proxy_ext));
     }
     Ok(out)
 }
@@ -705,9 +717,12 @@ mod tests {
         .unwrap();
 
         let mut refs = list_media_refs(&conn).unwrap();
-        refs.sort_by_key(|(id, _)| id.to_string());
-        let mut expected = vec![(a, Some("flac".to_string())), (b, None)];
-        expected.sort_by_key(|(id, _)| id.to_string());
+        refs.sort_by_key(|(id, _, _)| id.to_string());
+        let mut expected = vec![
+            (a, "file".to_string(), Some("flac".to_string())),
+            (b, "file".to_string(), None),
+        ];
+        expected.sort_by_key(|(id, _, _)| id.to_string());
         assert_eq!(refs, expected);
     }
 }

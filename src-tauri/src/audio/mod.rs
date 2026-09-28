@@ -284,6 +284,45 @@ impl CaptureController {
             .clone()
     }
 
+    /// Stops capture and releases every opened device stream. Callbacks from
+    /// the released generation are ignored because the pipeline has no active
+    /// inputs when this method returns.
+    pub fn stop_capture(&self) {
+        let _switch = self
+            .inner
+            .source_switch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let opened = {
+            let mut opened = self
+                .inner
+                .opened
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::mem::take(&mut *opened)
+        };
+        self.inner
+            .failed_inputs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        self.inner
+            .pipeline
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .deactivate();
+        *self
+            .inner
+            .active_source
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+
+        // Drop native streams after clearing their generation from the
+        // pipeline so callbacks racing stream teardown cannot publish audio.
+        drop(opened);
+    }
+
     /// Prepare and start the full replacement first. If opening or starting
     /// any part fails, dropping the candidate leaves the current streams and
     /// pipeline generation intact.
@@ -604,6 +643,16 @@ impl AudioPipeline {
         }
         self.active_inputs = active_inputs;
         self.source = Some(source);
+    }
+
+    fn deactivate(&mut self) {
+        self.source = None;
+        self.active_inputs.clear();
+        self.pending_output.clear();
+        self.pending_errors.clear();
+        for input in &mut self.inputs {
+            input.samples.clear();
+        }
     }
 
     fn preserve_active_samples(&mut self) {
@@ -1225,6 +1274,34 @@ mod tests {
         assert_eq!(backend.drop_count.load(Ordering::SeqCst), 0);
         drop(controller);
         assert_eq!(backend.drop_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn stop_capture_releases_every_stream_and_ignores_old_generation_audio() {
+        let backend = Arc::new(FakeBackend::default());
+        let controller = CaptureController::new(backend.clone());
+        controller.set_source("system").unwrap();
+        assert_eq!(controller.active_source().as_deref(), Some("system"));
+
+        controller.stop_capture();
+
+        assert!(controller.active_source().is_none());
+        assert_eq!(backend.drop_count.load(Ordering::SeqCst), 1);
+        let mut pipeline = controller
+            .inner
+            .pipeline
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(pipeline.source.is_none());
+        assert!(pipeline.active_inputs.is_empty());
+        pipeline.ingest(audio_block(1, InputSide::System, 16_000, 1, 0.5, 1_600));
+        assert!(pipeline.inputs[0].samples.is_empty());
+        assert!(pipeline.tick().is_none());
+        drop(pipeline);
+
+        controller.set_source("system").unwrap();
+        assert_eq!(controller.active_source().as_deref(), Some("system"));
+        assert_eq!(backend.start_count.load(Ordering::SeqCst), 2);
     }
 
     #[test]
