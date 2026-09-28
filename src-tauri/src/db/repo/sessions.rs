@@ -167,6 +167,25 @@ pub fn update_live_progress(
     Ok(changed == 1)
 }
 
+/// Atomically marks a Live session complete and records its final duration
+/// and optional published Proxy. The row must already be `finalizing`, so a
+/// failed finalization leaves the durable recovery state untouched.
+pub fn finalize_live(
+    conn: &Connection,
+    id: SessionId,
+    duration_sec: f64,
+    proxy_ext: Option<&str>,
+    updated_at: i64,
+) -> rusqlite::Result<bool> {
+    let changed = conn.execute(
+        "UPDATE sessions SET duration_sec = MAX(duration_sec, ?1), proxy_ext = ?2, \
+             status = 'complete', updated_at = ?3 \
+         WHERE id = ?4 AND kind = 'live' AND status = 'finalizing'",
+        params![duration_sec.max(0.0), proxy_ext, updated_at, id.to_string()],
+    )?;
+    Ok(changed == 1)
+}
+
 /// Xoá một Phiên (story 3.1, spec Approach). FK `ON DELETE CASCADE` (migration)
 /// xoá luôn mọi `transcripts`/`segments` của nó -- `Db::open` đã bật
 /// `foreign_keys` nên việc này chạy trong đúng lệnh `DELETE` này, không cần
@@ -395,6 +414,33 @@ mod tests {
         insert(&conn, sample(SessionId::new())).unwrap();
         let err = insert(&conn, sample(SessionId::new())).unwrap_err();
         assert!(err.to_string().to_lowercase().contains("unique"));
+    }
+
+    #[test]
+    fn finalize_live_updates_completion_fields_only_from_finalizing_state() {
+        let conn = open_migrated();
+        let id = SessionId::new();
+        insert(
+            &conn,
+            NewSession {
+                kind: "live",
+                status: "finalizing",
+                source_hash: None,
+                source_name: None,
+                proxy_ext: None,
+                ..sample(id)
+            },
+        )
+        .unwrap();
+
+        assert!(finalize_live(&conn, id, 20.0, Some("flac"), 2_000).unwrap());
+        let row = get(&conn, id).unwrap().unwrap();
+        assert_eq!(row.status, "complete");
+        assert_eq!(row.proxy_ext.as_deref(), Some("flac"));
+        assert_eq!(row.duration_sec, 20.0);
+        assert_eq!(row.updated_at, 2_000);
+        assert!(!finalize_live(&conn, id, 25.0, None, 3_000).unwrap());
+        assert_eq!(get(&conn, id).unwrap().unwrap().duration_sec, 20.0);
     }
 
     #[test]

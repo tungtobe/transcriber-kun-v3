@@ -18,6 +18,8 @@ const mocks = vi.hoisted(() => ({
   liveOpenPermissionSettings: vi.fn(),
   keysLoad: vi.fn(),
   tagsLoad: vi.fn(),
+  notesFlush: vi.fn((_sessionId: string) => Promise.resolve(true)),
+  notesRetry: vi.fn((_sessionId: string) => Promise.resolve(true)),
 }));
 
 type FakeChannel<T> = { onmessage: (event: T) => void };
@@ -57,10 +59,10 @@ vi.mock('../lib/stores/notes.svelte', () => ({
   MAX_NOTE_BODY_LENGTH: 10_000,
   notesStore: {
     load: vi.fn(),
-    flush: vi.fn(() => Promise.resolve(true)),
+    flush: (sessionId: string) => mocks.notesFlush(sessionId),
     view: () => ({ body: '', status: 'idle', savedAtMs: null, loadError: false }),
     setBody: vi.fn(),
-    retry: vi.fn(),
+    retry: (sessionId: string) => mocks.notesRetry(sessionId),
   },
 }));
 
@@ -111,12 +113,14 @@ beforeEach(() => {
     backendSessionId = 'session-1';
     return Promise.resolve({ status: 'ok', data: backendSessionId });
   });
-  mocks.liveStop.mockReset().mockResolvedValue({ status: 'ok', data: null });
+  mocks.liveStop.mockReset().mockResolvedValue({ status: 'ok', data: 'session-1' });
   mocks.liveContinueRecordingOnly.mockReset().mockResolvedValue({ status: 'ok', data: null });
   mocks.liveSetSource.mockReset().mockResolvedValue({ status: 'ok', data: null });
   mocks.liveOpenPermissionSettings.mockReset().mockResolvedValue({ status: 'ok', data: null });
   mocks.keysLoad.mockReset().mockResolvedValue(undefined);
   mocks.tagsLoad.mockReset().mockResolvedValue(undefined);
+  mocks.notesFlush.mockReset().mockResolvedValue(true);
+  mocks.notesRetry.mockReset().mockResolvedValue(true);
 });
 
 describe('Live setup and status UI', () => {
@@ -218,6 +222,63 @@ describe('Live remount and shortcut', () => {
 });
 
 describe('Live failure handling', () => {
+  it('flushes notes before stopping and opens the returned session ID', async () => {
+    backendSessionId = 'session-1';
+    render(Live);
+    const stop = await screen.findByRole('button', { name: 'Stop recording' });
+
+    await fireEvent.click(stop);
+
+    await waitFor(() => expect(window.location.pathname).toBe('/session/session-1'));
+    expect(mocks.notesFlush).toHaveBeenCalledWith('session-1');
+    expect(mocks.notesFlush.mock.invocationCallOrder[0]).toBeLessThan(mocks.liveStop.mock.invocationCallOrder[0]);
+    expect(mocks.liveStop).toHaveBeenCalledTimes(1);
+  });
+
+  it('shows the saving overlay while recording and Proxy finalization are pending', async () => {
+    backendSessionId = 'session-1';
+    let finishStop!: (value: { status: 'ok'; data: string }) => void;
+    mocks.liveStop.mockImplementationOnce(() => new Promise((resolve) => { finishStop = resolve; }));
+    render(Live);
+
+    await fireEvent.click(await screen.findByRole('button', { name: 'Stop recording' }));
+    expect(await screen.findByText('Saving session…')).toBeTruthy();
+    expect(screen.getByText('Finalizing the recording and creating the Proxy')).toBeTruthy();
+
+    finishStop({ status: 'ok', data: 'session-1' });
+    await waitFor(() => expect(window.location.pathname).toBe('/session/session-1'));
+  });
+
+  it('keeps the Live screen and skips stop when notes fail to flush, then allows retry', async () => {
+    backendSessionId = 'session-1';
+    mocks.notesFlush.mockResolvedValue(false);
+    render(Live);
+    await fireEvent.click(await screen.findByRole('button', { name: 'Stop recording' }));
+
+    expect(await screen.findByText('Notes could not be saved. Retry before opening the session.')).toBeTruthy();
+    expect(mocks.liveStop).not.toHaveBeenCalled();
+    expect(window.location.pathname).toBe('/live');
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Retry save and continue' }));
+    await waitFor(() => expect(window.location.pathname).toBe('/session/session-1'));
+    expect(mocks.notesRetry).toHaveBeenCalledWith('session-1');
+    expect(mocks.liveStop).toHaveBeenCalledTimes(1);
+  });
+
+  it('flushes notes and opens a session finalized by an automatic device stop', async () => {
+    backendSessionId = 'session-1';
+    render(Live);
+    await waitFor(() => expect(channels).toHaveLength(1));
+
+    channels[0].onmessage({
+      type: 'final', seq: 1, sessionId: 'session-1', transcriptId: 'transcript-1', durationSec: 1,
+    });
+
+    await waitFor(() => expect(window.location.pathname).toBe('/session/session-1'));
+    expect(mocks.notesFlush).toHaveBeenCalledWith('session-1');
+    expect(mocks.liveStop).not.toHaveBeenCalled();
+  });
+
   it('shows reconnect elapsed time while keeping the recording timer active', async () => {
     backendSessionId = 'session-1';
     vi.useFakeTimers();

@@ -33,10 +33,10 @@ export const commands = {
 	 */
 	liveStart: (source: string, language: TranscribeLanguage, locale: string, tagIds: string[]) => typedError<string, AppError>(__TAURI_INVOKE("live_start", { source, language, locale, tagIds })),
 	/**
-	 *  Stop capture, drain the old gateway generation, flush the last transcript
-	 *  text and leave the session at the `finalizing` state for Story 4.9.
+	 *  Stop capture, flush the final transcript and WAV, then commit the Live
+	 *  session as complete before returning its ID.
 	 */
-	liveStop: () => typedError<null, AppError>(__TAURI_INVOKE("live_stop")),
+	liveStop: () => typedError<string, AppError>(__TAURI_INVOKE("live_stop")),
 	/**
 	 *  Keep WAV capture running after five consecutive Gemini Live setup rejections.
 	 *  This records a session-scoped choice in the LiveSession actor and never

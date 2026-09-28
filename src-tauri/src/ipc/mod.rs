@@ -244,11 +244,11 @@ async fn live_start(
     track_ipc_error(&state.db, result).await
 }
 
-/// Stop capture, drain the old gateway generation, flush the last transcript
-/// text and leave the session at the `finalizing` state for Story 4.9.
+/// Stop capture, flush the final transcript and WAV, then commit the Live
+/// session as complete before returning its ID.
 #[tauri::command]
 #[specta::specta]
-async fn live_stop(state: tauri::State<'_, AppState>) -> Result<(), AppError> {
+async fn live_stop(state: tauri::State<'_, AppState>) -> Result<SessionId, AppError> {
     let result = match state.live.clone() {
         Ok(live) => live.stop().await,
         Err(error) => Err(error),
@@ -261,9 +261,7 @@ async fn live_stop(state: tauri::State<'_, AppState>) -> Result<(), AppError> {
 /// starts another Gemini connection for the current session.
 #[tauri::command]
 #[specta::specta]
-async fn live_continue_recording_only(
-    state: tauri::State<'_, AppState>,
-) -> Result<(), AppError> {
+async fn live_continue_recording_only(state: tauri::State<'_, AppState>) -> Result<(), AppError> {
     let result = match state.live.clone() {
         Ok(live) => live.continue_recording_only().await,
         Err(error) => Err(error),

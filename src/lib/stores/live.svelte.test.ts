@@ -54,7 +54,7 @@ beforeEach(() => {
     microphonePermission: 'notDetermined', systemPermission: 'unknown',
   } });
   mocks.liveStart.mockReset().mockResolvedValue({ status: 'ok', data: 'session-1' });
-  mocks.liveStop.mockReset().mockResolvedValue({ status: 'ok', data: null });
+  mocks.liveStop.mockReset().mockResolvedValue({ status: 'ok', data: 'session-1' });
   mocks.liveContinueRecordingOnly.mockReset().mockResolvedValue({ status: 'ok', data: null });
   mocks.liveSetSource.mockReset().mockResolvedValue({ status: 'ok', data: null });
 });
@@ -112,6 +112,21 @@ describe('liveStore', () => {
     await Promise.resolve();
     await Promise.resolve();
     expect(mocks.liveSubscribe).toHaveBeenCalledTimes(3);
+  });
+
+  it('returns the stopped session ID and records automatic final events', async () => {
+    const { createLiveStore } = await import('./live.svelte');
+    const store = createLiveStore();
+    await store.subscribe();
+    const channel = channels[0];
+    channel.onmessage({ type: 'ready', seq: 0, snapshot: snapshot() });
+
+    expect(await store.stop()).toEqual({ sessionId: 'session-1', error: null });
+    channel.onmessage({
+      type: 'final', seq: 1, sessionId: 'session-1', transcriptId: 'transcript-1', durationSec: 2,
+    });
+    expect(store.finalizedSessionId).toBe('session-1');
+    expect(store.snapshot.recording).toBe('stopped');
   });
 
   it('keeps permission denial scoped to the source that failed until the user rechecks it', async () => {

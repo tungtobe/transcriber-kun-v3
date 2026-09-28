@@ -528,19 +528,17 @@ describe('Session route', () => {
     expect(screen.getByText('Không có audio · Chọn lại file nguồn')).toBeTruthy();
   });
 
-  it('shows the live-unsupported message and keeps the Transcript unchanged', async () => {
+  it('shows the no-audio state without offering source relinking for Live sessions', async () => {
     mocks.librarySessionGet.mockResolvedValue({
       status: 'ok',
       data: { kind: 'session', sessionId: 's1', title: 'cuộc họp', durationSec: 120, status: 'complete', partial: false, transcriptId: 't1' },
     });
     mocks.librarySessionDetail.mockResolvedValue({ status: 'ok', data: detail({ proxyPath: null, kind: 'live' }) });
-    mocks.libraryProxyRelink.mockResolvedValue({ status: 'ok', data: 'liveUnsupported' });
     render(Session, { routeParams: { id: 's1' } });
 
-    const relinkButton = await screen.findByRole('button', { name: 'Chọn lại file nguồn' });
-    await fireEvent.click(relinkButton);
-
-    expect(await screen.findByText('Phiên live này chưa có Recording để tái tạo.')).toBeTruthy();
+    expect(await screen.findByText('Phiên này không có audio.')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Chọn lại file nguồn' })).toBeNull();
+    expect(mocks.libraryProxyRelink).not.toHaveBeenCalled();
     expect(mocks.librarySessionDetail).toHaveBeenCalledTimes(1);
   });
 

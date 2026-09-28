@@ -48,7 +48,7 @@
   }
 
   async function handleRetry(): Promise<void> {
-    await notesStore.retry(sessionId);
+    await retry();
   }
 
   async function handleReload(): Promise<void> {
@@ -59,6 +59,12 @@
    * và, sau này, Live ("lưu bền trước khi Phiên finalize", spec Code Map). */
   export async function flush(): Promise<boolean> {
     return notesStore.flush(sessionId);
+  }
+
+  /** Retries a previously failed save so Live can wait for its acknowledgement
+   * before continuing the stop flow. */
+  export async function retry(): Promise<boolean> {
+    return notesStore.retry(sessionId);
   }
 </script>
 

@@ -599,6 +599,7 @@
       bind:duration
       bind:playing
       proxyPath={detail.proxyPath}
+      allowRelink={detail.kind !== 'live'}
       onRelinkRequest={handleRelinkRequest}
       {relinking}
       {relinkMessage}

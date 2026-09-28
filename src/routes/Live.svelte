@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
-  import { link } from '@keenmate/svelte-spa-router';
+  import { link, push } from '@keenmate/svelte-spa-router';
   import NotesPanel from '../components/NotesPanel.svelte';
   import TagPicker, {
     type TagPickerAction,
@@ -26,12 +26,19 @@
   let tagButton = $state<HTMLButtonElement | null>(null);
   let startPending = $state(false);
   let stopPending = $state(false);
+  let notesFlushError = $state(false);
+  let pendingFinalSessionId = $state<string | null>(null);
+  let finalNavigationAttemptId: string | null = null;
   let recordingOnlyPending = $state(false);
   let sourcePending = $state(false);
   let autoScroll = $state(true);
   let elapsedSeconds = $state(0);
   let wallClockMs = $state(Date.now());
   let transcriptEl = $state<HTMLDivElement | null>(null);
+  let notesPanelRef = $state<{
+    flush: () => Promise<boolean>;
+    retry: () => Promise<boolean>;
+  } | null>(null);
   let previousScrollTop = 0;
   let focusListener: (() => void) | null = null;
 
@@ -153,6 +160,7 @@
     autoScroll = true;
     const error = await liveStore.start(sourceValue, language, i18n.locale, selectedTagIds);
     startPending = false;
+    if (!error) notesFlushError = false;
     if (error?.category === 'permission') {
       await liveStore.loadSources(true);
     }
@@ -161,9 +169,70 @@
   async function stop(): Promise<void> {
     if (!isRunning || stopPending) return;
     stopPending = true;
-    await liveStore.stop();
-    stopPending = false;
+    notesFlushError = false;
+    try {
+      const notesSaved = await (notesPanelRef?.flush() ?? Promise.resolve(true));
+      if (!notesSaved) {
+        notesFlushError = true;
+        return;
+      }
+
+      const result = await liveStore.stop();
+      if (result.error || !result.sessionId) return;
+      finalNavigationAttemptId = result.sessionId;
+      pendingFinalSessionId = null;
+      await push(`/session/${result.sessionId}`);
+    } finally {
+      stopPending = false;
+    }
   }
+
+  async function finishAutomaticStop(sessionId: string): Promise<void> {
+    if (finalNavigationAttemptId === sessionId || stopPending) return;
+    finalNavigationAttemptId = sessionId;
+    stopPending = true;
+    notesFlushError = false;
+    try {
+      const notesSaved = await (notesPanelRef?.flush() ?? Promise.resolve(true));
+      if (!notesSaved) {
+        pendingFinalSessionId = sessionId;
+        notesFlushError = true;
+        return;
+      }
+      await push(`/session/${sessionId}`);
+    } finally {
+      stopPending = false;
+    }
+  }
+
+  async function retryNotesAndContinue(): Promise<void> {
+    if (stopPending) return;
+    stopPending = true;
+    try {
+      const saved = await (notesPanelRef?.retry() ?? Promise.resolve(true));
+      if (!saved) return;
+      notesFlushError = false;
+      if (pendingFinalSessionId) {
+        const sessionId = pendingFinalSessionId;
+        pendingFinalSessionId = null;
+        await push(`/session/${sessionId}`);
+      } else {
+        if (!isRunning) return;
+        const result = await liveStore.stop();
+        if (result.error || !result.sessionId) return;
+        finalNavigationAttemptId = result.sessionId;
+        await push(`/session/${result.sessionId}`);
+      }
+    } finally {
+      stopPending = false;
+    }
+  }
+
+  $effect(() => {
+    const sessionId = liveStore.finalizedSessionId;
+    if (!sessionId || stopPending || finalNavigationAttemptId === sessionId) return;
+    void finishAutomaticStop(sessionId);
+  });
 
   async function continueRecordingOnly(): Promise<void> {
     if (recordingOnlyPending) return;
@@ -288,7 +357,7 @@
   <title>{i18n.t('live.header.title')} · trans-kun</title>
 </svelte:head>
 
-<section class="live-screen" aria-labelledby="live-title" data-ad-slot-hidden="true">
+<section class="live-screen" aria-labelledby="live-title" aria-busy={stopPending} data-ad-slot-hidden="true">
   <div class="live-heading">
     <div>
       <p class="route-kicker">{i18n.t('live.header.kicker')}</p>
@@ -352,6 +421,16 @@
         <strong>{i18n.t('live.recordingOnly.title')}</strong>
         <p>{i18n.t('live.recordingOnly.description')}</p>
       </div>
+    </div>
+  {/if}
+
+  {#if notesFlushError}
+    <div class="live-error notes-flush-error" role="alert">
+      <AlertTriangleIcon size={18} strokeWidth={1.75} aria-hidden="true" />
+      <div><p>{i18n.t('live.notes.saveError')}</p></div>
+      <button class="button button-secondary" type="button" disabled={stopPending} onclick={() => void retryNotesAndContinue()}>
+        {i18n.t('live.notes.retryAndContinue')}
+      </button>
     </div>
   {/if}
 
@@ -582,15 +661,30 @@
       {#if liveStore.snapshot.sessionId}
         <details class="notes-card" open>
           <summary>{i18n.t('live.notes.title')}</summary>
-          <div class="notes-content"><NotesPanel sessionId={liveStore.snapshot.sessionId} /></div>
+          <div class="notes-content"><NotesPanel bind:this={notesPanelRef} sessionId={liveStore.snapshot.sessionId} /></div>
         </details>
       {/if}
+    </div>
+  {/if}
+
+  {#if stopPending}
+    <div class="save-overlay" role="status" aria-live="polite">
+      <div class="save-overlay-card">
+        <span class="save-spinner"><RefreshCwIcon size={20} strokeWidth={1.75} aria-hidden="true" /></span>
+        <span>{i18n.t('live.overlay.saving')}<small>{i18n.t('live.overlay.steps')}</small></span>
+      </div>
     </div>
   {/if}
 </section>
 
 <style>
   .live-screen { max-width: 1120px; margin: 0 auto; padding: var(--space-8); }
+  .save-overlay { position:fixed; inset:0; z-index:1000; display:grid; place-items:center; padding:var(--space-4); background:rgb(15 23 42 / 38%); }
+  .save-overlay-card { display:flex; align-items:center; gap:var(--space-3); padding:var(--space-4) var(--space-5); border:1px solid var(--color-border); border-radius:var(--radius-lg); background:var(--color-surface); color:var(--color-text); box-shadow:0 10px 32px rgb(17 24 39 / 12%); font-weight:600; }
+  .save-spinner { display:inline-flex; color:var(--color-accent); animation:save-spin 1s linear infinite; }
+  .save-overlay-card small { display:block; margin-top:var(--space-1); color:var(--color-text-muted); font-size:var(--text-help-size); font-weight:400; }
+  .notes-flush-error { align-items:center; }
+  .notes-flush-error p { margin:0; }
   .live-heading { display:flex; align-items:flex-start; justify-content:space-between; gap:var(--space-4); margin-bottom:var(--space-6); }
   .route-kicker { margin:0 0 var(--space-1); color:var(--color-text-muted); font-size:var(--text-help-size); font-weight:600; letter-spacing:.04em; text-transform:uppercase; }
   h1, h2, p { margin-top:0; }
@@ -670,8 +764,9 @@
   .notes-card:not([open]) { align-self:start; }
   .mono { font-family:var(--font-mono); }
   @keyframes caret-blink { 50% { opacity:0; } }
+  @keyframes save-spin { to { transform:rotate(360deg); } }
   @keyframes recording-pulse { 50% { opacity:.3; transform:scale(1.5); } }
-  @media (prefers-reduced-motion: reduce) { .live-caret, .status-recording .status-dot { animation:none; } .transcript-list { scroll-behavior:auto; } }
+  @media (prefers-reduced-motion: reduce) { .live-caret, .status-recording .status-dot, .save-spinner { animation:none; } .transcript-list { scroll-behavior:auto; } }
   @media (max-width: 900px) { .live-layout { grid-template-columns:1fr; } .notes-card { min-height:280px; } }
   @media (max-width: 650px) { .live-screen { padding:var(--space-4); } .setup-grid, .source-options { grid-template-columns:1fr; } .source-card { min-height:84px; } .live-heading { flex-direction:column; } .setup-actions { align-items:flex-start; flex-direction:column; } }
 </style>

@@ -191,6 +191,68 @@ pub fn append_live_batch(
     })
 }
 
+/// Finalizes the durable metadata for a stopped Live recording. Proxy
+/// generation and publication are best-effort: a failure commits the session
+/// with `proxy_ext = NULL`, preserving the WAV and transcript. The final
+/// session update is one transaction and only changes a `finalizing` Live row
+/// to `complete`; if it fails, the published files and recovery row remain.
+#[derive(Debug)]
+pub struct LiveFinalizeOutcome {
+    pub session_id: SessionId,
+    pub proxy_error: Option<AppError>,
+}
+
+pub fn finalize_live_session(
+    db: &Db,
+    root: &Path,
+    session_id: SessionId,
+    recording_path: &Path,
+    duration_sec: f64,
+) -> Result<LiveFinalizeOutcome, AppError> {
+    let job_id = JobId::new();
+    let staging_dir = paths::staging_dir(root, job_id);
+    let (proxy_ext, proxy_error) = match media::create_proxy(&staging_dir, recording_path) {
+        Ok(proxy) => match publish_proxy(root, session_id, &proxy.path) {
+            Ok(ext) => (Some(ext), None),
+            Err(error) => {
+                remove_media_dir_if_empty(root, session_id);
+                (None, Some(error))
+            }
+        },
+        Err(error) => (None, Some(error)),
+    };
+
+    if let Err(error) = discard_staging(root, job_id) {
+        tracing::warn!(session_id = %session_id, error = %error, "could not clean Live proxy staging");
+    }
+
+    db.with_connection(|conn| {
+        let tx = conn.transaction()?;
+        if !repo::sessions::finalize_live(
+            &tx,
+            session_id,
+            duration_sec,
+            proxy_ext.as_deref(),
+            now_ms(),
+        )? {
+            return Err(storage_error("Live session is not in a finalizing state"));
+        }
+
+        #[cfg(test)]
+        if fault::should_fail(fault::Point::Commit) {
+            return Err(storage_error("injected: commit failure"));
+        }
+
+        tx.commit()?;
+        Ok(())
+    })?;
+
+    Ok(LiveFinalizeOutcome {
+        session_id,
+        proxy_error,
+    })
+}
+
 /// Compensates a newly inserted Live row if the dedicated Recording worker
 /// cannot be started. Existing sessions and file sessions are not affected.
 pub fn delete_live_session(db: &Db, id: SessionId) -> Result<(), AppError> {
@@ -1322,6 +1384,114 @@ mod tests {
             .with_connection(|conn| Ok(repo::sessions::get(conn, session_id)?))
             .unwrap();
         assert!(session.is_none());
+    }
+
+    fn seed_finalizing_live(root: &Path, db: &Db) -> (SessionId, std::path::PathBuf) {
+        let session_id = SessionId::new();
+        create_live_session(db, session_id, "Live test").unwrap();
+        let transcript_id = create_live_transcript(db, session_id, "live-test", None).unwrap();
+        append_live_batch(
+            db,
+            session_id,
+            transcript_id,
+            &[text_segment(0.0, 0.5, "final transcript")],
+            1.0,
+            "finalizing",
+        )
+        .unwrap();
+
+        let recording_path = paths::recording_path(root, session_id);
+        fs::create_dir_all(recording_path.parent().unwrap()).unwrap();
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&recording_path, spec).unwrap();
+        for sample in 0..16_000 {
+            writer.write_sample((sample % 100) as i16).unwrap();
+        }
+        writer.finalize().unwrap();
+        (session_id, recording_path)
+    }
+
+    #[test]
+    fn finalize_live_publishes_proxy_and_atomically_marks_session_complete() {
+        let root = tempdir().unwrap();
+        let db = open_db(root.path());
+        let (session_id, recording_path) = seed_finalizing_live(root.path(), &db);
+
+        let outcome =
+            finalize_live_session(&db, root.path(), session_id, &recording_path, 2.0).unwrap();
+
+        assert_eq!(outcome.session_id, session_id);
+        assert!(outcome.proxy_error.is_none());
+        assert!(paths::proxy_path(root.path(), session_id, "flac").is_file());
+        let row = db
+            .with_connection(|conn| Ok(repo::sessions::get(conn, session_id)?.unwrap()))
+            .unwrap();
+        assert_eq!(row.status, "complete");
+        assert_eq!(row.proxy_ext.as_deref(), Some("flac"));
+        assert!((row.duration_sec - 2.0).abs() < f64::EPSILON);
+        assert!(recording_path.is_file());
+    }
+
+    #[test]
+    fn finalize_live_proxy_failure_keeps_wav_and_commits_complete_without_proxy() {
+        let root = tempdir().unwrap();
+        let db = open_db(root.path());
+        let (session_id, recording_path) = seed_finalizing_live(root.path(), &db);
+        fault::set(Some(fault::Point::PublishWrite));
+
+        let outcome =
+            finalize_live_session(&db, root.path(), session_id, &recording_path, 1.0).unwrap();
+        fault::set(None);
+
+        assert!(outcome.proxy_error.is_some());
+        assert!(recording_path.is_file());
+        let row = db
+            .with_connection(|conn| Ok(repo::sessions::get(conn, session_id)?.unwrap()))
+            .unwrap();
+        assert_eq!(row.status, "complete");
+        assert_eq!(row.proxy_ext, None);
+        assert!(get_detail(&db, root.path(), session_id)
+            .unwrap()
+            .unwrap()
+            .proxy_path
+            .is_none());
+        assert!(staging_root_is_empty(root.path()));
+    }
+
+    #[test]
+    fn finalize_live_database_failure_leaves_recovery_row_wav_and_published_proxy() {
+        let root = tempdir().unwrap();
+        let db = open_db(root.path());
+        let (session_id, recording_path) = seed_finalizing_live(root.path(), &db);
+        fault::set(Some(fault::Point::Commit));
+
+        let error =
+            finalize_live_session(&db, root.path(), session_id, &recording_path, 2.0).unwrap_err();
+        fault::set(None);
+
+        assert_eq!(error.code, Code::Storage);
+        assert!(recording_path.is_file());
+        assert!(paths::proxy_path(root.path(), session_id, "flac").is_file());
+        let row = db
+            .with_connection(|conn| Ok(repo::sessions::get(conn, session_id)?.unwrap()))
+            .unwrap();
+        assert_eq!(row.status, "finalizing");
+        assert_eq!(row.proxy_ext, None);
+        assert!((row.duration_sec - 1.0).abs() < f64::EPSILON);
+        let segments = db
+            .with_connection(|conn| {
+                let transcript_id = repo::transcripts::primary_for_session(conn, session_id)?
+                    .expect("recoverable Live row retains its transcript");
+                Ok(repo::segments::list_for_transcript(conn, transcript_id)?)
+            })
+            .unwrap();
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].text, "final transcript");
     }
 
     fn text_segment(start: f64, end: f64, text: &str) -> SegmentDraft {

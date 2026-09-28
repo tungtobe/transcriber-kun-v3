@@ -37,6 +37,7 @@ const UNAVAILABLE_ERROR: AppError = {
 
 export function createLiveStore() {
   let snapshot = $state<LiveSnapshot>({ ...EMPTY_SNAPSHOT });
+  let finalizedSessionId = $state<string | null>(null);
   let sources = $state<LiveSources | null>(null);
   let sourceStatus = $state<'idle' | 'loading' | 'ready' | 'error'>('idle');
   let sourceError = $state<AppError | null>(null);
@@ -57,6 +58,7 @@ export function createLiveStore() {
       snapshot = event.snapshot;
       error = event.snapshot.errorCategory;
       if (changedSession) {
+        finalizedSessionId = null;
         lines = [];
         draft = '';
       }
@@ -102,6 +104,7 @@ export function createLiveStore() {
         snapshot = { ...snapshot, errorCategory: event.error.category };
         break;
       case 'final':
+        finalizedSessionId = event.sessionId;
         snapshot = {
           ...snapshot,
           sessionId: event.sessionId,
@@ -196,6 +199,7 @@ export function createLiveStore() {
     try {
       const result = await commands.liveStart(source, language, locale, tagIds);
       if (result.status === 'ok') {
+        finalizedSessionId = null;
         snapshot = {
           sessionId: result.data,
           transcriptId: null,
@@ -217,15 +221,15 @@ export function createLiveStore() {
     }
   }
 
-  async function stop(): Promise<AppError | null> {
+  async function stop(): Promise<{ sessionId: string | null; error: AppError | null }> {
     try {
       const result = await commands.liveStop();
-      if (result.status === 'ok') return null;
+      if (result.status === 'ok') return { sessionId: result.data, error: null };
       error = result.error.category;
-      return result.error;
+      return { sessionId: null, error: result.error };
     } catch {
       error = UNAVAILABLE_ERROR.category;
-      return UNAVAILABLE_ERROR;
+      return { sessionId: null, error: UNAVAILABLE_ERROR };
     }
   }
 
@@ -264,6 +268,7 @@ export function createLiveStore() {
 
   function reset(): void {
     generation += 1;
+    finalizedSessionId = null;
     snapshot = { ...EMPTY_SNAPSHOT };
     lines = [];
     draft = '';
@@ -280,6 +285,7 @@ export function createLiveStore() {
 
   return {
     get snapshot() { return snapshot; },
+    get finalizedSessionId() { return finalizedSessionId; },
     get lines() { return lines; },
     get draft() { return draft; },
     get error() { return error; },

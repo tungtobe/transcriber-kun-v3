@@ -48,6 +48,13 @@ pub struct RecordingHandle {
     stop_tx: Option<Sender<StopMode>>,
     terminal_errors: watch::Receiver<Option<AppError>>,
     worker: Option<JoinHandle<Result<(), AppError>>>,
+    wav_finalized: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[derive(Debug)]
+pub struct RecordingStopOutcome {
+    pub wav_finalized: bool,
+    pub error: Option<AppError>,
 }
 
 impl RecordingHandle {
@@ -64,9 +71,13 @@ impl RecordingHandle {
     /// Stops the file consumer and finalizes the current WAV header. The
     /// caller controls capture shutdown so it can order both operations with
     /// the rest of Live finalization.
-    pub fn stop(mut self) -> Result<(), AppError> {
+    pub fn stop(mut self) -> RecordingStopOutcome {
         self.request_stop();
-        self.join_worker()
+        let error = self.join_worker().err();
+        RecordingStopOutcome {
+            wav_finalized: self.wav_finalized.load(Ordering::Acquire),
+            error,
+        }
     }
 
     /// Signals an intentional shutdown without blocking on the writer thread.
@@ -262,6 +273,8 @@ fn start_inner_with_receiver(
     let worker_capture = capture.clone();
     let written_samples = Arc::new(AtomicU64::new(0));
     let worker_written_samples = written_samples.clone();
+    let wav_finalized = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let worker_wav_finalized = wav_finalized.clone();
     let thread_result = thread::Builder::new()
         .name(format!("live-recording-{session_id}"))
         .spawn(move || {
@@ -274,6 +287,7 @@ fn start_inner_with_receiver(
                 terminal_tx,
                 fail_after_samples,
                 worker_written_samples,
+                worker_wav_finalized,
             )
         });
 
@@ -294,6 +308,7 @@ fn start_inner_with_receiver(
         stop_tx: Some(stop_tx),
         terminal_errors,
         worker: Some(worker),
+        wav_finalized,
     })
 }
 
@@ -329,6 +344,7 @@ fn run_consumer(
     terminal_tx: watch::Sender<Option<AppError>>,
     fail_after_samples: Option<u32>,
     written_samples: Arc<AtomicU64>,
+    wav_finalized: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(), AppError> {
     let mut expected_sample = None;
     let mut uncheckpointed_bytes = 0_u64;
@@ -360,12 +376,13 @@ fn run_consumer(
                         "Audio capture stopped while the Live Recording was running",
                     );
                     return fail_recording(
-                        &mut writer,
+                        writer,
                         &sync_file,
                         capture.as_ref(),
                         &terminal_tx,
                         err,
                         true,
+                        &wav_finalized,
                     );
                 }
             }
@@ -375,12 +392,13 @@ fn run_consumer(
             Ok(chunk) => {
                 if let Some(source_error) = chunk.source_errors.first() {
                     return fail_recording(
-                        &mut writer,
+                        writer,
                         &sync_file,
                         capture.as_ref(),
                         &terminal_tx,
                         source_error.error.clone(),
                         true,
+                        &wav_finalized,
                     );
                 }
                 if chunk.sample_rate != OUTPUT_SAMPLE_RATE
@@ -388,17 +406,18 @@ fn run_consumer(
                     || chunk.samples.len() != crate::audio::OUTPUT_CHUNK_SAMPLES
                 {
                     return fail_recording(
-                        &mut writer,
+                        writer,
                         &sync_file,
                         capture.as_ref(),
                         &terminal_tx,
                         AppError::new(Code::Storage, "Live capture emitted an invalid PCM chunk"),
                         true,
+                        &wav_finalized,
                     );
                 }
                 if expected_sample.is_some_and(|expected| chunk.start_sample != expected) {
                     return fail_recording(
-                        &mut writer,
+                        writer,
                         &sync_file,
                         capture.as_ref(),
                         &terminal_tx,
@@ -407,29 +426,32 @@ fn run_consumer(
                             "Live capture lost PCM samples; Recording stopped to preserve continuity",
                         ),
                         true,
+                        &wav_finalized,
                     );
                 }
 
                 if fail_after_samples.is_some_and(|limit| writer.len() >= limit) {
                     return fail_recording(
-                        &mut writer,
+                        writer,
                         &sync_file,
                         capture.as_ref(),
                         &terminal_tx,
                         AppError::new(Code::Storage, "Injected Live Recording write failure"),
                         true,
+                        &wav_finalized,
                     );
                 }
 
                 for sample in &chunk.samples {
                     if let Err(err) = writer.write_sample(*sample) {
                         return fail_recording(
-                            &mut writer,
+                            writer,
                             &sync_file,
                             capture.as_ref(),
                             &terminal_tx,
                             AppError::new(Code::Storage, err.to_string()),
                             true,
+                            &wav_finalized,
                         );
                     }
                 }
@@ -443,12 +465,13 @@ fn run_consumer(
                 {
                     if let Err(err) = checkpoint(&mut writer, &sync_file) {
                         return fail_recording(
-                            &mut writer,
+                            writer,
                             &sync_file,
                             capture.as_ref(),
                             &terminal_tx,
                             err,
                             false,
+                            &wav_finalized,
                         );
                     }
                     uncheckpointed_bytes = 0;
@@ -457,7 +480,7 @@ fn run_consumer(
             }
             Err(broadcast::error::TryRecvError::Lagged(count)) => {
                 return fail_recording(
-                    &mut writer,
+                    writer,
                     &sync_file,
                     capture.as_ref(),
                     &terminal_tx,
@@ -466,6 +489,7 @@ fn run_consumer(
                         format!("Live Recording consumer lagged and lost {count} PCM chunks"),
                     ),
                     true,
+                    &wav_finalized,
                 );
             }
             Err(broadcast::error::TryRecvError::Closed) => break,
@@ -479,12 +503,13 @@ fn run_consumer(
 
     if let Err(err) = checkpoint(&mut writer, &sync_file) {
         return fail_recording(
-            &mut writer,
+            writer,
             &sync_file,
             capture.as_ref(),
             &terminal_tx,
             err,
             false,
+            &wav_finalized,
         );
     }
     if let Err(err) = writer.finalize() {
@@ -501,20 +526,31 @@ fn run_consumer(
             AppError::new(Code::Storage, err.to_string()),
         );
     }
+    wav_finalized.store(true, Ordering::Release);
     Ok(())
 }
 
 fn fail_recording(
-    writer: &mut RecordingWriter,
+    mut writer: RecordingWriter,
     sync_file: &File,
     capture: Option<&Arc<CaptureController>>,
     terminal_tx: &watch::Sender<Option<AppError>>,
     mut error: AppError,
     checkpoint_before_exit: bool,
+    wav_finalized: &std::sync::atomic::AtomicBool,
 ) -> Result<(), AppError> {
     if checkpoint_before_exit {
-        if let Err(checkpoint_error) = checkpoint(writer, sync_file) {
+        if let Err(checkpoint_error) = checkpoint(&mut writer, sync_file) {
             error = checkpoint_error;
+        }
+    }
+    match writer.finalize() {
+        Ok(()) => match sync_file.sync_data() {
+            Ok(()) => wav_finalized.store(true, Ordering::Release),
+            Err(sync_error) => error = AppError::new(Code::Storage, sync_error.to_string()),
+        },
+        Err(finalize_error) => {
+            error = AppError::new(Code::Storage, finalize_error.to_string());
         }
     }
     report_terminal_failure(capture, terminal_tx, error)
@@ -698,7 +734,9 @@ mod tests {
         assert_eq!(row.status, "recording");
         assert!(paths::recording_path(root.path(), id).is_file());
         std::thread::sleep(Duration::from_millis(350));
-        handle.stop().unwrap();
+        let stopped = handle.stop();
+        assert!(stopped.wav_finalized);
+        assert!(stopped.error.is_none());
 
         let mut wav = hound::WavReader::open(paths::recording_path(root.path(), id)).unwrap();
         assert_eq!(wav.spec().sample_rate, 16_000);
@@ -752,7 +790,9 @@ mod tests {
         let mut handle = handle;
         handle.begin_shutdown();
         capture.stop_capture();
-        handle.stop().unwrap();
+        let stopped = handle.stop();
+        assert!(stopped.wav_finalized);
+        assert!(stopped.error.is_none());
 
         let mut wav = hound::WavReader::open(paths::recording_path(root.path(), id)).unwrap();
         let wav_samples = wav.samples::<i16>().map(Result::unwrap).collect::<Vec<_>>();
@@ -798,6 +838,7 @@ mod tests {
                 terminal_tx,
                 None,
                 worker_samples,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
             )
         })
         .join()
@@ -845,7 +886,12 @@ mod tests {
         let mut wav = hound::WavReader::open(file).unwrap();
         assert!(wav.duration() >= 1_600);
         assert!(wav.samples::<i16>().any(|sample| sample.unwrap() != 0));
-        let _ = handle.stop();
+        let stopped = handle.stop();
+        assert!(stopped.wav_finalized);
+        assert_eq!(
+            stopped.error.as_ref().map(|error| error.category),
+            Some(crate::core::error::Category::Storage)
+        );
     }
 
     #[test]
@@ -871,6 +917,7 @@ mod tests {
                     terminal_tx,
                     None,
                     Arc::new(AtomicU64::new(0)),
+                    Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 )
             }
         });
@@ -909,6 +956,7 @@ mod tests {
                 terminal_tx,
                 None,
                 Arc::new(AtomicU64::new(0)),
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
             )
         })
         .join()
@@ -943,7 +991,10 @@ mod tests {
         .unwrap();
         let (_stop_tx, stop_rx) = mpsc::channel();
         let (terminal_tx, terminal_rx) = watch::channel(None);
-        let (writer, sync_file) = new_test_writer(&root.path().join("device-error.wav"));
+        let wav_path = root.path().join("device-error.wav");
+        let (writer, sync_file) = new_test_writer(&wav_path);
+        let wav_finalized = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_wav_finalized = wav_finalized.clone();
         let worker_capture = capture.clone();
         let result = thread::spawn(move || {
             run_consumer(
@@ -955,6 +1006,7 @@ mod tests {
                 terminal_tx,
                 None,
                 Arc::new(AtomicU64::new(0)),
+                worker_wav_finalized,
             )
         })
         .join()
@@ -969,6 +1021,8 @@ mod tests {
             crate::core::error::Category::Permission
         );
         assert!(capture.active_source().is_none());
+        assert!(wav_finalized.load(Ordering::Acquire));
+        assert_eq!(hound::WavReader::open(wav_path).unwrap().duration(), 0);
     }
 
     #[test]
@@ -1056,6 +1110,7 @@ mod tests {
                 terminal_tx,
                 None,
                 worker_written_samples,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
             )
             .unwrap();
         });

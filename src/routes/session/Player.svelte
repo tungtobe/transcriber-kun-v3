@@ -15,6 +15,7 @@
 
   let {
     proxyPath,
+    allowRelink = true,
     onRelinkRequest,
     relinking,
     relinkMessage,
@@ -23,6 +24,7 @@
     playing = $bindable(false),
   }: {
     proxyPath: string | null;
+    allowRelink?: boolean;
     onRelinkRequest: () => void;
     relinking: boolean;
     relinkMessage: string | null;
@@ -134,13 +136,15 @@
 
   {#if !hasAudio}
     <div class="player-broken">
-      <span>{i18n.t('session.player.noAudio')}</span>
-      <button type="button" disabled={relinking} onclick={onRelinkRequest}>
-        <FolderOpenIcon size={16} strokeWidth={1.75} />
-        {relinking ? i18n.t('session.player.relinking') : i18n.t('session.player.relink')}
-      </button>
-      {#if relinkMessage}
-        <span class="player-relink-message" role="alert">{relinkMessage}</span>
+      <span>{i18n.t(allowRelink ? 'session.player.noAudio' : 'session.player.noAudioLive')}</span>
+      {#if allowRelink}
+        <button type="button" disabled={relinking} onclick={onRelinkRequest}>
+          <FolderOpenIcon size={16} strokeWidth={1.75} />
+          {relinking ? i18n.t('session.player.relinking') : i18n.t('session.player.relink')}
+        </button>
+        {#if relinkMessage}
+          <span class="player-relink-message" role="alert">{relinkMessage}</span>
+        {/if}
       {/if}
     </div>
   {:else}

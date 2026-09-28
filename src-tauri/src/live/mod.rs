@@ -191,7 +191,7 @@ impl LiveSessionHandle {
         response.await.map_err(|_| actor_error())?
     }
 
-    pub async fn stop(&self) -> Result<(), AppError> {
+    pub async fn stop(&self) -> Result<SessionId, AppError> {
         let (reply, response) = oneshot::channel();
         self.commands
             .send(Command::Stop { reply })
@@ -225,7 +225,7 @@ enum Command {
         reply: oneshot::Sender<Result<SessionId, AppError>>,
     },
     Stop {
-        reply: oneshot::Sender<Result<(), AppError>>,
+        reply: oneshot::Sender<Result<SessionId, AppError>>,
     },
     ContinueRecordingOnly {
         reply: oneshot::Sender<Result<(), AppError>>,
@@ -834,9 +834,15 @@ impl LiveSessionActor {
         }
     }
 
-    async fn finish_current(&mut self, writer_error: Option<AppError>) -> Result<(), AppError> {
+    async fn finish_current(
+        &mut self,
+        writer_error: Option<AppError>,
+    ) -> Result<SessionId, AppError> {
         if self.running.is_none() {
-            return Ok(());
+            return Err(AppError::new(
+                Code::Request,
+                "There is no Live session to stop",
+            ));
         }
         let final_segment = if let Some(running) = self.running.as_mut() {
             if !running.sentence_buffer.trim().is_empty() {
@@ -883,11 +889,7 @@ impl LiveSessionActor {
         // actually stops, then persist it with the final transcript batch.
         let stop_sample = self.capture.sample_clock();
         if let Some(start_sample) = running.transcript_stopped_sample {
-            if let Some(gap) = tail_gap_draft(
-                start_sample,
-                stop_sample,
-                running.baseline_sample,
-            ) {
+            if let Some(gap) = tail_gap_draft(start_sample, stop_sample, running.baseline_sample) {
                 let start_sec = gap.start_sec;
                 let end_sec = gap.end_sec;
                 running.pending.push(gap);
@@ -900,36 +902,13 @@ impl LiveSessionActor {
             }
         }
 
-        let recording_result = if let Some(recording) = running.recording.take() {
-            match tokio::task::spawn_blocking(move || recording.stop()).await {
-                Ok(result) => result,
-                Err(err) => Err(AppError::new(Code::Storage, err.to_string())),
-            }
-        } else {
-            Ok(())
-        };
-        match tokio::time::timeout(OLD_GENERATION_DRAIN, &mut running.gateway_task).await {
-            Ok(Ok(())) => {}
-            Ok(Err(_)) => {}
-            Err(_) => running.gateway_task.abort(),
-        }
-        let final_error = writer_error.or_else(|| recording_result.err());
-        if let Some(error) = &final_error {
-            self.snapshot.error_category = Some(error.category);
-            self.emit(LiveEvent::Error {
-                seq: 0,
-                error: error.clone(),
-            });
-        }
-
         let sample_clock = self.capture.sample_clock();
         let duration_sec = relative_seconds(sample_clock, running.baseline_sample);
         let db = self.db.clone();
         let session_id = running.session_id;
         let transcript_id = running.transcript_id;
-        let pending = std::mem::take(&mut running.pending);
-        let batch = pending.clone();
-        let final_result = tokio::task::spawn_blocking(move || {
+        let batch = std::mem::take(&mut running.pending);
+        let final_flush = tokio::task::spawn_blocking(move || {
             store::append_live_batch(
                 &db,
                 session_id,
@@ -940,11 +919,36 @@ impl LiveSessionActor {
             )
         })
         .await;
-        let final_result = match final_result {
+        let final_flush = match final_flush {
             Ok(result) => result,
             Err(err) => Err(AppError::new(Code::Storage, err.to_string())),
         };
-        if let Err(error) = final_result {
+
+        // Persist the final transcript batch and enter `finalizing` before
+        // closing the WAV writer. Even when that DB flush fails, still join
+        // the writer below so its checkpointed data is left in a recoverable
+        // state on disk.
+        let recording_result = if let Some(recording) = running.recording.take() {
+            match tokio::task::spawn_blocking(move || recording.stop()).await {
+                Ok(outcome) => outcome,
+                Err(err) => recording::RecordingStopOutcome {
+                    wav_finalized: false,
+                    error: Some(AppError::new(Code::Storage, err.to_string())),
+                },
+            }
+        } else {
+            recording::RecordingStopOutcome {
+                wav_finalized: true,
+                error: None,
+            }
+        };
+        match tokio::time::timeout(OLD_GENERATION_DRAIN, &mut running.gateway_task).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {}
+            Err(_) => running.gateway_task.abort(),
+        }
+
+        if let Err(error) = final_flush {
             self.emit(LiveEvent::Error {
                 seq: 0,
                 error: error.clone(),
@@ -965,27 +969,98 @@ impl LiveSessionActor {
             self.emit(LiveEvent::Done { seq: 0 });
             return Err(error);
         }
-        let _ = pending;
-        let recording_state = if final_error.is_some() {
-            RecordingState::Failed
-        } else {
-            RecordingState::Stopped
+
+        let terminal_error = writer_error.or(recording_result.error.clone());
+        if !recording_result.wav_finalized {
+            let error = terminal_error.unwrap_or_else(|| {
+                AppError::new(Code::Storage, "Live Recording WAV could not be finalized")
+            });
+            self.emit(LiveEvent::Error {
+                seq: 0,
+                error: error.clone(),
+            });
+            self.snapshot = LiveSnapshot {
+                session_id: Some(session_id),
+                transcript_id: Some(transcript_id),
+                recording: RecordingState::Failed,
+                connection: ConnectionState::Stopped,
+                transcription: TranscriptionState::Stopped,
+                error_category: Some(error.category),
+                duration_sec,
+            };
+            self.emit(LiveEvent::Recording {
+                seq: 0,
+                state: RecordingState::Failed,
+            });
+            self.emit(LiveEvent::Done { seq: 0 });
+            return Err(error);
+        }
+
+        if let Some(error) = terminal_error.as_ref() {
+            self.emit(LiveEvent::Error {
+                seq: 0,
+                error: error.clone(),
+            });
+        }
+
+        let data_dir = self.data_dir.clone();
+        let db = self.db.clone();
+        let recording_path = crate::core::paths::recording_path(&data_dir, session_id);
+        let outcome = tokio::task::spawn_blocking(move || {
+            store::finalize_live_session(&db, &data_dir, session_id, &recording_path, duration_sec)
+        })
+        .await;
+        let outcome = match outcome {
+            Ok(result) => result,
+            Err(err) => Err(AppError::new(Code::Storage, err.to_string())),
         };
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.emit(LiveEvent::Error {
+                    seq: 0,
+                    error: error.clone(),
+                });
+                self.snapshot = LiveSnapshot {
+                    session_id: Some(session_id),
+                    transcript_id: Some(transcript_id),
+                    recording: RecordingState::Failed,
+                    connection: ConnectionState::Stopped,
+                    transcription: TranscriptionState::Stopped,
+                    error_category: Some(error.category),
+                    duration_sec,
+                };
+                self.emit(LiveEvent::Recording {
+                    seq: 0,
+                    state: RecordingState::Failed,
+                });
+                self.emit(LiveEvent::Done { seq: 0 });
+                return Err(error);
+            }
+        };
+
+        if let Some(error) = outcome.proxy_error.as_ref() {
+            self.emit(LiveEvent::Error {
+                seq: 0,
+                error: error.clone(),
+            });
+        }
         self.snapshot = LiveSnapshot {
             session_id: Some(session_id),
             transcript_id: Some(transcript_id),
-            recording: recording_state,
+            recording: RecordingState::Stopped,
             connection: ConnectionState::Stopped,
             transcription: TranscriptionState::Stopped,
-            error_category: final_error
+            error_category: terminal_error
                 .as_ref()
                 .map(|error| error.category)
+                .or_else(|| outcome.proxy_error.as_ref().map(|error| error.category))
                 .or(running.error_category),
             duration_sec,
         };
         self.emit(LiveEvent::Recording {
             seq: 0,
-            state: recording_state,
+            state: RecordingState::Stopped,
         });
         self.emit(LiveEvent::Done { seq: 0 });
         self.emit(LiveEvent::Final {
@@ -998,10 +1073,7 @@ impl LiveSessionActor {
             seq: 0,
             message: "Live session stopped".to_owned(),
         });
-        match final_error {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
+        Ok(outcome.session_id)
     }
 
     fn snapshot_for_running(&self) -> LiveSnapshot {
@@ -1211,8 +1283,8 @@ fn split_complete_sentences(running: &mut RunningSession) -> Vec<LiveSegment> {
 mod tests {
     use super::*;
     use crate::audio::{
-        CaptureBackend, InputBlock, InputCallback, InputErrorCallback, InputFormat, LiveMicrophone,
-        InputSide, LiveSources, PreparedInput, PreparedSourceSet, PreparedStream, SourceInput,
+        CaptureBackend, InputBlock, InputCallback, InputErrorCallback, InputFormat, InputSide,
+        LiveMicrophone, LiveSources, PreparedInput, PreparedSourceSet, PreparedStream, SourceInput,
         OUTPUT_CHUNK_SAMPLES,
     };
     use crate::db::repo;
@@ -1628,7 +1700,7 @@ mod tests {
             .db
             .with_connection(|conn| Ok(repo::sessions::get(conn, session_id)?.unwrap()))
             .unwrap();
-        assert_eq!(row.status, "finalizing");
+        assert_eq!(row.status, "complete");
     }
 
     #[tokio::test]
@@ -1680,7 +1752,7 @@ mod tests {
             .db
             .with_connection(|conn| Ok(repo::sessions::get(conn, session_id)?.unwrap()))
             .unwrap();
-        assert_eq!(row.status, "finalizing");
+        assert_eq!(row.status, "complete");
     }
 
     #[tokio::test]
@@ -1761,7 +1833,10 @@ mod tests {
             })
             .await;
 
-        assert_eq!(fixture.actor.snapshot.transcription, TranscriptionState::SetupRejected);
+        assert_eq!(
+            fixture.actor.snapshot.transcription,
+            TranscriptionState::SetupRejected
+        );
         assert_eq!(fixture.actor.snapshot.recording, RecordingState::Active);
         assert!(fixture.capture.active_source().is_some());
         let baseline = fixture.actor.running.as_ref().unwrap().baseline_sample;
@@ -1773,7 +1848,10 @@ mod tests {
             .transcript_stopped_sample
             .unwrap();
         fixture.actor.continue_recording_only().await.unwrap();
-        assert_eq!(fixture.actor.snapshot.transcription, TranscriptionState::RecordingOnly);
+        assert_eq!(
+            fixture.actor.snapshot.transcription,
+            TranscriptionState::RecordingOnly
+        );
         assert_eq!(fixture.actor.snapshot.recording, RecordingState::Active);
         assert!(fixture.capture.active_source().is_some());
 
@@ -1798,7 +1876,10 @@ mod tests {
         .await
         .expect("capture sample clock should advance while recording-only");
         fixture.actor.finish_current(None).await.unwrap();
-        assert_eq!(fixture.actor.snapshot.transcription, TranscriptionState::Stopped);
+        assert_eq!(
+            fixture.actor.snapshot.transcription,
+            TranscriptionState::Stopped
+        );
         assert_eq!(fixture.actor.snapshot.recording, RecordingState::Stopped);
         assert!(fixture.capture.active_source().is_none());
 
@@ -1819,7 +1900,7 @@ mod tests {
             .db
             .with_connection(|conn| Ok(repo::sessions::get(conn, session_id)?.unwrap()))
             .unwrap();
-        assert_eq!(session.status, "finalizing");
+        assert_eq!(session.status, "complete");
         assert!(events.lock().unwrap().iter().any(|event| matches!(
             event,
             LiveEvent::Gap { start_sec, end_sec, reason, .. }
@@ -1928,12 +2009,19 @@ mod tests {
         })
         .await
         .expect("capture should publish its first output chunk");
-        fixture.actor.finish_current(None).await.unwrap();
+        let stopped_id = fixture.actor.finish_current(None).await.unwrap();
+        assert_eq!(stopped_id, session_id);
 
         let path = crate::core::paths::recording_path(fixture._root.path(), session_id);
         let mut wav = hound::WavReader::open(path).unwrap();
         assert!(wav.duration() >= OUTPUT_CHUNK_SAMPLES as u32);
         assert!(wav.samples::<i16>().any(|sample| sample.unwrap() != 0));
+        let row = fixture
+            .db
+            .with_connection(|conn| Ok(repo::sessions::get(conn, session_id)?.unwrap()))
+            .unwrap();
+        assert_eq!(row.status, "complete");
+        assert_eq!(row.proxy_ext.as_deref(), Some("flac"));
     }
 
     #[tokio::test]
@@ -2026,6 +2114,14 @@ mod tests {
     async fn normal_stop_finishes_recording_without_error_while_gateway_drain_times_out() {
         let mut fixture = fixture();
         let (_session_id, _transcript_id) = add_recording(&mut fixture, 1);
+        let baseline = fixture.actor.running.as_ref().unwrap().baseline_sample;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while fixture.capture.sample_clock() <= baseline {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("capture should publish audio before stopping");
         let terminal_errors = fixture
             .actor
             .running
@@ -2070,5 +2166,51 @@ mod tests {
             }
         )));
         assert!(fixture.capture.active_source().is_none());
+    }
+
+    #[tokio::test]
+    async fn device_error_uses_the_save_pipeline_and_returns_the_completed_session_id() {
+        let mut fixture = fixture();
+        let (session_id, _) = add_recording(&mut fixture, 1);
+        let baseline = fixture.actor.running.as_ref().unwrap().baseline_sample;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while fixture.capture.sample_clock() <= baseline {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("capture should publish audio before the device failure");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        fixture
+            .actor
+            .register_subscriber(collect_channel(events.clone()));
+        let device_error = AppError::new(Code::Permission, "audio device disconnected");
+
+        let stopped_id = fixture
+            .actor
+            .finish_current(Some(device_error.clone()))
+            .await
+            .unwrap();
+
+        assert_eq!(stopped_id, session_id);
+        let row = fixture
+            .db
+            .with_connection(|conn| Ok(repo::sessions::get(conn, session_id)?.unwrap()))
+            .unwrap();
+        assert_eq!(row.status, "complete");
+        assert_eq!(row.proxy_ext.as_deref(), Some("flac"));
+        assert_eq!(
+            fixture.actor.snapshot.error_category,
+            Some(Category::Permission)
+        );
+        let events = events.lock().unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            LiveEvent::Error { error, .. } if error.category == Category::Permission
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            LiveEvent::Final { session_id: final_id, .. } if *final_id == session_id
+        )));
     }
 }
