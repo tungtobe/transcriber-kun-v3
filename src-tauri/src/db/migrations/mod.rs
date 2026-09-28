@@ -62,7 +62,7 @@ use rusqlite_migration::{Migrations, M};
 /// `transcript_id` đã lưu với transcript `primary` hiện tại để suy
 /// `fromPreviousTranscript` -- một FK ở đây sẽ chặn chính transaction xoá
 /// đó. `notes_revision` để `NULL` khi Phiên chưa từng có ghi chú lúc sinh.
-static MIGRATIONS: [M; 7] = [
+static MIGRATIONS: [M; 8] = [
     M::up(
         "CREATE TABLE settings (\n\
              key TEXT PRIMARY KEY,\n\
@@ -164,6 +164,10 @@ static MIGRATIONS: [M; 7] = [
              PRIMARY KEY (session_id, template_id)\n\
          );",
     ),
+    M::up(
+        "CREATE UNIQUE INDEX transcripts_one_retranscribe_per_session\n\
+             ON transcripts (session_id) WHERE variant = 'retranscribe';",
+    ),
 ];
 
 fn runner() -> Migrations<'static> {
@@ -197,8 +201,8 @@ mod tests {
         let version_after_second: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version_after_first, 7);
-        assert_eq!(version_after_second, 7);
+        assert_eq!(version_after_first, 8);
+        assert_eq!(version_after_second, 8);
     }
 
     #[test]
@@ -373,7 +377,7 @@ mod tests {
         let version_after: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version_after, 7);
+        assert_eq!(version_after, 8);
         assert!(table_exists(&conn, "tags"));
         assert!(table_exists(&conn, "session_tags"));
         let title: String = conn

@@ -129,6 +129,11 @@ export const commands = {
 	 */
 	transcribeRerun: (sessionId: string, transcriptId: string, scope: RerunScope) => typedError<TranscribeRerunOutcome, AppError>(__TAURI_INVOKE("transcribe_rerun", { sessionId, transcriptId, scope })),
 	/**
+	 *  Transcribe the persisted audio of a finalized live session into its
+	 *  independent retranscribe variant. The registry owns queueing and cancel.
+	 */
+	transcribeRecording: (sessionId: string) => typedError<TranscribeRerunOutcome, AppError>(__TAURI_INVOKE("transcribe_recording", { sessionId })),
+	/**
 	 *  Đăng ký một Channel nhận snapshot rồi các `JobEvent` tiếp theo (spec
 	 *  Always: "snapshot và đăng ký Channel trong cùng một lệnh actor").
 	 */
@@ -164,6 +169,7 @@ export const commands = {
 	sourceName: string | null,
 	proxyPath: string | null,
 	transcript: TranscriptDetail | null,
+	retranscribe: TranscriptDetail | null,
 	/**
 	 *  Tag đang gắn với Phiên này (story 3.2) — tên tăng dần
 	 *  (`library::tags::list_for_session`). Không phụ thuộc
@@ -300,13 +306,13 @@ export const commands = {
 	 *  được xử lý sau khi panel Memo unmount (toast thay vì cập nhật UI trực
 	 *  tiếp).
 	 */
-	memoGenerate: (sessionId: string, templateId: string, locale: string) => typedError<MemoGenerateOutcome, AppError>(__TAURI_INVOKE("memo_generate", { sessionId, templateId, locale })),
+	memoGenerate: (sessionId: string, templateId: string, transcriptId: string, locale: string) => typedError<MemoGenerateOutcome, AppError>(__TAURI_INVOKE("memo_generate", { sessionId, templateId, transcriptId, locale })),
 	/**
 	 *  Đọc memo đã cache của một cặp (Phiên, Template), không bao giờ gọi
 	 *  Gemini (spec Boundaries Always: "Mở lại memo chỉ đọc DB") — xem
 	 *  [`memo::generate::view`] cho logic đọc + suy hai cờ provenance thật.
 	 */
-	memoGet: (sessionId: string, templateId: string) => typedError<{
+	memoGet: (sessionId: string, templateId: string, transcriptId: string) => typedError<{
 	body: string,
 	/**
 	 *  Mili-giây kể từ Unix epoch (UTC), `f64` -- cùng quy ước
@@ -333,7 +339,7 @@ export const commands = {
 	fromPreviousTranscript: boolean,
 	/**  `true` khi revision ghi chú hiện tại khác revision đã chụp lúc sinh. */
 	notesChanged: boolean,
-} | null, AppError>(__TAURI_INVOKE("memo_get", { sessionId, templateId })),
+} | null, AppError>(__TAURI_INVOKE("memo_get", { sessionId, templateId, transcriptId })),
 	/**
 	 *  Huỷ request `memo_generate` đang chạy của một cặp (Phiên, Template) nếu
 	 *  có -- không lỗi khi không có gì đang chạy (idempotent, spec I/O Matrix
@@ -516,7 +522,7 @@ export type JobEvent =
  *  hàng đợi `JobRegistry`"). Không phải bảng riêng, không hàng đợi thứ hai —
  *  chỉ một cờ trên `JobSnapshot` để UI phân biệt hiển thị.
  */
-export type JobKind = "transcribe" | "rerun";
+export type JobKind = "transcribe" | "rerun" | "retranscribe";
 
 /**
  *  Ảnh chụp một Job tại một thời điểm — đủ để UI vẽ "32 / 90 phút · 36 %",
@@ -801,6 +807,7 @@ export type SessionDetail = {
 	sourceName: string | null,
 	proxyPath: string | null,
 	transcript: TranscriptDetail | null,
+	retranscribe: TranscriptDetail | null,
 	/**
 	 *  Tag đang gắn với Phiên này (story 3.2) — tên tăng dần
 	 *  (`library::tags::list_for_session`). Không phụ thuộc

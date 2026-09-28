@@ -239,6 +239,20 @@ pub fn primary_for_session(
     .transpose()
 }
 
+pub fn retranscribe_for_session(
+    conn: &Connection,
+    session_id: SessionId,
+) -> rusqlite::Result<Option<TranscriptId>> {
+    conn.query_row(
+        "SELECT id FROM transcripts WHERE session_id = ?1 AND variant = 'retranscribe'",
+        params![session_id.to_string()],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()?
+    .map(|id| parse_transcript_id(&id))
+    .transpose()
+}
+
 /// Chạy lại (2.5): swap nguyên tử một transcript chỉ khi nó vẫn tồn tại với
 /// đúng `expected_id` thuộc đúng `session_id` lúc bắt đầu -- trả `None`
 /// (không ghi gì) nếu transcript đích đã bị xoá/đổi Phiên giữa chừng (spec

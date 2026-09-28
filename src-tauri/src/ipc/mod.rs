@@ -30,7 +30,7 @@ use crate::memo;
 use crate::secrets::{KeyId, KeyMetadata};
 use crate::settings::{self, Settings, SettingsChanged, TranscribeLanguage};
 use crate::transcribe::job::{CancelOutcome, JobEvent};
-use crate::transcribe::registry::{self, RerunOutcome, RerunParams};
+use crate::transcribe::registry::{self, RerunOutcome, RerunParams, RetranscribeParams};
 use crate::transcribe::rerun::{self, RerunScope};
 use boot::AppState;
 
@@ -1223,6 +1223,95 @@ async fn transcribe_rerun(
     track_ipc_error(&state.db, result).await
 }
 
+/// Transcribe the persisted audio of a finalized live session into its
+/// independent retranscribe variant. The registry owns queueing and cancel.
+#[tauri::command]
+#[specta::specta]
+async fn transcribe_recording(
+    state: tauri::State<'_, AppState>,
+    session_id: SessionId,
+) -> Result<TranscribeRerunOutcome, AppError> {
+    let result = async {
+        if is_session_deleting(&state.deleting, session_id) {
+            return Err(session_deleting_error());
+        }
+        if is_session_recovering(&state.recovering, session_id) {
+            return Err(session_recovering_error());
+        }
+        if is_wiping(&state.wiping) {
+            return Err(wiping_error());
+        }
+        let db = state.db.clone()?;
+        let root = state.data_dir.clone()?;
+        let settings = blocking({
+            let db = db.clone();
+            move || Ok(settings::load(&db))
+        })
+        .await?;
+        let consent =
+            ConsentSnapshot::new(settings.consent_accepted_version, settings.consent_declined);
+        if !consent.is_current() {
+            return Err(AppError::new(Code::Auth, "Current consent is required"));
+        }
+        let (session, expected_id) = blocking({
+            let db = db.clone();
+            move || {
+                db.with_connection(|conn| {
+                    let session = repo::sessions::get(conn, session_id)?
+                        .ok_or_else(|| AppError::new(Code::Request, "Phiên không tồn tại"))?;
+                    let expected_id =
+                        repo::transcripts::retranscribe_for_session(conn, session_id)?;
+                    Ok((session, expected_id))
+                })
+            }
+        })
+        .await?;
+        if session.kind != "live" || session.status != "complete" {
+            return Err(AppError::new(Code::Request, "Recording chưa sẵn sàng"));
+        }
+        let wav = paths::recording_path(&root, session_id);
+        let source_path = if wav.is_file() {
+            wav
+        } else if let Some(ext) = session.proxy_ext {
+            let proxy = paths::proxy_path(&root, session_id, &ext);
+            if !proxy.is_file() {
+                return Err(AppError::new(Code::Storage, "Recording không còn tồn tại"));
+            }
+            proxy
+        } else {
+            return Err(AppError::new(Code::Storage, "Recording không còn tồn tại"));
+        };
+        let secrets = state.secrets.clone();
+        if blocking(move || secrets.list()).await?.is_empty() {
+            return Err(AppError::new(
+                Code::Auth,
+                "No usable Gemini API key is configured",
+            ));
+        }
+        let jobs = state.jobs.clone()?;
+        Ok(
+            match jobs
+                .start_retranscribe(RetranscribeParams {
+                    session_id,
+                    expected_id,
+                    source_path,
+                    model: settings.transcribe_model,
+                    language: settings.transcribe_language,
+                    chunk_minutes: settings.chunk_minutes,
+                    consent,
+                })
+                .await?
+            {
+                RerunOutcome::Started { job_id } => TranscribeRerunOutcome::Started { job_id },
+                RerunOutcome::Existing { job_id } => TranscribeRerunOutcome::Existing { job_id },
+                RerunOutcome::Busy { job_id } => TranscribeRerunOutcome::Busy { job_id },
+            },
+        )
+    }
+    .await;
+    track_ipc_error(&state.db, result).await
+}
+
 /// Đăng ký một Channel nhận snapshot rồi các `JobEvent` tiếp theo (spec
 /// Always: "snapshot và đăng ký Channel trong cùng một lệnh actor").
 #[tauri::command]
@@ -1973,6 +2062,7 @@ async fn memo_generate_inner(
     state: &AppState,
     session_id: SessionId,
     template_id: MemoTemplateId,
+    transcript_id: TranscriptId,
     locale: String,
 ) -> Result<MemoGenerateOutcome, AppError> {
     if is_session_deleting(&state.deleting, session_id) {
@@ -2008,11 +2098,12 @@ async fn memo_generate_inner(
         token
     };
 
-    let outcome = memo::generate::run(
+    let outcome = memo::generate::run_for_source(
         &db,
         &gateway,
         session_id,
         template_id,
+        Some(transcript_id),
         &locale,
         consent,
         cancellation,
@@ -2043,9 +2134,10 @@ async fn memo_generate(
     state: tauri::State<'_, AppState>,
     session_id: SessionId,
     template_id: MemoTemplateId,
+    transcript_id: TranscriptId,
     locale: String,
 ) -> Result<MemoGenerateOutcome, AppError> {
-    let result = memo_generate_inner(&state, session_id, template_id, locale).await;
+    let result = memo_generate_inner(&state, session_id, template_id, transcript_id, locale).await;
     track_ipc_error(&state.db, result).await
 }
 
@@ -2058,11 +2150,15 @@ async fn memo_get(
     state: tauri::State<'_, AppState>,
     session_id: SessionId,
     template_id: MemoTemplateId,
+    transcript_id: TranscriptId,
 ) -> Result<Option<memo::generate::MemoView>, AppError> {
     let db = state.db.clone();
     let result = async {
         let db = db?;
-        blocking(move || memo::generate::view(&db, session_id, template_id)).await
+        blocking(move || {
+            memo::generate::view_for_source(&db, session_id, template_id, Some(transcript_id))
+        })
+        .await
     }
     .await;
     track_ipc_error(&state.db, result).await
@@ -2427,6 +2523,7 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             transcribe_start,
             transcribe_pick_files,
             transcribe_rerun,
+            transcribe_recording,
             jobs_subscribe,
             jobs_unsubscribe,
             jobs_cancel,

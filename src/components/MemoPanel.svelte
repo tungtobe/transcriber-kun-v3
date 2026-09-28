@@ -25,12 +25,16 @@
 
   let {
     sessionId,
+    transcriptId,
+    sourceVariant,
     active,
     hasTranscript,
     segmentTextCount,
     onMemoAvailable,
   }: {
     sessionId: string;
+    transcriptId: string | null;
+    sourceVariant: 'primary' | 'retranscribe';
     active: boolean;
     hasTranscript: boolean;
     segmentTextCount: number;
@@ -65,20 +69,22 @@
 
   $effect(() => {
     const id = selectedTemplateId;
-    if (!id) return;
-    void memoStore.load(sessionId, id);
+    if (!id || !transcriptId) return;
+    void memoStore.load(sessionId, id, transcriptId);
   });
 
   $effect(() => {
     if (active && selectedTemplateId) {
-      memoStore.setVisible(sessionId, selectedTemplateId);
+      memoStore.setVisible(sessionId, selectedTemplateId, transcriptId);
     } else {
       memoStore.setVisible(null, null);
     }
     return () => memoStore.setVisible(null, null);
   });
 
-  const view = $derived(selectedTemplateId ? memoStore.view(sessionId, selectedTemplateId) : { status: 'idle' as const, memo: null, error: null });
+  const view = $derived(selectedTemplateId && transcriptId
+    ? memoStore.view(sessionId, selectedTemplateId, transcriptId)
+    : { status: 'idle' as const, memo: null, error: null });
 
   $effect(() => {
     if (view.memo) onMemoAvailable?.();
@@ -96,8 +102,10 @@
     const memo = view.memo;
     if (!memo) return null;
     const variant = memo.fromPreviousTranscript
-      ? i18n.t('memoPanel.source.variantRerun')
-      : i18n.t('memoPanel.source.variantPrimary');
+      ? i18n.t('memoPanel.source.previousTranscript')
+      : i18n.t(sourceVariant === 'retranscribe'
+        ? 'memoPanel.source.variantRerun'
+        : 'memoPanel.source.variantPrimary');
     const status = memo.transcriptStatus === 'partial'
       ? i18n.t('memoPanel.source.statusPartial')
       : i18n.t('memoPanel.source.statusComplete');
@@ -109,11 +117,11 @@
   const renderedBody = $derived(view.memo ? renderMemoMarkdown(view.memo.body) : '');
 
   async function handleGenerate(): Promise<void> {
-    if (disabledReason || view.status === 'generating' || !selectedTemplateId) return;
+    if (disabledReason || view.status === 'generating' || !selectedTemplateId || !transcriptId) return;
     exportMessage = null;
     // Spec Boundaries Always: "Trước khi sinh, flush ghi chú của Phiên".
     await notesStore.flush(sessionId);
-    await memoStore.generate(sessionId, selectedTemplateId, i18n.locale);
+    await memoStore.generate(sessionId, selectedTemplateId, i18n.locale, transcriptId);
   }
 
   async function handleCancel(): Promise<void> {

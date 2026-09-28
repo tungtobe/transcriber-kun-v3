@@ -13,12 +13,14 @@
     onRename,
     onDelete,
     onTag,
+    onRetranscribe,
   }: {
     onRename: () => void;
     onDelete: () => void;
     /** Story 3.2: mục "Gắn tag" tuỳ chọn -- chỉ hiện khi caller truyền
      * (spec Code Map: "thêm mục tuỳ chọn `onTag`"). */
     onTag?: () => void;
+    onRetranscribe?: () => void;
   } = $props();
 
   let open = $state(false);
@@ -27,10 +29,11 @@
   // trong `rootEl` -- click-outside phải kiểm cả hai.
   let listEl = $state<HTMLDivElement | null>(null);
   let rootEl = $state<HTMLDivElement | null>(null);
-  let itemEls: (HTMLButtonElement | null)[] = [];
+  let itemEls = $state<(HTMLButtonElement | null)[]>([]);
 
   const items = $derived([
     ...(onTag ? [{ label: i18n.t('sessionMenu.item.tag'), run: onTag }] : []),
+    ...(onRetranscribe ? [{ label: i18n.t('sessionMenu.item.transcribeRecording'), run: onRetranscribe }] : []),
     { label: i18n.t('sessionMenu.item.rename'), run: onRename },
     { label: i18n.t('sessionMenu.item.delete'), run: onDelete, danger: true },
   ]);

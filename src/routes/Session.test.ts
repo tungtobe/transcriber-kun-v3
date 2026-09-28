@@ -19,6 +19,7 @@ const mocks = vi.hoisted(() => {
     jobsUnsubscribe: vi.fn().mockResolvedValue({ status: 'ok', data: null }),
     jobsCancel: vi.fn(),
     transcribeRerun: vi.fn(),
+    transcribeRecording: vi.fn(),
     tagsList: vi.fn(),
     // Story 3.5: `NotesPanel` mounts inside the aside for every `saved` view
     // -- default (set in `beforeEach`) to "no note yet, loaded fine" so it
@@ -69,6 +70,7 @@ vi.mock('../lib/bindings', () => ({
     jobsUnsubscribe: (...args: unknown[]) => mocks.jobsUnsubscribe(...args),
     jobsCancel: (...args: unknown[]) => mocks.jobsCancel(...args),
     transcribeRerun: (...args: unknown[]) => mocks.transcribeRerun(...args),
+    transcribeRecording: (...args: unknown[]) => mocks.transcribeRecording(...args),
     tagsList: (...args: unknown[]) => mocks.tagsList(...args),
     notesGet: (...args: unknown[]) => mocks.notesGet(...args),
     notesSave: (...args: unknown[]) => mocks.notesSave(...args),
@@ -122,6 +124,7 @@ beforeEach(async () => {
   mocks.jobsUnsubscribe.mockReset().mockResolvedValue({ status: 'ok', data: null });
   mocks.jobsCancel.mockReset();
   mocks.transcribeRerun.mockReset();
+  mocks.transcribeRecording.mockReset();
   mocks.intakeStore.notices = [];
   mocks.intakeStore.dismiss.mockReset();
   mocks.push.mockReset();
@@ -179,6 +182,7 @@ function detail(overrides: Record<string, unknown> = {}) {
       language: null,
       segments: [textSegment(0, 0, 10, 'xin chào'), textSegment(1, 10, 20, 'các bạn')],
     },
+    retranscribe: null,
     tags: [],
     ...overrides,
   };
@@ -376,6 +380,96 @@ describe('Session route', () => {
     await fireEvent.click(screen.getByRole('button', { name: 'Xuất JSON' }));
     expect((await screen.findByRole('alert')).textContent).toContain('Không thể xuất transcript.');
     expect(screen.queryByText('Đã lưu transcript.')).toBeNull();
+  });
+
+  it('keeps the action source independent from the visible comparison pane', async () => {
+    const alternate = {
+      ...detail().transcript,
+      id: 't2',
+      variant: 'retranscribe',
+      segments: [textSegment(0, 7, 10, 'từ recording')],
+    };
+    mocks.librarySessionGet.mockResolvedValue({
+      status: 'ok',
+      data: { kind: 'session', sessionId: 's1', title: 'cuộc họp', durationSec: 120, status: 'complete', partial: false, transcriptId: 't1' },
+    });
+    mocks.librarySessionDetail.mockResolvedValue({ status: 'ok', data: detail({ kind: 'live', retranscribe: alternate }) });
+    render(Session, { routeParams: { id: 's1' } });
+
+    const sources = await screen.findAllByRole('combobox', { name: 'Nguồn cho thao tác' });
+    await fireEvent.change(sources[0], { target: { value: 'retranscribe' } });
+    await fireEvent.click(screen.getByRole('button', { name: 'So sánh cạnh nhau' }));
+    expect(screen.getByRole('region', { name: 'Bản live' })).toBeTruthy();
+    expect(screen.getByRole('region', { name: 'Bản từ Recording' })).toBeTruthy();
+    expect(screen.getByText('Offset thời gian: +0s')).toBeTruthy();
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Xuất TXT' }));
+    expect(mocks.libraryTranscriptExport).toHaveBeenCalledWith('s1', 't2', 'txt', 0, VI_GAP_LABELS);
+    await fireEvent.click(screen.getByRole('button', { name: /từ recording/ }));
+    expect(screen.getByRole('slider', { name: 'Tua' }).getAttribute('aria-valuenow')).toBe('7');
+    expect((screen.getAllByRole('combobox', { name: 'Nguồn cho thao tác' })[0] as HTMLSelectElement).value).toBe('retranscribe');
+  });
+
+  it('starts a cancellable Recording retranscribe from the session menu', async () => {
+    mocks.librarySessionGet.mockResolvedValue({
+      status: 'ok',
+      data: { kind: 'session', sessionId: 's1', title: 'cuộc họp', durationSec: 120, status: 'complete', partial: false, transcriptId: 't1' },
+    });
+    mocks.librarySessionDetail.mockResolvedValue({ status: 'ok', data: detail({ kind: 'live' }) });
+    mocks.transcribeRecording.mockResolvedValue({ status: 'ok', data: { kind: 'started', jobId: 'job-recording' } });
+    render(Session, { routeParams: { id: 's1' } });
+
+    await screen.findByRole('heading', { name: 'cuộc họp' });
+    await fireEvent.click(screen.getByRole('button', { name: 'Thao tác khác' }));
+    await fireEvent.click(screen.getByRole('menuitem', { name: 'Transcribe lại từ Recording' }));
+    expect(mocks.transcribeRecording).toHaveBeenCalledWith('s1');
+    await waitFor(() => expect(mocks.jobsSubscribe).toHaveBeenCalledTimes(1));
+    capturedChannel!.onmessage({
+      kind: 'snapshot',
+      seq: 1,
+      jobs: [job({ jobId: 'job-recording', sessionId: 's1', kind: 'retranscribe', sourceName: null })],
+    });
+    expect(await screen.findByRole('heading', { name: 'Đang transcribe Recording' })).toBeTruthy();
+  });
+
+  it('shows disconnected gaps with a retranscribe hint and no live-gap retry', async () => {
+    mocks.librarySessionGet.mockResolvedValue({
+      status: 'ok',
+      data: { kind: 'session', sessionId: 's1', title: 'cuộc họp', durationSec: 120, status: 'complete', partial: false, transcriptId: 't1' },
+    });
+    mocks.librarySessionDetail.mockResolvedValue({
+      status: 'ok',
+      data: detail({
+        kind: 'live',
+        transcript: { ...detail().transcript, segments: [gapSegment(0, 5, 10, 'disconnected')] },
+      }),
+    });
+    render(Session, { routeParams: { id: 's1' } });
+
+    expect(await screen.findByText('Mất kết nối')).toBeTruthy();
+    expect(screen.getByText('Transcribe lại từ Recording để bổ sung khoảng thiếu này.')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /Chạy lại khoảng này/ })).toBeNull();
+  });
+
+  it('retries a failed retranscribe gap against its retranscribe ID', async () => {
+    const alternate = {
+      ...detail().transcript,
+      id: 't2',
+      variant: 'retranscribe',
+      status: 'partial',
+      segments: [gapSegment(4, 30, 40, 'chunk_failed')],
+    };
+    mocks.librarySessionGet.mockResolvedValue({
+      status: 'ok',
+      data: { kind: 'session', sessionId: 's1', title: 'cuộc họp', durationSec: 120, status: 'complete', partial: false, transcriptId: 't1' },
+    });
+    mocks.librarySessionDetail.mockResolvedValue({ status: 'ok', data: detail({ kind: 'live', retranscribe: alternate }) });
+    mocks.transcribeRerun.mockResolvedValue({ status: 'ok', data: { kind: 'started', jobId: 'job-gap' } });
+    render(Session, { routeParams: { id: 's1' } });
+
+    await fireEvent.click((await screen.findAllByRole('button', { name: 'Bản từ Recording' }))[0]);
+    await fireEvent.click(await screen.findByRole('button', { name: /Chạy lại khoảng này/ }));
+    expect(mocks.transcribeRerun).toHaveBeenCalledWith('s1', 't2', { kind: 'gap', gapId: 4 });
   });
 
   it('shows a partial banner listing the chunk_failed ranges, with two rerun buttons', async () => {

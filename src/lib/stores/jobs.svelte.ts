@@ -226,6 +226,17 @@ export function createJobsStore() {
     }
   }
 
+  async function retranscribe(sessionId: string): Promise<TranscribeRerunOutcome | { error: AppError }> {
+    try {
+      const result = await commands.transcribeRecording(sessionId);
+      return result.status === 'ok' ? result.data : { error: result.error };
+    } catch {
+      return {
+        error: { category: 'network', code: 'network', detailRedacted: 'recording transcribe unavailable' },
+      };
+    }
+  }
+
   async function cancel(jobId: string): Promise<CancelOutcome | null> {
     try {
       const result = await commands.jobsCancel(jobId);
@@ -277,6 +288,7 @@ export function createJobsStore() {
     unsubscribe,
     start,
     rerun,
+    retranscribe,
     cancel,
     reset,
   };

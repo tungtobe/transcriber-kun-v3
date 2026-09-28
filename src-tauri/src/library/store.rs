@@ -864,6 +864,7 @@ pub struct SessionDetail {
     pub source_name: Option<String>,
     pub proxy_path: Option<String>,
     pub transcript: Option<TranscriptDetail>,
+    pub retranscribe: Option<TranscriptDetail>,
     /// Tag đang gắn với Phiên này (story 3.2) — tên tăng dần
     /// (`library::tags::list_for_session`). Không phụ thuộc
     /// tên/transcript: đổi tên hay Chạy lại không đụng tới danh sách này
@@ -915,26 +916,37 @@ pub fn get_detail(
         None => None,
     };
 
-    let transcript = db.with_connection(|conn| {
-        let Some(transcript_id) = repo::transcripts::primary_for_session(conn, session_id)? else {
-            return Ok(None);
+    let load_transcript =
+        |transcript_id: Option<TranscriptId>| -> Result<Option<TranscriptDetail>, AppError> {
+            let Some(transcript_id) = transcript_id else {
+                return Ok(None);
+            };
+            db.with_connection(|conn| {
+                let Some(transcript_row) = repo::transcripts::get(conn, transcript_id)? else {
+                    return Ok(None);
+                };
+                let segments = repo::segments::list_for_transcript(conn, transcript_id)?
+                    .into_iter()
+                    .map(segment_row_to_detail)
+                    .collect();
+                Ok(Some(TranscriptDetail {
+                    id: transcript_row.id,
+                    variant: transcript_row.variant.as_str().to_string(),
+                    status: transcript_row.status.as_str().to_string(),
+                    model: transcript_row.model,
+                    language: transcript_row.language,
+                    segments,
+                }))
+            })
         };
-        let Some(transcript_row) = repo::transcripts::get(conn, transcript_id)? else {
-            return Ok(None);
-        };
-        let segments = repo::segments::list_for_transcript(conn, transcript_id)?
-            .into_iter()
-            .map(segment_row_to_detail)
-            .collect();
-        Ok(Some(TranscriptDetail {
-            id: transcript_row.id,
-            variant: transcript_row.variant.as_str().to_string(),
-            status: transcript_row.status.as_str().to_string(),
-            model: transcript_row.model,
-            language: transcript_row.language,
-            segments,
-        }))
+    let (primary_id, retranscribe_id) = db.with_connection(|conn| {
+        Ok((
+            repo::transcripts::primary_for_session(conn, session_id)?,
+            repo::transcripts::retranscribe_for_session(conn, session_id)?,
+        ))
     })?;
+    let transcript = load_transcript(primary_id)?;
+    let retranscribe = load_transcript(retranscribe_id)?;
 
     let tags = crate::library::tags::list_for_session(db, session_id)?;
     let has_memo =
@@ -950,6 +962,7 @@ pub fn get_detail(
         source_name: session.source_name,
         proxy_path,
         transcript,
+        retranscribe,
         tags,
         has_memo,
     }))
@@ -1144,6 +1157,55 @@ pub fn swap_transcript(
     })?;
 
     Ok(swapped.then_some(new_id))
+}
+
+/// Publish a complete candidate only if the current retranscribe variant is
+/// still the one observed when the job began. The transaction also checks
+/// that the live session still exists and is finalized.
+pub fn commit_retranscribe(
+    db: &Db,
+    session_id: SessionId,
+    expected_id: Option<TranscriptId>,
+    draft: TranscriptDraft,
+) -> Result<Option<TranscriptId>, AppError> {
+    let new_id = TranscriptId::new();
+    let now = now_ms();
+    let committed = db.with_connection(|conn| {
+        let tx = conn.transaction()?;
+        let Some(session) = repo::sessions::get(&tx, session_id)? else {
+            return Ok(false);
+        };
+        if session.kind != "live" || session.status != "complete" {
+            return Ok(false);
+        }
+        let current = repo::transcripts::retranscribe_for_session(&tx, session_id)?;
+        if current != expected_id {
+            return Ok(false);
+        }
+        if let Some(old_id) = current {
+            tx.execute(
+                "DELETE FROM transcripts WHERE id = ?1",
+                [old_id.to_string()],
+            )?;
+        }
+        repo::transcripts::insert_with_segments(
+            &tx,
+            new_id,
+            session_id,
+            repo::transcripts::Variant::Retranscribe,
+            &draft.model,
+            draft.language.as_deref(),
+            &draft.segments,
+            now,
+        )?;
+        #[cfg(test)]
+        if fault::should_fail(fault::Point::Commit) {
+            return Err(storage_error("injected: commit failure"));
+        }
+        tx.commit()?;
+        Ok(true)
+    })?;
+    Ok(committed.then_some(new_id))
 }
 
 /// Chạy lại: thay transcript `primary` của một Phiên có sẵn trong một

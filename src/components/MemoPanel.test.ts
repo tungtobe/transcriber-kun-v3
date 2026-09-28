@@ -47,6 +47,7 @@ vi.mock('../lib/bindings', async (importOriginal) => {
 
 const SESSION_ID = 'session-1';
 const TEMPLATE_ID = 'template-1';
+const TRANSCRIPT_ID = 'transcript-1';
 
 function template(): MemoTemplate {
   return {
@@ -82,6 +83,8 @@ const quotaError: AppError = { category: 'quota', code: 'quota', detailRedacted:
 function baseProps(overrides: Record<string, unknown> = {}) {
   return {
     sessionId: SESSION_ID,
+    transcriptId: TRANSCRIPT_ID,
+    sourceVariant: 'primary' as const,
     active: true,
     hasTranscript: true,
     segmentTextCount: 5,
@@ -167,7 +170,7 @@ describe('MemoPanel cached memo', () => {
     render(MemoPanel, baseProps());
     await Promise.resolve();
 
-    expect(mocks.memoStore.load).toHaveBeenCalledWith(SESSION_ID, TEMPLATE_ID);
+    expect(mocks.memoStore.load).toHaveBeenCalledWith(SESSION_ID, TEMPLATE_ID, TRANSCRIPT_ID);
     expect(mocks.memoStore.generate).not.toHaveBeenCalled();
     expect(screen.getByText(/bản gốc/)).toBeTruthy();
   });
@@ -180,7 +183,7 @@ describe('MemoPanel cached memo', () => {
     await Promise.resolve();
 
     expect(screen.getByText('Memo sinh từ bản trước')).toBeTruthy();
-    expect(screen.getByText(/bản chạy lại/)).toBeTruthy();
+    expect(screen.getByText(/bản transcript trước/)).toBeTruthy();
   });
 
   it('does not show the stale label when fromPreviousTranscript is false', async () => {
@@ -228,7 +231,7 @@ describe('MemoPanel inline categorized error', () => {
     await Promise.resolve();
 
     expect(mocks.notesStore.flush).toHaveBeenCalledWith(SESSION_ID);
-    expect(mocks.memoStore.generate).toHaveBeenCalledWith(SESSION_ID, TEMPLATE_ID, 'vi');
+    expect(mocks.memoStore.generate).toHaveBeenCalledWith(SESSION_ID, TEMPLATE_ID, 'vi', TRANSCRIPT_ID);
   });
 });
 

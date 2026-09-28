@@ -30,6 +30,7 @@ pub enum JobState {
 pub enum JobKind {
     Transcribe,
     Rerun,
+    Retranscribe,
 }
 
 /// Ảnh chụp một Job tại một thời điểm — đủ để UI vẽ "32 / 90 phút · 36 %",

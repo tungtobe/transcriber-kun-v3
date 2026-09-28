@@ -30,6 +30,8 @@
     matches = [],
     activeMatchIndex = -1,
     rerunStarting,
+    rerunAvailable = true,
+    disconnectedHint = false,
     onSeek,
     onTogglePlay,
     onRerun,
@@ -42,6 +44,8 @@
     matches?: TranscriptSearchMatch[];
     activeMatchIndex?: number;
     rerunStarting: boolean;
+    rerunAvailable?: boolean;
+    disconnectedHint?: boolean;
     onSeek: (startSec: number) => void;
     onTogglePlay: () => void;
     onRerun: (scope: RerunScope) => void;
@@ -200,7 +204,10 @@
                 ? i18n.t('session.segment.gapChunkFailed')
                 : i18n.t('session.segment.gapDisconnected')}
             </span>
-            {#if segment.gapReason === 'chunk_failed'}
+            {#if segment.gapReason === 'disconnected' && disconnectedHint}
+              <span class="segment-gap-hint">{i18n.t('session.segment.gapDisconnectedHint')}</span>
+            {/if}
+            {#if segment.gapReason === 'chunk_failed' && rerunAvailable}
               <button
                 type="button"
                 class="segment-gap-rerun"
@@ -331,6 +338,11 @@
     flex-wrap: wrap;
     align-items: center;
     gap: var(--space-3);
+  }
+
+  .segment-gap-hint {
+    color: var(--color-text-secondary);
+    font-size: var(--text-help-size);
   }
 
   .segment-gap-label {

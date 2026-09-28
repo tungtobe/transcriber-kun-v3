@@ -131,6 +131,17 @@ pub struct RerunParams {
     pub consent: ConsentSnapshot,
 }
 
+#[derive(Debug, Clone)]
+pub struct RetranscribeParams {
+    pub session_id: SessionId,
+    pub expected_id: Option<TranscriptId>,
+    pub source_path: PathBuf,
+    pub model: String,
+    pub language: TranscribeLanguage,
+    pub chunk_minutes: u32,
+    pub consent: ConsentSnapshot,
+}
+
 /// Trả về từ `JobRegistryHandle::start_rerun` (spec Always: "Mỗi Phiên tối
 /// đa một Job Chạy lại đang chờ/chạy: gọi lại trả Job hiện có" -- và "khi
 /// Phiên đã có một Job Chạy lại đang chờ/chạy với `transcript_id`/`ranges`
@@ -280,6 +291,18 @@ impl JobRegistryHandle {
         response.await.map_err(|_| actor_error())
     }
 
+    pub async fn start_retranscribe(
+        &self,
+        params: RetranscribeParams,
+    ) -> Result<RerunOutcome, AppError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::StartRetranscribe { params, reply })
+            .await
+            .map_err(|_| actor_error())?;
+        response.await.map_err(|_| actor_error())
+    }
+
     pub async fn cancel(&self, job_id: JobId) -> Result<CancelOutcome, AppError> {
         let (reply, response) = oneshot::channel();
         self.commands
@@ -352,6 +375,10 @@ enum Command {
     },
     StartRerun {
         params: RerunParams,
+        reply: oneshot::Sender<RerunOutcome>,
+    },
+    StartRetranscribe {
+        params: RetranscribeParams,
         reply: oneshot::Sender<RerunOutcome>,
     },
     Cancel {
@@ -481,6 +508,7 @@ pub struct JobRegistryActor {
     /// given `JobId` only ever appears in one of the two maps — `kind` on
     /// its `JobEntry` says which.
     pending_rerun_params: HashMap<JobId, RerunParams>,
+    pending_retranscribe_params: HashMap<JobId, RetranscribeParams>,
     subscribers: Vec<Channel<JobEvent>>,
 }
 
@@ -507,6 +535,7 @@ pub fn channel(
         jobs: HashMap::new(),
         pending_params: HashMap::new(),
         pending_rerun_params: HashMap::new(),
+        pending_retranscribe_params: HashMap::new(),
         subscribers: Vec::new(),
     };
     (handle, actor)
@@ -526,6 +555,9 @@ impl JobRegistryActor {
                 let _ = reply.send(self.find_transcribe_job_by_hash(&source_hash));
             }
             Command::StartRerun { params, reply } => self.handle_start_rerun(params, reply),
+            Command::StartRetranscribe { params, reply } => {
+                self.handle_start_retranscribe(params, reply)
+            }
             Command::Cancel { job_id, reply } => self.handle_cancel(job_id, reply),
             Command::Subscribe { channel, reply } => self.handle_subscribe(channel, reply),
             Command::Unsubscribe { channel_id, reply } => {
@@ -623,11 +655,11 @@ impl JobRegistryActor {
     /// trong cùng hàng đợi.
     fn handle_start_rerun(&mut self, params: RerunParams, reply: oneshot::Sender<RerunOutcome>) {
         let existing = self.jobs.iter().find_map(|(job_id, entry)| {
-            (entry.session_id == params.session_id && entry.kind == JobKind::Rerun)
-                .then_some((*job_id, entry))
+            (entry.session_id == params.session_id).then_some((*job_id, entry))
         });
         if let Some((job_id, entry)) = existing {
-            let same_target = entry.rerun_transcript_id == Some(params.transcript_id)
+            let same_target = entry.kind == JobKind::Rerun
+                && entry.rerun_transcript_id == Some(params.transcript_id)
                 && entry.rerun_ranges.as_deref() == Some(params.ranges.as_slice());
             let outcome = if same_target {
                 RerunOutcome::Existing { job_id }
@@ -673,6 +705,59 @@ impl JobRegistryActor {
         }
     }
 
+    fn handle_start_retranscribe(
+        &mut self,
+        params: RetranscribeParams,
+        reply: oneshot::Sender<RerunOutcome>,
+    ) {
+        if let Some((job_id, entry)) = self
+            .jobs
+            .iter()
+            .find(|(_, entry)| entry.session_id == params.session_id)
+        {
+            let outcome = if entry.kind == JobKind::Retranscribe {
+                RerunOutcome::Existing { job_id: *job_id }
+            } else {
+                RerunOutcome::Busy { job_id: *job_id }
+            };
+            let _ = reply.send(outcome);
+            return;
+        }
+        let job_id = JobId::new();
+        let will_run_now = self.order.is_empty();
+        self.jobs.insert(
+            job_id,
+            JobEntry {
+                session_id: params.session_id,
+                source_name: None,
+                source_hash: None,
+                kind: JobKind::Retranscribe,
+                state: if will_run_now {
+                    JobState::Running
+                } else {
+                    JobState::Queued
+                },
+                processed_ms: 0,
+                total_ms: 0,
+                chunk_index: 0,
+                chunk_count: 0,
+                key_ordinal: None,
+                attempt: None,
+                waiting_quota: false,
+                cancel: CancellationToken::new(),
+                rerun_transcript_id: None,
+                rerun_ranges: None,
+            },
+        );
+        self.order.push_back(job_id);
+        self.pending_retranscribe_params.insert(job_id, params);
+        let _ = reply.send(RerunOutcome::Started { job_id });
+        self.broadcast_updated(job_id);
+        if will_run_now {
+            self.start_pipeline_for(job_id);
+        }
+    }
+
     fn handle_cancel(&mut self, job_id: JobId, reply: oneshot::Sender<CancelOutcome>) {
         let Some(entry) = self.jobs.get(&job_id) else {
             let _ = reply.send(CancelOutcome::AlreadyFinished);
@@ -691,6 +776,7 @@ impl JobRegistryActor {
         self.jobs.remove(&job_id);
         self.pending_params.remove(&job_id);
         self.pending_rerun_params.remove(&job_id);
+        self.pending_retranscribe_params.remove(&job_id);
         let _ = reply.send(CancelOutcome::Cancelling);
         let seq = self.next_seq();
         self.broadcast(JobEvent::Cancelled { seq, job_id });
@@ -816,6 +902,24 @@ impl JobRegistryActor {
             return;
         }
 
+        if let Some(params) = self.pending_retranscribe_params.remove(&job_id) {
+            tokio::spawn(async move {
+                let outcome = run_retranscribe_job(
+                    job_id,
+                    session_id,
+                    &params,
+                    &db,
+                    &transcriber,
+                    &cancel,
+                    &handle,
+                )
+                .await;
+                handle
+                    .send_internal(Internal::Finished { job_id, outcome })
+                    .await;
+            });
+            return;
+        }
         let Some(params) = self.pending_rerun_params.remove(&job_id) else {
             return;
         };
@@ -1271,6 +1375,88 @@ fn segment_row_to_draft(row: SegmentRow) -> SegmentDraft {
         gap_reason: row.gap_reason,
         text: row.text,
         speaker: row.speaker,
+    }
+}
+
+async fn run_retranscribe_job(
+    job_id: JobId,
+    session_id: SessionId,
+    params: &RetranscribeParams,
+    db: &Arc<Db>,
+    transcriber: &Arc<dyn ChunkTranscriber>,
+    cancel: &CancellationToken,
+    handle: &JobRegistryHandle,
+) -> JobOutcome {
+    if cancel.is_cancelled() {
+        return JobOutcome::Cancelled;
+    }
+    let source = params.source_path.clone();
+    let probe = match tokio::task::spawn_blocking(move || media::probe(&source)).await {
+        Ok(Ok(info)) => info,
+        Ok(Err(err)) => return JobOutcome::Error(err),
+        Err(_) => return JobOutcome::Error(actor_error()),
+    };
+    let total_ms = (probe.duration_seconds * 1000.0).round().max(0.0) as u64;
+    let chunk_count = estimate_chunk_count(total_ms, params.chunk_minutes);
+    handle
+        .send_internal(Internal::Progress {
+            job_id,
+            processed_ms: 0,
+            total_ms,
+            chunk_index: 0,
+            chunk_count,
+        })
+        .await;
+    let decode_params = StartParams {
+        source_path: params.source_path.clone(),
+        source_hash: String::new(),
+        source_name: None,
+        model: params.model.clone(),
+        language: params.language,
+        chunk_minutes: params.chunk_minutes,
+        consent: params.consent,
+    };
+    let (segments, outcome) = decode_and_transcribe(
+        job_id,
+        &decode_params,
+        total_ms,
+        chunk_count,
+        db,
+        transcriber,
+        cancel,
+        handle,
+    )
+    .await;
+    if let Some(outcome) = outcome {
+        return outcome;
+    }
+    if cancel.is_cancelled() {
+        return JobOutcome::Cancelled;
+    }
+    let db = db.clone();
+    let expected_id = params.expected_id;
+    let model = params.model.clone();
+    let language = params.language.as_code().map(str::to_string);
+    match tokio::task::spawn_blocking(move || {
+        store::commit_retranscribe(
+            &db,
+            session_id,
+            expected_id,
+            TranscriptDraft {
+                model,
+                language,
+                segments,
+            },
+        )
+    })
+    .await
+    {
+        Ok(Ok(Some(_))) => JobOutcome::Committed(session_id),
+        Ok(Ok(None)) => {
+            JobOutcome::Error(AppError::new(Code::Request, "Retranscribe target changed"))
+        }
+        Ok(Err(err)) => JobOutcome::Error(err),
+        Err(_) => JobOutcome::Error(actor_error()),
     }
 }
 
@@ -2757,6 +2943,172 @@ mod tests {
             .with_connection(|conn| Ok(repo::segments::list_for_transcript(conn, transcript_id)?))
             .unwrap();
         rerun::resolve_ranges(RerunScope::Missing, &rows, total_duration_ms).unwrap()
+    }
+
+    fn seed_live_retranscribe_session(
+        root: &Path,
+        db: &Db,
+        session_id: SessionId,
+        primary_id: TranscriptId,
+        retranscribe_id: Option<TranscriptId>,
+    ) -> PathBuf {
+        let recording_path = paths::recording_path(root, session_id);
+        std::fs::create_dir_all(recording_path.parent().unwrap()).unwrap();
+        wav_fixture_seconds(recording_path.parent().unwrap(), "recording.wav", 1);
+        db.with_connection(|conn| {
+            repo::sessions::insert(
+                conn,
+                repo::sessions::NewSession {
+                    id: session_id,
+                    kind: "live",
+                    title: "Live session",
+                    source_hash: None,
+                    source_name: None,
+                    status: "complete",
+                    recovered: true,
+                    duration_sec: 1.0,
+                    proxy_ext: None,
+                    created_at: 0,
+                    updated_at: 0,
+                },
+            )?;
+            repo::transcripts::insert_with_segments(
+                conn,
+                primary_id,
+                session_id,
+                Variant::Primary,
+                "live-model",
+                None,
+                &[rerun_text_draft(0.0, 1.0, "live source")],
+                0,
+            )?;
+            if let Some(id) = retranscribe_id {
+                repo::transcripts::insert_with_segments(
+                    conn,
+                    id,
+                    session_id,
+                    Variant::Retranscribe,
+                    "old-model",
+                    None,
+                    &[rerun_text_draft(0.0, 1.0, "old recording transcript")],
+                    0,
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        recording_path
+    }
+
+    fn retranscribe_params(
+        session_id: SessionId,
+        expected_id: Option<TranscriptId>,
+        source_path: PathBuf,
+    ) -> RetranscribeParams {
+        RetranscribeParams {
+            session_id,
+            expected_id,
+            source_path,
+            model: "gemini-flash-lite-latest".to_string(),
+            language: TranscribeLanguage::Auto,
+            chunk_minutes: 5,
+            consent: ConsentSnapshot::new(1, false),
+        }
+    }
+
+    #[tokio::test]
+    async fn recording_retranscribe_publishes_first_and_repeat_variants_without_touching_live() {
+        let root = tempdir().unwrap();
+        let db = Arc::new(Db::open(root.path()).unwrap());
+        seed_current_consent(&db);
+        let session_id = SessionId::new();
+        let primary_id = TranscriptId::new();
+        let source = seed_live_retranscribe_session(root.path(), &db, session_id, primary_id, None);
+        let transcriber = FakeTranscriber::new(vec![
+            Behavior::Success("first recording transcript".to_string()),
+            Behavior::Success("replacement recording transcript".to_string()),
+        ]);
+        let (handle, actor) = channel(db.clone(), root.path().to_path_buf(), transcriber);
+        tokio::spawn(actor.run());
+
+        assert!(matches!(
+            handle.start_retranscribe(retranscribe_params(session_id, None, source.clone())).await.unwrap(),
+            RerunOutcome::Started { .. }
+        ));
+        wait_until_empty(&handle, Duration::from_secs(5)).await;
+        let first_id = db.with_connection(|conn| Ok(repo::transcripts::retranscribe_for_session(conn, session_id)?)).unwrap().unwrap();
+
+        assert!(matches!(
+            handle.start_retranscribe(retranscribe_params(session_id, Some(first_id), source)).await.unwrap(),
+            RerunOutcome::Started { .. }
+        ));
+        wait_until_empty(&handle, Duration::from_secs(5)).await;
+        let current_id = db.with_connection(|conn| Ok(repo::transcripts::retranscribe_for_session(conn, session_id)?)).unwrap().unwrap();
+        assert_ne!(current_id, first_id);
+        let count: i64 = db.with_connection(|conn| Ok(conn.query_row(
+            "SELECT count(*) FROM transcripts WHERE session_id = ?1 AND variant = 'retranscribe'",
+            [session_id.to_string()],
+            |row| row.get(0),
+        )?)).unwrap();
+        assert_eq!(count, 1);
+        let primary = db.with_connection(|conn| Ok(repo::transcripts::get(conn, primary_id)?)).unwrap().unwrap();
+        assert_eq!(primary.variant, Variant::Primary);
+        let text = db.with_connection(|conn| Ok(repo::segments::list_for_transcript(conn, current_id)?[0].text.clone())).unwrap();
+        assert_eq!(text, "replacement recording transcript");
+    }
+
+    #[tokio::test]
+    async fn recording_retranscribe_partial_commits_gap_and_cancel_keeps_old_variant() {
+        let root = tempdir().unwrap();
+        let db = Arc::new(Db::open(root.path()).unwrap());
+        seed_current_consent(&db);
+        let session_id = SessionId::new();
+        let primary_id = TranscriptId::new();
+        let old_retranscribe_id = TranscriptId::new();
+        let source = seed_live_retranscribe_session(
+            root.path(),
+            &db,
+            session_id,
+            primary_id,
+            Some(old_retranscribe_id),
+        );
+        let transcriber = FakeTranscriber::new(vec![
+            Behavior::Fail { code: Code::Network, retryable: false },
+            Behavior::BlockUntilCancelled,
+        ]);
+        let (handle, actor) = channel(db.clone(), root.path().to_path_buf(), transcriber);
+        tokio::spawn(actor.run());
+
+        assert!(matches!(
+            handle.start_retranscribe(retranscribe_params(session_id, Some(old_retranscribe_id), source.clone())).await.unwrap(),
+            RerunOutcome::Started { .. }
+        ));
+        wait_until_empty(&handle, Duration::from_secs(5)).await;
+        let partial_id = db.with_connection(|conn| Ok(repo::transcripts::retranscribe_for_session(conn, session_id)?)).unwrap().unwrap();
+        assert_ne!(partial_id, old_retranscribe_id);
+        let partial = db.with_connection(|conn| Ok(repo::transcripts::get(conn, partial_id)?)).unwrap().unwrap();
+        assert_eq!(partial.status, crate::db::repo::transcripts::Status::Partial);
+        let partial_segments = db.with_connection(|conn| Ok(repo::segments::list_for_transcript(conn, partial_id)?)).unwrap();
+        assert!(partial_segments.iter().any(|segment| segment.kind == SegmentKind::Gap));
+
+        let outcome = handle.start_retranscribe(retranscribe_params(session_id, Some(partial_id), source)).await.unwrap();
+        let job_id = match outcome {
+            RerunOutcome::Started { job_id } => job_id,
+            other => panic!("expected a new retranscribe job, got {other:?}"),
+        };
+        wait_until_state(&handle, job_id, JobState::Running).await;
+        handle.cancel(job_id).await.unwrap();
+        wait_until_empty(&handle, Duration::from_secs(3)).await;
+        assert_eq!(
+            db.with_connection(|conn| Ok(repo::transcripts::retranscribe_for_session(conn, session_id)?)).unwrap(),
+            Some(partial_id),
+            "cancel leaves the published retranscribe variant intact"
+        );
+        assert_eq!(
+            db.with_connection(|conn| Ok(repo::transcripts::primary_for_session(conn, session_id)?)).unwrap(),
+            Some(primary_id),
+            "recording retranscribe never replaces live primary"
+        );
     }
 
     #[tokio::test]

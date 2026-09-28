@@ -87,10 +87,9 @@
   }
 
   export function seek(sec: number): void {
-    if (!audioEl) return;
     const clamped = Math.min(Math.max(sec, 0), duration > 0 ? duration : Math.max(sec, 0));
-    audioEl.currentTime = clamped;
     currentTime = clamped;
+    if (audioEl) audioEl.currentTime = clamped;
   }
 
   function handleSliderInput(event: Event): void {

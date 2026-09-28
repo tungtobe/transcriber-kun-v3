@@ -37,6 +37,7 @@
     onRenamed,
     onDeleted,
     onTagsChanged,
+    onRetranscribe,
   }: {
     sessionId: string;
     title: string;
@@ -61,6 +62,7 @@
     /** Gọi với danh sách tag mới sau khi gắn/gỡ/xoá -- `Session.svelte` cập
      * nhật `view.detail.tags`. */
     onTagsChanged: (tags: TagSummary[]) => void;
+    onRetranscribe?: () => void;
   } = $props();
 
   const LOCALE_TAG: Record<string, string> = { vi: 'vi-VN', en: 'en-US', ja: 'ja-JP' };
@@ -286,7 +288,12 @@
     {/if}
   </div>
 
-  <SessionMenu bind:this={menuRef} onRename={() => openRename('menu')} onDelete={startDelete} />
+  <SessionMenu
+    bind:this={menuRef}
+    onRename={() => openRename('menu')}
+    onDelete={startDelete}
+    onRetranscribe={kind === 'live' ? onRetranscribe : undefined}
+  />
 </header>
 
 {#if deleteConfirming}

@@ -221,13 +221,17 @@ fn capture_inputs(
     db: &Db,
     session_id: SessionId,
     template_id: MemoTemplateId,
+    selected_transcript_id: Option<TranscriptId>,
 ) -> Result<CapturedInputs, AppError> {
     let settings = crate::settings::load(db);
     db.with_connection(|conn| {
-        let transcript_id = repo::transcripts::primary_for_session(conn, session_id)?
+        let transcript_id = selected_transcript_id.or(repo::transcripts::primary_for_session(conn, session_id)?)
             .ok_or_else(|| AppError::new(Code::Request, "Phiên chưa có transcript"))?;
         let transcript = repo::transcripts::get(conn, transcript_id)?
             .ok_or_else(|| AppError::new(Code::Request, "Phiên chưa có transcript"))?;
+        if transcript.session_id != session_id {
+            return Err(AppError::new(Code::Request, "Transcript không thuộc Phiên này"));
+        }
         let segments = repo::segments::list_for_transcript(conn, transcript_id)?;
         if segments
             .iter()
@@ -307,8 +311,34 @@ pub async fn run(
     consent: ConsentSnapshot,
     cancellation: CancellationToken,
 ) -> Result<GenerateOutcome, AppError> {
+    run_for_source(
+        db,
+        gateway,
+        session_id,
+        template_id,
+        None,
+        locale,
+        consent,
+        cancellation,
+    )
+    .await
+}
+
+/// Generate a memo from the transcript selected in Session detail. The
+/// transcript ID is checked against the session before its segments enter
+/// the Gemini prompt.
+pub async fn run_for_source(
+    db: &Db,
+    gateway: &GeminiGateway,
+    session_id: SessionId,
+    template_id: MemoTemplateId,
+    selected_transcript_id: Option<TranscriptId>,
+    locale: &str,
+    consent: ConsentSnapshot,
+    cancellation: CancellationToken,
+) -> Result<GenerateOutcome, AppError> {
     let locale = Locale::parse(locale)?;
-    let inputs = capture_inputs(db, session_id, template_id)?;
+    let inputs = capture_inputs(db, session_id, template_id, selected_transcript_id)?;
 
     let transcript_block = format_transcript_block(
         &inputs.segments,
@@ -396,11 +426,23 @@ pub fn view(
     session_id: SessionId,
     template_id: MemoTemplateId,
 ) -> Result<Option<MemoView>, AppError> {
+    view_for_source(db, session_id, template_id, None)
+}
+
+pub fn view_for_source(
+    db: &Db,
+    session_id: SessionId,
+    template_id: MemoTemplateId,
+    selected_transcript_id: Option<TranscriptId>,
+) -> Result<Option<MemoView>, AppError> {
     db.with_connection(|conn| {
         let Some(row) = repo::memos::get(conn, session_id, template_id)? else {
             return Ok(None);
         };
-        let current_transcript_id = repo::transcripts::primary_for_session(conn, session_id)?;
+        let current_transcript_id = match selected_transcript_id {
+            Some(id) => Some(id),
+            None => repo::transcripts::primary_for_session(conn, session_id)?,
+        };
         let current_notes_revision = repo::notes::get(conn, session_id)?.map(|row| row.revision);
         Ok(Some(MemoView {
             body: row.body.into_inner(),
@@ -642,6 +684,66 @@ mod tests {
         let cached = view_after(&db, session_id, template.id);
         assert_eq!(cached.body, "# Memo");
         let _ = transcript_id;
+    }
+
+    #[tokio::test]
+    async fn run_for_source_builds_the_prompt_from_the_selected_transcript() {
+        let (_dir, db) = open_db();
+        let session_id = SessionId::new();
+        insert_session(&db, session_id);
+        let primary_id =
+            insert_transcript(&db, session_id, vec![draft_text(0.0, 2.0, "bản live")]);
+        let retranscribe_id = TranscriptId::new();
+        db.with_connection(|conn| {
+            Ok(repo::transcripts::insert_with_segments(
+                conn,
+                retranscribe_id,
+                session_id,
+                repo::transcripts::Variant::Retranscribe,
+                "gemini-flash-lite-latest",
+                None,
+                &[draft_text(0.0, 2.0, "bản từ recording")],
+                1,
+            )?)
+        })
+        .unwrap();
+        let template = crate::memo::templates::create(
+            &db,
+            "Mẫu".to_string(),
+            "Tóm tắt: {transcript}".to_string(),
+        )
+        .unwrap();
+        let transport = FakeTransport::new(vec![Ok(TransportResponse {
+            status: 200,
+            body: json!({"candidates":[{"content":{"parts":[{"text":"# Memo"}]}}]}).to_string(),
+        })]);
+        let gateway = gateway_with(
+            vec![crate::gemini::test_support::key("a", "AIzaA123456789")],
+            transport.clone(),
+        )
+        .await;
+
+        let outcome = run_for_source(
+            &db,
+            &gateway,
+            session_id,
+            template.id,
+            Some(retranscribe_id),
+            "vi",
+            ConsentSnapshot::new(1, false),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome, GenerateOutcome::Generated(_)));
+        let request = transport.requests().pop().unwrap();
+        let body: Value = serde_json::from_str(request.body.as_ref().unwrap().expose()).unwrap();
+        let prompt = body.pointer("/contents/0/parts/0/text").unwrap().as_str().unwrap();
+        assert!(prompt.contains("[00:00] bản từ recording"));
+        assert!(!prompt.contains("bản live"));
+        assert_eq!(view(&db, session_id, template.id).unwrap().unwrap().from_previous_transcript, true);
+        assert_ne!(primary_id, retranscribe_id);
     }
 
     fn view_after(db: &Db, session_id: SessionId, template_id: MemoTemplateId) -> MemoView {
