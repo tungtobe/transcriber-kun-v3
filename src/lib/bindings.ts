@@ -38,6 +38,12 @@ export const commands = {
 	 */
 	liveStop: () => typedError<null, AppError>(__TAURI_INVOKE("live_stop")),
 	/**
+	 *  Keep WAV capture running after five consecutive Gemini Live setup rejections.
+	 *  This records a session-scoped choice in the LiveSession actor and never
+	 *  starts another Gemini connection for the current session.
+	 */
+	liveContinueRecordingOnly: () => typedError<null, AppError>(__TAURI_INVOKE("live_continue_recording_only")),
+	/**
 	 *  Register a live event Channel and send its state snapshot atomically with
 	 *  registration through the LiveSession actor.
 	 */
@@ -574,7 +580,7 @@ export type KeyTestResult = {
  *  Typed Live stream. The ready variant carries the snapshot and cursor sent
  *  by the actor in the same command that registers the Channel.
  */
-export type LiveEvent = { type: "ready"; seq: number; snapshot: LiveSnapshot } | { type: "delta"; seq: number; text: string } | { type: "turn"; seq: number } | { type: "segment"; seq: number; segment: LiveSegment } | { type: "gap"; seq: number; startSec: number | null; endSec: number | null; reason: string } | { type: "recording"; seq: number; state: RecordingState } | { type: "connection"; seq: number; state: ConnectionState } | { type: "log"; seq: number; message: string } | { type: "error"; seq: number; error: AppError } | { type: "done"; seq: number } | { type: "final"; seq: number; sessionId: string; transcriptId: string; durationSec: number | null };
+export type LiveEvent = { type: "ready"; seq: number; snapshot: LiveSnapshot } | { type: "delta"; seq: number; text: string } | { type: "turn"; seq: number } | { type: "segment"; seq: number; segment: LiveSegment } | { type: "gap"; seq: number; startSec: number | null; endSec: number | null; reason: string } | { type: "recording"; seq: number; state: RecordingState } | { type: "connection"; seq: number; state: ConnectionState } | { type: "transcription"; seq: number; state: TranscriptionState } | { type: "log"; seq: number; message: string } | { type: "error"; seq: number; error: AppError } | { type: "done"; seq: number } | { type: "final"; seq: number; sessionId: string; transcriptId: string; durationSec: number | null };
 
 /**
  *  A microphone visible to the frontend. `source` is the opaque value passed
@@ -597,6 +603,8 @@ export type LiveSnapshot = {
 	transcriptId: string | null,
 	recording: RecordingState,
 	connection: ConnectionState,
+	transcription: TranscriptionState,
+	errorCategory: Category | null,
 	durationSec: number | null,
 };
 
@@ -991,6 +999,8 @@ export type TranscriptExportOutcome = {
 	saved: boolean,
 	hasGaps: boolean,
 };
+
+export type TranscriptionState = "active" | "setupRejected" | "recordingOnly" | "stopped";
 
 /**
  *  Preference ngôn ngữ UI. `System` resolve ở frontend từ locale của WebView;

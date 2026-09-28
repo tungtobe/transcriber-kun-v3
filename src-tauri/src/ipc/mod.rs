@@ -256,6 +256,21 @@ async fn live_stop(state: tauri::State<'_, AppState>) -> Result<(), AppError> {
     track_ipc_error(&state.db, result).await
 }
 
+/// Keep WAV capture running after five consecutive Gemini Live setup rejections.
+/// This records a session-scoped choice in the LiveSession actor and never
+/// starts another Gemini connection for the current session.
+#[tauri::command]
+#[specta::specta]
+async fn live_continue_recording_only(
+    state: tauri::State<'_, AppState>,
+) -> Result<(), AppError> {
+    let result = match state.live.clone() {
+        Ok(live) => live.continue_recording_only().await,
+        Err(error) => Err(error),
+    };
+    track_ipc_error(&state.db, result).await
+}
+
 /// Register a live event Channel and send its state snapshot atomically with
 /// registration through the LiveSession actor.
 #[tauri::command]
@@ -2349,6 +2364,7 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             live_set_source,
             live_start,
             live_stop,
+            live_continue_recording_only,
             live_subscribe,
             settings_get,
             settings_save,

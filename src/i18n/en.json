@@ -18,6 +18,7 @@
   "live.connection.connected": "Connected",
   "live.connection.reconnecting": "Reconnecting",
   "live.connection.stopped": "Disconnected",
+  "live.connection.transcriptStopped": "Transcript stopped",
   "live.error.title": "Live needs attention",
   "live.category.quota": "The Gemini key has reached its usage limit.",
   "live.category.auth": "Gemini authentication failed. Check the key in Settings.",
@@ -535,5 +536,16 @@
   "memoPanel.export.copyError": "Could not copy",
   "memoPanel.export.exportSuccess": "Saved the .md file",
   "memoPanel.export.exportError": "Could not save the file",
-  "memoPanel.toast.ready": "Memo is ready"
+  "memoPanel.toast.ready": "Memo is ready",
+  "live.connection.reconnectingElapsed": "Reconnecting · {elapsed}",
+  "live.connection.reconnectingStatus": "Connection lost. Reconnecting automatically ({elapsed}); recording continues.",
+  "live.setupRejected.title": "Live setup failed five times",
+  "live.setupRejected.description": "WAV recording is still running. Continue with audio only or stop the recording.",
+  "live.setupRejected.continueRecordingOnly": "Continue recording only",
+  "live.setupRejected.stop": "Stop",
+  "live.recordingOnly.title": "Recording audio only",
+  "live.recordingOnly.description": "WAV recording continues. After you stop, open the saved session and transcribe it again.",
+  "live.transcript.gapRange": "Connection lost {start}–{end}",
+  "live.category.openSettings": "Open Gemini Settings",
+  "live.transcript.stopped": "Live transcription has stopped."
 }

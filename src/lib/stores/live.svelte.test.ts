@@ -7,6 +7,7 @@ const mocks = vi.hoisted(() => ({
   liveSources: vi.fn(),
   liveStart: vi.fn(),
   liveStop: vi.fn(),
+  liveContinueRecordingOnly: vi.fn(),
   liveSetSource: vi.fn(),
 }));
 
@@ -22,6 +23,7 @@ vi.mock('../bindings', () => ({
     liveSources: (...args: unknown[]) => mocks.liveSources(...args),
     liveStart: (...args: unknown[]) => mocks.liveStart(...args),
     liveStop: (...args: unknown[]) => mocks.liveStop(...args),
+    liveContinueRecordingOnly: (...args: unknown[]) => mocks.liveContinueRecordingOnly(...args),
     liveSetSource: (...args: unknown[]) => mocks.liveSetSource(...args),
   },
 }));
@@ -34,6 +36,8 @@ function snapshot(sessionId: string | null = 'session-1') {
     transcriptId: sessionId ? 'transcript-1' : null,
     recording: sessionId ? 'active' as const : 'stopped' as const,
     connection: { type: sessionId ? 'connecting' as const : 'stopped' as const },
+    transcription: sessionId ? 'active' as const : 'stopped' as const,
+    errorCategory: null,
     durationSec: 0,
   };
 }
@@ -51,6 +55,7 @@ beforeEach(() => {
   } });
   mocks.liveStart.mockReset().mockResolvedValue({ status: 'ok', data: 'session-1' });
   mocks.liveStop.mockReset().mockResolvedValue({ status: 'ok', data: null });
+  mocks.liveContinueRecordingOnly.mockReset().mockResolvedValue({ status: 'ok', data: null });
   mocks.liveSetSource.mockReset().mockResolvedValue({ status: 'ok', data: null });
 });
 
@@ -122,5 +127,31 @@ describe('liveStore', () => {
     expect(store.deniedSource).toBe('mic:device-a');
     store.clearPermissionDenial();
     expect(store.deniedSource).toBeNull();
+  });
+
+  it('stores only category codes and restores the actor-owned recording-only choice on remount', async () => {
+    const { createLiveStore } = await import('./live.svelte');
+    const store = createLiveStore();
+    await store.subscribe();
+    const first = channels[0];
+    first.onmessage({
+      type: 'ready', seq: 0,
+      snapshot: { ...snapshot(), transcription: 'setupRejected' },
+    });
+    first.onmessage({
+      type: 'error', seq: 1,
+      error: { category: 'quota', code: 'quota', detailRedacted: 'private diagnostic detail' },
+    });
+    expect(store.error).toBe('quota');
+    expect(JSON.stringify(store.error)).not.toContain('private diagnostic detail');
+
+    store.unsubscribe();
+    await store.subscribe();
+    channels[1].onmessage({
+      type: 'ready', seq: 1,
+      snapshot: { ...snapshot(), transcription: 'recordingOnly', errorCategory: 'quota' },
+    });
+    expect(store.snapshot.transcription).toBe('recordingOnly');
+    expect(store.error).toBe('quota');
   });
 });

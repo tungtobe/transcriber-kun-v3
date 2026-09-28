@@ -4,12 +4,14 @@ import { Channel } from '@tauri-apps/api/core';
 import {
   commands,
   type AppError,
+  type Category,
   type ConnectionState,
   type LiveEvent,
   type LiveSegment,
   type LiveSnapshot,
   type LiveSources,
   type RecordingState,
+  type TranscriptionState,
   type TranscribeLanguage,
 } from '../bindings';
 
@@ -22,6 +24,8 @@ const EMPTY_SNAPSHOT: LiveSnapshot = {
   transcriptId: null,
   recording: 'stopped',
   connection: { type: 'stopped' },
+  transcription: 'stopped',
+  errorCategory: null,
   durationSec: null,
 };
 
@@ -39,7 +43,7 @@ export function createLiveStore() {
   let deniedSource = $state<string | null>(null);
   let lines = $state<LiveLine[]>([]);
   let draft = $state('');
-  let error = $state<AppError | null>(null);
+  let error = $state<Category | null>(null);
   let status = $state<'idle' | 'subscribed' | 'error'>('idle');
   let lastSeq: number | null = null;
   let generation = 0;
@@ -51,10 +55,10 @@ export function createLiveStore() {
     if (event.type === 'ready') {
       const changedSession = snapshot.sessionId !== event.snapshot.sessionId;
       snapshot = event.snapshot;
+      error = event.snapshot.errorCategory;
       if (changedSession) {
         lines = [];
         draft = '';
-        error = null;
       }
       lastSeq = event.seq;
       return;
@@ -90,8 +94,12 @@ export function createLiveStore() {
       case 'connection':
         snapshot = { ...snapshot, connection: event.state as ConnectionState };
         break;
+      case 'transcription':
+        snapshot = { ...snapshot, transcription: event.state as TranscriptionState };
+        break;
       case 'error':
-        error = event.error;
+        error = event.error.category;
+        snapshot = { ...snapshot, errorCategory: event.error.category };
         break;
       case 'final':
         snapshot = {
@@ -101,10 +109,13 @@ export function createLiveStore() {
           durationSec: event.durationSec,
           recording: 'stopped',
           connection: { type: 'stopped' },
+          transcription: 'stopped',
         };
         break;
       case 'done':
-        if (snapshot.recording === 'active') snapshot = { ...snapshot, recording: 'stopped' };
+        if (snapshot.recording === 'active') {
+          snapshot = { ...snapshot, recording: 'stopped', transcription: 'stopped' };
+        }
         break;
       case 'log':
         // Actor log messages are intentionally not retained; logs must stay
@@ -124,15 +135,14 @@ export function createLiveStore() {
       if (forGeneration !== generation) return;
       if (result.status === 'ok') {
         status = 'subscribed';
-        error = null;
       } else {
         status = 'error';
-        error = result.error;
+        error = result.error.category;
       }
     } catch {
       if (forGeneration !== generation) return;
       status = 'error';
-      error = UNAVAILABLE_ERROR;
+      error = UNAVAILABLE_ERROR.category;
     }
   }
 
@@ -191,16 +201,18 @@ export function createLiveStore() {
           transcriptId: null,
           recording: 'active',
           connection: { type: 'connecting' },
+          transcription: 'active',
+          errorCategory: null,
           durationSec: 0,
         };
         error = null;
         return null;
       }
-      error = result.error;
+      error = result.error.category;
       if (result.error.category === 'permission') deniedSource = source;
       return result.error;
     } catch {
-      error = UNAVAILABLE_ERROR;
+      error = UNAVAILABLE_ERROR.category;
       return UNAVAILABLE_ERROR;
     }
   }
@@ -209,10 +221,25 @@ export function createLiveStore() {
     try {
       const result = await commands.liveStop();
       if (result.status === 'ok') return null;
-      error = result.error;
+      error = result.error.category;
       return result.error;
     } catch {
-      error = UNAVAILABLE_ERROR;
+      error = UNAVAILABLE_ERROR.category;
+      return UNAVAILABLE_ERROR;
+    }
+  }
+
+  async function continueRecordingOnly(): Promise<AppError | null> {
+    try {
+      const result = await commands.liveContinueRecordingOnly();
+      if (result.status === 'ok') {
+        snapshot = { ...snapshot, transcription: 'recordingOnly' };
+        return null;
+      }
+      error = result.error.category;
+      return result.error;
+    } catch {
+      error = UNAVAILABLE_ERROR.category;
       return UNAVAILABLE_ERROR;
     }
   }
@@ -221,18 +248,18 @@ export function createLiveStore() {
     try {
       const result = await commands.liveSetSource(source);
       if (result.status === 'ok') return null;
-      error = result.error;
+      error = result.error.category;
       if (result.error.category === 'permission') deniedSource = source;
       return result.error;
     } catch {
-      error = UNAVAILABLE_ERROR;
+      error = UNAVAILABLE_ERROR.category;
       return UNAVAILABLE_ERROR;
     }
   }
 
   function clearPermissionDenial(): void {
     deniedSource = null;
-    if (error?.category === 'permission') error = null;
+    if (error === 'permission') error = null;
   }
 
   function reset(): void {
@@ -266,6 +293,7 @@ export function createLiveStore() {
     loadSources,
     start,
     stop,
+    continueRecordingOnly,
     setSource,
     clearPermissionDenial,
     reset,

@@ -18,6 +18,7 @@
   "live.connection.connected": "Đã kết nối",
   "live.connection.reconnecting": "Đang kết nối lại",
   "live.connection.stopped": "Đã ngắt kết nối",
+  "live.connection.transcriptStopped": "Đã dừng transcript",
   "live.error.title": "Live cần được xử lý",
   "live.category.quota": "Key Gemini đã hết hạn mức sử dụng.",
   "live.category.auth": "Xác thực Gemini thất bại. Kiểm tra key trong Cài đặt.",
@@ -535,5 +536,16 @@
   "memoPanel.export.copyError": "Không copy được",
   "memoPanel.export.exportSuccess": "Đã lưu file .md",
   "memoPanel.export.exportError": "Không lưu được file",
-  "memoPanel.toast.ready": "Memo đã sẵn sàng"
+  "memoPanel.toast.ready": "Memo đã sẵn sàng",
+  "live.connection.reconnectingElapsed": "Đang kết nối lại · {elapsed}",
+  "live.connection.reconnectingStatus": "Mất kết nối. App tự kết nối lại ({elapsed}); WAV vẫn đang ghi.",
+  "live.setupRejected.title": "Gemini Live từ chối thiết lập 5 lần",
+  "live.setupRejected.description": "WAV vẫn đang ghi. Chọn tiếp tục chỉ ghi âm hoặc dừng phiên.",
+  "live.setupRejected.continueRecordingOnly": "Tiếp tục chỉ ghi âm",
+  "live.setupRejected.stop": "Dừng",
+  "live.recordingOnly.title": "Đang chỉ ghi âm",
+  "live.recordingOnly.description": "WAV vẫn tiếp tục được lưu. Sau khi dừng, mở phiên đã lưu và chạy Transcribe lại.",
+  "live.transcript.gapRange": "Mất kết nối {start}–{end}",
+  "live.category.openSettings": "Mở Cài đặt Gemini",
+  "live.transcript.stopped": "Transcript Live đã dừng."
 }

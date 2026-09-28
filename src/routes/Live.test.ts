@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import { i18n } from '../i18n/index.svelte';
 import { installKeymap, keymap } from '../lib/keymap';
 import { liveStore } from '../lib/stores/live.svelte';
@@ -13,6 +13,7 @@ const mocks = vi.hoisted(() => ({
   liveSources: vi.fn(),
   liveStart: vi.fn(),
   liveStop: vi.fn(),
+  liveContinueRecordingOnly: vi.fn(),
   liveSetSource: vi.fn(),
   liveOpenPermissionSettings: vi.fn(),
   keysLoad: vi.fn(),
@@ -33,6 +34,7 @@ vi.mock('../lib/bindings', () => ({
     liveSources: (...args: unknown[]) => mocks.liveSources(...args),
     liveStart: (...args: unknown[]) => mocks.liveStart(...args),
     liveStop: (...args: unknown[]) => mocks.liveStop(...args),
+    liveContinueRecordingOnly: (...args: unknown[]) => mocks.liveContinueRecordingOnly(...args),
     liveSetSource: (...args: unknown[]) => mocks.liveSetSource(...args),
     liveOpenPermissionSettings: (...args: unknown[]) => mocks.liveOpenPermissionSettings(...args),
   },
@@ -72,6 +74,8 @@ function snapshot(sessionId: string | null = backendSessionId, durationSec = 0):
     transcriptId: sessionId ? 'transcript-1' : null,
     recording: sessionId ? 'active' : 'stopped',
     connection: { type: sessionId ? 'connected' : 'stopped' },
+    transcription: sessionId ? 'active' : 'stopped',
+    errorCategory: null,
     durationSec,
   };
 }
@@ -108,6 +112,7 @@ beforeEach(() => {
     return Promise.resolve({ status: 'ok', data: backendSessionId });
   });
   mocks.liveStop.mockReset().mockResolvedValue({ status: 'ok', data: null });
+  mocks.liveContinueRecordingOnly.mockReset().mockResolvedValue({ status: 'ok', data: null });
   mocks.liveSetSource.mockReset().mockResolvedValue({ status: 'ok', data: null });
   mocks.liveOpenPermissionSettings.mockReset().mockResolvedValue({ status: 'ok', data: null });
   mocks.keysLoad.mockReset().mockResolvedValue(undefined);
@@ -209,5 +214,88 @@ describe('Live remount and shortcut', () => {
     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'l', ctrlKey: true, shiftKey: true, bubbles: true }));
     expect(mocks.liveStop).toHaveBeenCalledTimes(1);
     dialog.remove();
+  });
+});
+
+describe('Live failure handling', () => {
+  it('shows reconnect elapsed time while keeping the recording timer active', async () => {
+    backendSessionId = 'session-1';
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-09-28T12:00:20Z'));
+    render(Live);
+    await waitFor(() => expect(channels).toHaveLength(1));
+    channels[0].onmessage({
+      type: 'connection', seq: 1,
+      state: { type: 'reconnecting', sinceMs: Date.parse('2026-09-28T11:00:20Z') },
+    });
+
+    await waitFor(() => expect(screen.getByText('Reconnecting · 60:00')).toBeTruthy());
+    expect(screen.getByText(/Connection lost\. Reconnecting automatically \(60:00\); recording continues\./)).toBeTruthy();
+    expect(screen.getByText('Recording').closest('.status-pill')?.className).toContain('status-recording');
+  });
+
+  it('keeps WAV recording after setup rejection and restores the recording-only choice', async () => {
+    backendSessionId = 'session-1';
+    render(Live);
+    await waitFor(() => expect(channels).toHaveLength(1));
+    channels[0].onmessage({ type: 'transcription', seq: 1, state: 'setupRejected' });
+
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toContain('Live setup failed five times'));
+    const continueButton = screen.getByRole('button', { name: 'Continue recording only' });
+    const stopButton = screen.getByRole('button', { name: /^Stop$/ });
+    expect(continueButton).toBeTruthy();
+    expect(stopButton).toBeTruthy();
+    expect(screen.getByRole('link', { name: 'Open Gemini Settings' }).getAttribute('href')).toBe('/settings/gemini');
+    await fireEvent.click(continueButton);
+
+    await waitFor(() => expect(mocks.liveContinueRecordingOnly).toHaveBeenCalledTimes(1));
+    expect(screen.getByText('Recording audio only')).toBeTruthy();
+    expect(screen.getByText('Transcript stopped')).toBeTruthy();
+    expect(screen.getByText('Live transcription has stopped.')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Stop recording' })).toBeTruthy();
+    expect(mocks.liveStop).not.toHaveBeenCalled();
+  });
+
+  it('renders model, quota and auth copy with a Settings action without exposing error details', async () => {
+    backendSessionId = 'session-1';
+    render(Live);
+    await waitFor(() => expect(channels).toHaveLength(1));
+    await act(() => {
+      channels[0].onmessage({
+        type: 'error', seq: 1,
+        error: { category: 'quota', code: 'quota', detailRedacted: 'secret-key-and-url' },
+      });
+    });
+
+    await waitFor(() => expect(liveStore.error).toBe('quota'));
+    await waitFor(() => expect(screen.getByText('The Gemini key has reached its usage limit.')).toBeTruthy());
+    expect(screen.getByRole('link', { name: 'Open Gemini Settings' }).getAttribute('href')).toBe('/settings/gemini');
+    expect(document.body.textContent).not.toContain('secret-key-and-url');
+    await act(() => {
+      channels[0].onmessage({
+        type: 'error', seq: 2,
+        error: { category: 'auth', code: 'auth', detailRedacted: 'secret-key-and-url' },
+      });
+    });
+    expect(screen.getByText('Gemini authentication failed. Check the key in Settings.')).toBeTruthy();
+    await act(() => {
+      channels[0].onmessage({
+        type: 'error', seq: 3,
+        error: { category: 'model', code: 'model', detailRedacted: 'secret-key-and-url' },
+      });
+    });
+    expect(screen.getByText('The selected Live model is unavailable.')).toBeTruthy();
+    expect(document.body.textContent).not.toContain('secret-key-and-url');
+  });
+
+  it('shows a disconnected gap with both sample-clock endpoints inline', async () => {
+    backendSessionId = 'session-1';
+    render(Live);
+    await waitFor(() => expect(channels).toHaveLength(1));
+    channels[0].onmessage({
+      type: 'gap', seq: 1, startSec: 12, endSec: 18, reason: 'disconnected',
+    });
+    await waitFor(() => expect(screen.getByText('Connection lost 00:12–00:18')).toBeTruthy());
+    expect(screen.getByText('Connection lost 00:12–00:18').closest('.gap-line')).toBeTruthy();
   });
 });

@@ -26,9 +26,11 @@
   let tagButton = $state<HTMLButtonElement | null>(null);
   let startPending = $state(false);
   let stopPending = $state(false);
+  let recordingOnlyPending = $state(false);
   let sourcePending = $state(false);
   let autoScroll = $state(true);
   let elapsedSeconds = $state(0);
+  let wallClockMs = $state(Date.now());
   let transcriptEl = $state<HTMLDivElement | null>(null);
   let previousScrollTop = 0;
   let focusListener: (() => void) | null = null;
@@ -113,6 +115,7 @@
     const startedAt = Date.now() - Math.max(0, durationSec) * 1000;
     const update = () => {
       elapsedSeconds = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
+      wallClockMs = Date.now();
     };
     update();
     const timer = window.setInterval(update, 250);
@@ -160,6 +163,13 @@
     stopPending = true;
     await liveStore.stop();
     stopPending = false;
+  }
+
+  async function continueRecordingOnly(): Promise<void> {
+    if (recordingOnlyPending) return;
+    recordingOnlyPending = true;
+    await liveStore.continueRecordingOnly();
+    recordingOnlyPending = false;
   }
 
   async function changeSource(event: Event): Promise<void> {
@@ -252,6 +262,12 @@
     return sec === null ? '—' : formatTimestamp(sec);
   }
 
+  function gapRange(line: Extract<LiveLine, { kind: 'gap' }>): string {
+    const start = line.startSec === null ? '—' : formatTimestamp(line.startSec);
+    const end = line.endSec === null ? '—' : formatTimestamp(line.endSec);
+    return i18n.t('live.transcript.gapRange', { start, end });
+  }
+
   function formatElapsed(totalSeconds: number): string {
     const hours = Math.floor(totalSeconds / 3600);
     const minutes = Math.floor((totalSeconds % 3600) / 60);
@@ -259,6 +275,12 @@
     return hours > 0
       ? `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
       : `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+  }
+
+  function formatReconnectElapsed(totalSeconds: number): string {
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
   }
 </script>
 
@@ -283,8 +305,12 @@
         </span>
         <span class="status-pill connection-pill">
           <RadioIcon size={14} strokeWidth={1.75} aria-hidden="true" />
-          {#if liveStore.snapshot.connection.type === 'reconnecting'}
-            {i18n.t('live.connection.reconnecting')}
+          {#if liveStore.snapshot.transcription === 'recordingOnly' || liveStore.snapshot.transcription === 'setupRejected'}
+            {i18n.t('live.connection.transcriptStopped')}
+          {:else if liveStore.snapshot.connection.type === 'reconnecting'}
+            {i18n.t('live.connection.reconnectingElapsed', {
+              elapsed: formatReconnectElapsed(Math.floor(Math.max(0, wallClockMs - liveStore.snapshot.connection.sinceMs) / 1000)),
+            })}
           {:else}
             {i18n.t(`live.connection.${liveStore.snapshot.connection.type}`)}
           {/if}
@@ -293,14 +319,50 @@
     {/if}
   </div>
 
-  {#if liveStore.error}
+  {#if liveStore.snapshot.connection.type === 'reconnecting'}
+    <div class="live-status-banner reconnect-banner" role="status">
+      <RadioIcon size={18} strokeWidth={1.75} aria-hidden="true" />
+      <p>{i18n.t('live.connection.reconnectingStatus', {
+        elapsed: formatReconnectElapsed(Math.floor(Math.max(0, wallClockMs - liveStore.snapshot.connection.sinceMs) / 1000)),
+      })}</p>
+    </div>
+  {/if}
+
+  {#if liveStore.snapshot.transcription === 'setupRejected'}
+    <div class="live-error setup-rejected-banner" role="alert">
+      <AlertTriangleIcon size={18} strokeWidth={1.75} aria-hidden="true" />
+      <div>
+        <strong>{i18n.t('live.setupRejected.title')}</strong>
+        <p>{i18n.t('live.setupRejected.description')}</p>
+      </div>
+      <div class="permission-actions">
+        <button class="button button-secondary" type="button" disabled={recordingOnlyPending || stopPending} onclick={() => void continueRecordingOnly()}>
+          {i18n.t('live.setupRejected.continueRecordingOnly')}
+        </button>
+        <button class="button button-danger-soft" type="button" disabled={recordingOnlyPending || stopPending} onclick={() => void stop()}>
+          {i18n.t('live.setupRejected.stop')}
+        </button>
+        <a class="settings-link" href="/settings/gemini" use:link>{i18n.t('live.category.openSettings')}</a>
+      </div>
+    </div>
+  {:else if liveStore.snapshot.transcription === 'recordingOnly'}
+    <div class="live-status-banner recording-only-banner" role="status">
+      <RadioIcon size={18} strokeWidth={1.75} aria-hidden="true" />
+      <div>
+        <strong>{i18n.t('live.recordingOnly.title')}</strong>
+        <p>{i18n.t('live.recordingOnly.description')}</p>
+      </div>
+    </div>
+  {/if}
+
+  {#if liveStore.error && liveStore.snapshot.transcription !== 'setupRejected'}
     <div class="live-error" role="status">
       <AlertTriangleIcon size={18} strokeWidth={1.75} aria-hidden="true" />
       <div>
         <strong>{i18n.t('live.error.title')}</strong>
-        <p>{i18n.t(`live.category.${liveStore.error.category}`)}</p>
+        <p>{i18n.t(`live.category.${liveStore.error}`)}</p>
       </div>
-      {#if liveStore.error.category === 'permission'}
+      {#if liveStore.error === 'permission'}
         <div class="permission-actions">
           <button type="button" class="text-button" onclick={() => void openPermissionSettings()}>
             {i18n.t('live.permission.openSettings')}
@@ -309,6 +371,8 @@
             {i18n.t('live.permission.recheck')}
           </button>
         </div>
+      {:else if liveStore.error === 'model' || liveStore.error === 'quota' || liveStore.error === 'auth'}
+        <a class="settings-link" href="/settings/gemini" use:link>{i18n.t('live.category.openSettings')}</a>
       {/if}
     </div>
   {/if}
@@ -488,11 +552,11 @@
         >
           {#each liveStore.lines as line (line.seq)}
             <article class:gap-line={line.kind === 'gap'} class="transcript-line">
-              <time class="mono">{lineTime(line)}</time>
               {#if line.kind === 'segment'}
+                <time class="mono">{lineTime(line)}</time>
                 <p>{line.segment.text}</p>
               {:else}
-                <p>{i18n.t('live.transcript.gap')}</p>
+                <p>{gapRange(line)}</p>
               {/if}
             </article>
           {/each}
@@ -501,6 +565,8 @@
               <time class="mono">{i18n.t('live.transcript.now')}</time>
               <p>{liveStore.draft}<span class="live-caret" aria-hidden="true">▍</span></p>
             </article>
+          {:else if liveStore.snapshot.transcription !== 'active' && liveStore.lines.length === 0}
+            <p class="listening-empty">{i18n.t('live.transcript.stopped')}</p>
           {:else if isRunning && liveStore.lines.length === 0}
             <p class="listening-empty">{i18n.t('live.transcript.listening')}<span class="live-caret" aria-hidden="true">▍</span></p>
           {/if}
@@ -576,6 +642,12 @@
   .live-error { display:flex; align-items:flex-start; gap:var(--space-3); margin-bottom:var(--space-4); padding:var(--space-3) var(--space-4); border:1px solid var(--color-danger); border-radius:var(--radius-lg); color:var(--color-danger); }
   .live-error div { flex:1; }
   .live-error p { margin:var(--space-1) 0 0; }
+  .live-status-banner { display:flex; align-items:flex-start; gap:var(--space-3); margin-bottom:var(--space-4); padding:var(--space-3) var(--space-4); border:1px solid var(--color-border-strong); border-radius:var(--radius-lg); color:var(--color-text-secondary); }
+  .live-status-banner p { margin:0; }
+  .live-status-banner strong { color:var(--color-text); }
+  .reconnect-banner { border-color:var(--color-warning); background:var(--color-warning-soft); }
+  .recording-only-banner { border-color:var(--color-accent); background:var(--color-accent-soft); }
+  .setup-rejected-banner { align-items:center; }
   .live-layout { display:grid; grid-template-columns:minmax(0,1.7fr) minmax(260px,.8fr); align-items:stretch; gap:var(--space-4); min-height:540px; }
   .transcript-card { position:relative; display:flex; min-height:500px; flex-direction:column; overflow:hidden; }
   .transcript-header { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:var(--space-3); padding:var(--space-4) var(--space-5); border-bottom:1px solid var(--color-border); }
@@ -586,7 +658,7 @@
   .transcript-line { display:grid; grid-template-columns:64px minmax(0,1fr); gap:var(--space-3); padding:var(--space-3) 0; border-bottom:1px solid var(--color-border); }
   .transcript-line time { padding-top:3px; color:var(--color-text-muted); font-size:var(--text-help-size); }
   .transcript-line p { margin:0; white-space:pre-wrap; line-height:1.65; }
-  .gap-line { color:var(--color-text-muted); font-style:italic; }
+  .gap-line { display:block; margin-block:var(--space-2); padding:var(--space-3); border-radius:var(--radius-md); background:var(--color-surface-sunken); color:var(--color-text-muted); font-style:italic; }
   .interim-line { color:var(--color-text-secondary); }
   .listening-empty { margin:var(--space-6) 0; color:var(--color-text-muted); text-align:center; }
   .live-caret { margin-left:3px; color:var(--color-accent); animation:caret-blink 1s step-end infinite; }

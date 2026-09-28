@@ -18,6 +18,7 @@
   "live.connection.connected": "接続済み",
   "live.connection.reconnecting": "再接続中",
   "live.connection.stopped": "切断",
+  "live.connection.transcriptStopped": "文字起こし停止",
   "live.error.title": "Live で対応が必要です",
   "live.category.quota": "Gemini キーの利用上限に達しました。",
   "live.category.auth": "Gemini の認証に失敗しました。設定でキーを確認してください。",
@@ -535,5 +536,16 @@
   "memoPanel.export.copyError": "コピーできませんでした",
   "memoPanel.export.exportSuccess": ".mdファイルを保存しました",
   "memoPanel.export.exportError": "ファイルを保存できませんでした",
-  "memoPanel.toast.ready": "メモの準備ができました"
+  "memoPanel.toast.ready": "メモの準備ができました",
+  "live.connection.reconnectingElapsed": "再接続中 · {elapsed}",
+  "live.connection.reconnectingStatus": "接続が切れました。自動再接続中（{elapsed}）です。録音は続いています。",
+  "live.setupRejected.title": "Live のセットアップが5回拒否されました",
+  "live.setupRejected.description": "WAV 録音は続いています。音声のみで続けるか、録音を停止してください。",
+  "live.setupRejected.continueRecordingOnly": "音声のみで録音を続ける",
+  "live.setupRejected.stop": "停止",
+  "live.recordingOnly.title": "音声のみ録音中",
+  "live.recordingOnly.description": "WAV 録音は続いています。停止後、保存したセッションを開いて再度文字起こししてください。",
+  "live.transcript.gapRange": "接続中断 {start}–{end}",
+  "live.category.openSettings": "Gemini 設定を開く",
+  "live.transcript.stopped": "Live 文字起こしは停止しています。"
 }
