@@ -30,6 +30,7 @@ const mocks = vi.hoisted(() => {
     jobsCancel: vi.fn(),
     keysList: vi.fn(),
     tagsList: vi.fn(),
+    recoveryListener: null as null | ((event: unknown) => void),
     FakeChannel,
   };
 });
@@ -39,6 +40,14 @@ vi.mock('@tauri-apps/api/core', () => ({
 }));
 
 vi.mock('../lib/bindings', () => ({
+  events: {
+    liveRecoveryCompleted: {
+      listen: (callback: (event: unknown) => void) => {
+        mocks.recoveryListener = callback;
+        return Promise.resolve(() => {});
+      },
+    },
+  },
   commands: {
     librarySessionsList: (...args: unknown[]) => mocks.librarySessionsList(...args),
     librarySessionRename: (...args: unknown[]) => mocks.librarySessionRename(...args),
@@ -105,6 +114,7 @@ beforeEach(async () => {
   mocks.jobsCancel.mockReset();
   mocks.keysList.mockReset().mockResolvedValue({ status: 'ok', data: [] });
   mocks.tagsList.mockReset().mockResolvedValue({ status: 'ok', data: [] });
+  mocks.recoveryListener = null;
   capturedChannel = null;
   mocks.jobsSubscribe.mockImplementation((channel: CapturedChannel) => {
     capturedChannel = channel;
@@ -160,5 +170,27 @@ describe('Home + real jobsStore/libraryStore (story 2.9 acceptance criteria)', (
     await waitFor(() => expect(mocks.librarySessionsList).toHaveBeenCalledTimes(2));
     await screen.findByText('phiên c');
     expect(screen.queryByText('new-recording.wav')).toBeNull();
+  });
+
+  it('reloads an already-open Home after async Live recovery and shows the recovered rerun hint', async () => {
+    mocks.librarySessionsList.mockResolvedValueOnce({
+      status: 'ok',
+      data: [item('live-1', { kind: 'live', recovered: false })],
+    });
+    render(Home);
+
+    await screen.findByText('phiên live-1');
+    expect(screen.queryByText('Phục hồi')).toBeNull();
+    await waitFor(() => expect(mocks.recoveryListener).not.toBeNull());
+
+    mocks.librarySessionsList.mockResolvedValueOnce({
+      status: 'ok',
+      data: [item('live-1', { kind: 'live', recovered: true })],
+    });
+    mocks.recoveryListener!({ payload: { sessionId: 'live-1' } });
+
+    await screen.findByText('Phục hồi');
+    expect(screen.getByText('Có thể Transcribe lại')).toBeTruthy();
+    expect(mocks.librarySessionsList).toHaveBeenCalledTimes(2);
   });
 });

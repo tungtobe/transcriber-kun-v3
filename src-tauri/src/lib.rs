@@ -20,7 +20,6 @@ pub mod settings;
 pub mod transcribe;
 
 use tauri::Manager;
-use tauri_specta::Event;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -35,54 +34,43 @@ pub fn run() {
             app.manage(state);
             Ok(())
         })
-        // Story 2.4 Design Notes (đổi ở story 3.5): "Đóng app: luôn
-        // `prevent_close`, hỏi registry async" — the OS close request always
-        // arrives synchronously, but whether a Job is running is only
-        // knowable by asking the registry actor, which is async;
-        // `prevent_close` buys the time for that async check. Story 3.5 spec
-        // Code Map: sự kiện đóng cửa sổ giờ LUÔN đi qua frontend (kể cả khi
-        // không có Job) để flush ghi chú trước khi thoát -- Rust không còn tự
-        // `exit(0)` ở nhánh rảnh, chỉ luôn emit `CloseRequested { busy }` và
-        // để `appStore`/`CloseConfirm` quyết định (flush rồi gọi
-        // `app_close_confirm`, hoặc mở dialog Job hiện có khi `busy`).
+        // Native window close and app ExitRequested (including Cmd+Q) share
+        // the same async coordinator. Prevent each synchronous request first
+        // so notes and Live metadata can be flushed before exit.
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
-                let window = window.clone();
+                let app = window.app_handle().clone();
                 tauri::async_runtime::spawn(async move {
-                    let state = window.state::<ipc::boot::AppState>();
-                    // P0 review fix: when the registry actor is unreachable
-                    // (`snapshot()` returns `Err`), fail closed -- treat it as
-                    // busy (spec Boundaries Always: "khi `jobs.snapshot()`
-                    // trả `Err`, coi là bận").
-                    let busy = match &state.jobs {
-                        Ok(jobs) => jobs
-                            .snapshot()
-                            .await
-                            .map(|jobs| !jobs.is_empty())
-                            .unwrap_or(true),
-                        Err(_) => false,
-                    };
-                    if let Err(err) = (ipc::CloseRequested { busy }).emit(&window) {
-                        tracing::warn!(error = %err, "phát event CloseRequested thất bại");
-                    }
+                    ipc::close::request_close(&app).await;
                 });
             }
         })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app_handle, event| {
-            // Marker "thoát sạch" (spec Always: "Crash"): chỉ đặt `true` khi
-            // tiến trình thực sự đang thoát — `note_boot` (chạy lúc khởi
-            // động lần sau) coi mọi trường hợp khác (kill -9, mất điện,
-            // panic không unwind) là thoát không sạch và tăng bộ đếm crash.
-            if let tauri::RunEvent::Exit = event {
-                let state = app_handle.state::<ipc::boot::AppState>();
-                if let Ok(db) = &state.db {
-                    if let Err(err) = crate::diagnostics::mark_clean_shutdown(db) {
-                        tracing::warn!(error = %err, "không ghi được marker thoát sạch");
+            match event {
+                tauri::RunEvent::ExitRequested { api, .. } => {
+                    let state = app_handle.state::<ipc::boot::AppState>();
+                    if ipc::close::should_prevent_exit(ipc::close::is_exit_authorized(&state)) {
+                        api.prevent_exit();
+                        let app = app_handle.clone();
+                        tauri::async_runtime::spawn(async move {
+                            ipc::close::request_close(&app).await;
+                        });
                     }
                 }
+                // SIGKILL and OS shutdown do not depend on this callback;
+                // boot recovery uses the durable WAV checkpoints.
+                tauri::RunEvent::Exit => {
+                    let state = app_handle.state::<ipc::boot::AppState>();
+                    if let Ok(db) = &state.db {
+                        if let Err(err) = crate::diagnostics::mark_clean_shutdown(db) {
+                            tracing::warn!(error = %err, "could not mark clean shutdown");
+                        }
+                    }
+                }
+                _ => {}
             }
         });
 }

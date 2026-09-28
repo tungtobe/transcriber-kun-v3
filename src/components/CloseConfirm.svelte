@@ -1,31 +1,48 @@
 <script lang="ts">
-  // Story 3.5 (trước đó story 2.4 Design Notes): "Đóng app: luôn
-  // `prevent_close`, hỏi registry async" — Rust giờ LUÔN emit
-  // `CloseRequested { busy }` (không còn tự thoát thẳng ở nhánh rảnh), và
-  // component này quyết định: rảnh → flush ghi chú rồi tự gọi
-  // `appCloseConfirm` (không dialog nếu flush thành công — spec Acceptance:
-  // "không có dialog thừa"); bận → dialog Job hiện có (flush trước khi xác
-  // nhận, không chặn dialog nếu flush lỗi); flush lỗi ở nhánh rảnh → dialog
-  // "Ở lại"/"Vẫn thoát" riêng (`ConfirmDialog`, mặc định focus "Ở lại").
+  // Window, menu, and Cmd+Q close requests arrive through one typed event.
+  // An idle close flushes notes and continues without an extra prompt; Live or
+  // Job activity opens one dialog, and any storage error keeps it open.
   import { appStore } from '../lib/stores/app.svelte';
   import { notesStore } from '../lib/stores/notes.svelte';
   import { i18n } from '../i18n/index.svelte';
-  import ConfirmDialog from './ConfirmDialog.svelte';
 
-  let jobDialogVisible = $state(false);
-  let flushErrorVisible = $state(false);
+  let dialogVisible = $state(false);
   let closing = $state(false);
+  let liveBusy = $state(false);
+  let jobBusy = $state(false);
+  let closeError = $state<string | null>(null);
 
-  async function handleCloseRequested(busy: boolean): Promise<void> {
-    if (busy) {
-      jobDialogVisible = true;
+  async function handleCloseRequested(request: { liveBusy: boolean; jobBusy: boolean }): Promise<void> {
+    liveBusy = request.liveBusy;
+    jobBusy = request.jobBusy;
+    closeError = null;
+    if (liveBusy || jobBusy) {
+      dialogVisible = true;
       return;
     }
-    const flushedOk = await notesStore.flushAll();
-    if (flushedOk) {
-      await appStore.confirmClose();
-    } else {
-      flushErrorVisible = true;
+    await flushAndConfirm();
+  }
+
+  async function flushAndConfirm(): Promise<void> {
+    closing = true;
+    try {
+      if (!(await notesStore.flushAll())) {
+        closeError = i18n.t('closeConfirm.storageError.body');
+        dialogVisible = true;
+        return;
+      }
+      const error = await appStore.confirmClose();
+      if (error) {
+        closeError = i18n.t('closeConfirm.storageError.body');
+        dialogVisible = true;
+      } else {
+        dialogVisible = false;
+      }
+    } catch {
+      closeError = i18n.t('closeConfirm.storageError.body');
+      dialogVisible = true;
+    } finally {
+      closing = false;
     }
   }
 
@@ -49,65 +66,48 @@
     };
   });
 
-  function stayJobDialog(): void {
-    jobDialogVisible = false;
+  function stayOpen(): void {
+    dialogVisible = false;
+    closeError = null;
+    void appStore.stayOpen();
   }
 
-  // Job hiện có: flush ghi chú trước khi xác nhận (spec Code Map) -- kết quả
-  // flush không chặn gì ở đây, người dùng đã đồng ý đóng dù có Job đang chạy.
-  async function confirmJobDialog(): Promise<void> {
-    closing = true;
-    try {
-      await notesStore.flushAll();
-      await appStore.confirmClose();
-    } finally {
-      closing = false;
-      jobDialogVisible = false;
-    }
+  function dialogTitle(): string {
+    if (closeError) return i18n.t('closeConfirm.storageError.title');
+    if (liveBusy) return i18n.t('closeConfirm.dialog.liveTitle');
+    return i18n.t('closeConfirm.dialog.title');
   }
 
-  function stayFlushError(): void {
-    flushErrorVisible = false;
+  function dialogBody(): string {
+    if (closeError) return closeError;
+    if (liveBusy && jobBusy) return i18n.t('closeConfirm.dialog.liveAndJobBody');
+    if (liveBusy) return i18n.t('closeConfirm.dialog.liveBody');
+    return i18n.t('closeConfirm.dialog.jobBody');
   }
 
-  async function exitAnywayAfterFlushError(): Promise<void> {
-    closing = true;
-    try {
-      await appStore.confirmClose();
-    } finally {
-      closing = false;
-      flushErrorVisible = false;
-    }
+  function confirmLabel(): string {
+    if (closeError) return i18n.t('closeConfirm.storageError.retry');
+    if (liveBusy && jobBusy) return i18n.t('closeConfirm.dialog.liveAndJobConfirm');
+    if (liveBusy) return i18n.t('closeConfirm.dialog.liveConfirm');
+    return i18n.t('closeConfirm.dialog.confirm');
   }
 </script>
 
-{#if jobDialogVisible}
+{#if dialogVisible}
   <div class="close-confirm-backdrop" role="presentation">
     <div class="close-confirm" role="alertdialog" aria-modal="true" aria-labelledby="close-confirm-title">
-      <h2 id="close-confirm-title">{i18n.t('closeConfirm.dialog.title')}</h2>
-      <p>{i18n.t('closeConfirm.dialog.body')}</p>
+      <h2 id="close-confirm-title">{dialogTitle()}</h2>
+      <p>{dialogBody()}</p>
       <div class="close-confirm-actions">
-        <button type="button" class="button button-secondary" disabled={closing} onclick={stayJobDialog}>
+        <button type="button" class="button button-secondary" disabled={closing} onclick={stayOpen}>
           {i18n.t('closeConfirm.dialog.stay')}
         </button>
-        <button type="button" class="button button-danger" disabled={closing} onclick={confirmJobDialog}>
-          {closing ? i18n.t('closeConfirm.dialog.closing') : i18n.t('closeConfirm.dialog.confirm')}
+        <button type="button" class="button button-danger" disabled={closing} onclick={() => void flushAndConfirm()}>
+          {closing ? i18n.t('closeConfirm.dialog.closing') : confirmLabel()}
         </button>
       </div>
     </div>
   </div>
-{/if}
-
-{#if flushErrorVisible}
-  <ConfirmDialog
-    title={i18n.t('closeConfirm.flushError.title')}
-    body={i18n.t('closeConfirm.flushError.body')}
-    cancelLabel={i18n.t('closeConfirm.flushError.stay')}
-    confirmLabel={i18n.t('closeConfirm.flushError.exit')}
-    confirming={closing}
-    onCancel={stayFlushError}
-    onConfirm={exitAnywayAfterFlushError}
-  />
 {/if}
 
 <style>

@@ -3,7 +3,7 @@
 // `error` mang đúng kiểu `AppError` (category/code/detailRedacted) sinh từ
 // story 1.2 khi có; `null` khi lỗi không phải một `AppError` có cấu trúc
 // (invoke ném exception thẳng, ví dụ IPC chưa sẵn sàng).
-import { commands, events, type AppError } from '../bindings';
+import { commands, events, type AppError, type CloseRequested } from '../bindings';
 
 export type AppVersionState =
   | { status: 'loading' }
@@ -35,8 +35,8 @@ function createAppStore() {
    * để flush ghi chú trước khi đóng. `CloseConfirm` gọi hàm này một lần lúc
    * mount; hàm unlisten trả về phải được gọi lúc unmount.
    */
-  function listenForCloseRequested(callback: (busy: boolean) => void): Promise<() => void> {
-    return events.closeRequested.listen((event) => callback(event.payload.busy));
+  function listenForCloseRequested(callback: (request: CloseRequested) => void): Promise<() => void> {
+    return events.closeRequested.listen((event) => callback(event.payload));
   }
 
   /** Thật sự thoát: huỷ mọi Job hiện có rồi thoát (spec Design Notes: "đồng ý
@@ -44,8 +44,26 @@ function createAppStore() {
    * gọi hàm này sau khi flush ghi chú xong, dù rảnh (flush ok, tự thoát,
    * không dialog thừa) hay bận (người dùng đã bấm "Huỷ và thoát") hay flush
    * lỗi mà người dùng chọn "Vẫn thoát". */
-  async function confirmClose(): Promise<void> {
-    await commands.appCloseConfirm();
+  async function confirmClose(): Promise<AppError | null> {
+    try {
+      const result = await commands.appCloseConfirm();
+      return result.status === 'ok' ? null : result.error;
+    } catch {
+      return {
+        category: 'storage',
+        code: 'storage',
+        detailRedacted: 'App close could not be completed',
+      };
+    }
+  }
+
+  async function stayOpen(): Promise<void> {
+    try {
+      await commands.appCloseStay();
+    } catch {
+      // A failed release only leaves the close request coalesced until restart;
+      // the app stays open and a later explicit request can still be retried.
+    }
   }
 
   return {
@@ -55,6 +73,7 @@ function createAppStore() {
     loadVersion,
     listenForCloseRequested,
     confirmClose,
+    stayOpen,
   };
 }
 

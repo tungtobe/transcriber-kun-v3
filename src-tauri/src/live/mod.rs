@@ -192,12 +192,31 @@ impl LiveSessionHandle {
     }
 
     pub async fn stop(&self) -> Result<SessionId, AppError> {
+        self.stop_inner(false).await
+    }
+
+    /// Stops capture and commits the durable Live data without waiting for a
+    /// derived Proxy. Used by the application close coordinator.
+    pub async fn stop_for_close(&self) -> Result<SessionId, AppError> {
+        self.stop_inner(true).await
+    }
+
+    async fn stop_inner(&self, for_close: bool) -> Result<SessionId, AppError> {
         let (reply, response) = oneshot::channel();
         self.commands
-            .send(Command::Stop { reply })
+            .send(Command::Stop { for_close, reply })
             .await
             .map_err(|_| actor_error())?;
         response.await.map_err(|_| actor_error())?
+    }
+
+    pub async fn is_running(&self) -> Result<bool, AppError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::IsRunning { reply })
+            .await
+            .map_err(|_| actor_error())?;
+        response.await.map_err(|_| actor_error())
     }
 
     pub async fn continue_recording_only(&self) -> Result<(), AppError> {
@@ -225,7 +244,11 @@ enum Command {
         reply: oneshot::Sender<Result<SessionId, AppError>>,
     },
     Stop {
+        for_close: bool,
         reply: oneshot::Sender<Result<SessionId, AppError>>,
+    },
+    IsRunning {
+        reply: oneshot::Sender<bool>,
     },
     ContinueRecordingOnly {
         reply: oneshot::Sender<Result<(), AppError>>,
@@ -283,6 +306,8 @@ pub struct LiveSessionActor {
     subscribers: Vec<Channel<LiveEvent>>,
     snapshot: LiveSnapshot,
     running: Option<RunningSession>,
+    pending_close_finalize: Option<(SessionId, f64)>,
+    close_failed: bool,
 }
 
 /// Creates the one process-wide LiveSession handle and actor.
@@ -319,6 +344,8 @@ pub fn channel(
                 duration_sec: 0.0,
             },
             running: None,
+            pending_close_finalize: None,
+            close_failed: false,
         },
     )
 }
@@ -334,9 +361,16 @@ impl LiveSessionActor {
                         let result = self.start(params).await;
                         let _ = reply.send(result);
                     }
-                    Some(Command::Stop { reply }) => {
-                        let result = self.finish_current(None).await;
+                    Some(Command::Stop { for_close, reply }) => {
+                        let result = self.finish_current(None, for_close).await;
                         let _ = reply.send(result);
+                    }
+                    Some(Command::IsRunning { reply }) => {
+                        let _ = reply.send(
+                            self.running.is_some()
+                                || self.pending_close_finalize.is_some()
+                                || self.close_failed,
+                        );
                     }
                     Some(Command::ContinueRecordingOnly { reply }) => {
                         let result = self.continue_recording_only().await;
@@ -347,7 +381,7 @@ impl LiveSessionActor {
                         let _ = reply.send(());
                     }
                     None => {
-                        let _ = self.finish_current(None).await;
+                        let _ = self.finish_current(None, false).await;
                         break;
                     }
                 },
@@ -625,7 +659,7 @@ impl LiveSessionActor {
                             // Persistent transcript storage is terminal for
                             // this Live session: stop capture and keep the
                             // prior DB checkpoints plus durable WAV bounded.
-                            let _ = self.finish_current(None).await;
+                            let _ = self.finish_current(None, false).await;
                         }
                     }
                     GatewayEvent::AudioGap {
@@ -759,7 +793,7 @@ impl LiveSessionActor {
             .as_ref()
             .and_then(|running| running.terminal_errors.borrow().clone());
         if let Some(error) = writer_error {
-            let _ = self.finish_current(Some(error)).await;
+            let _ = self.finish_current(Some(error), false).await;
             return;
         }
         let due = self.running.as_ref().is_some_and(|running| {
@@ -770,7 +804,7 @@ impl LiveSessionActor {
         });
         if due {
             if self.flush_active("recording").await.is_err() {
-                let _ = self.finish_current(None).await;
+                let _ = self.finish_current(None, false).await;
             }
         }
     }
@@ -837,8 +871,49 @@ impl LiveSessionActor {
     async fn finish_current(
         &mut self,
         writer_error: Option<AppError>,
+        for_close: bool,
     ) -> Result<SessionId, AppError> {
         if self.running.is_none() {
+            if for_close {
+                if let Some((session_id, duration_sec)) = self.pending_close_finalize {
+                    let db = self.db.clone();
+                    let retry = tokio::task::spawn_blocking(move || {
+                        store::finalize_live_session_minimal(&db, session_id, duration_sec)
+                    })
+                    .await
+                    .map_err(|error| AppError::new(Code::Storage, error.to_string()))?;
+                    retry?;
+                    self.pending_close_finalize = None;
+                    self.close_failed = false;
+                    self.snapshot = LiveSnapshot {
+                        session_id: Some(session_id),
+                        transcript_id: self.snapshot.transcript_id,
+                        recording: RecordingState::Stopped,
+                        connection: ConnectionState::Stopped,
+                        transcription: TranscriptionState::Stopped,
+                        error_category: None,
+                        duration_sec,
+                    };
+                    self.emit(LiveEvent::Recording {
+                        seq: 0,
+                        state: RecordingState::Stopped,
+                    });
+                    self.emit(LiveEvent::Done { seq: 0 });
+                    self.emit(LiveEvent::Final {
+                        seq: 0,
+                        session_id,
+                        transcript_id: self.snapshot.transcript_id.unwrap_or_default(),
+                        duration_sec,
+                    });
+                    return Ok(session_id);
+                }
+            }
+            if self.close_failed {
+                return Err(AppError::new(
+                    Code::Storage,
+                    "Live storage failed; the app must stay open for data recovery",
+                ));
+            }
             return Err(AppError::new(
                 Code::Request,
                 "There is no Live session to stop",
@@ -908,6 +983,7 @@ impl LiveSessionActor {
         let session_id = running.session_id;
         let transcript_id = running.transcript_id;
         let batch = std::mem::take(&mut running.pending);
+        let retry_batch = batch.clone();
         let final_flush = tokio::task::spawn_blocking(move || {
             store::append_live_batch(
                 &db,
@@ -949,6 +1025,15 @@ impl LiveSessionActor {
         }
 
         if let Err(error) = final_flush {
+            if for_close {
+                if recording_result.wav_finalized {
+                    running.pending = retry_batch;
+                    running.recording = None;
+                    self.running = Some(running);
+                } else {
+                    self.close_failed = true;
+                }
+            }
             self.emit(LiveEvent::Error {
                 seq: 0,
                 error: error.clone(),
@@ -972,6 +1057,9 @@ impl LiveSessionActor {
 
         let terminal_error = writer_error.or(recording_result.error.clone());
         if !recording_result.wav_finalized {
+            if for_close {
+                self.close_failed = true;
+            }
             let error = terminal_error.unwrap_or_else(|| {
                 AppError::new(Code::Storage, "Live Recording WAV could not be finalized")
             });
@@ -1007,7 +1095,17 @@ impl LiveSessionActor {
         let db = self.db.clone();
         let recording_path = crate::core::paths::recording_path(&data_dir, session_id);
         let outcome = tokio::task::spawn_blocking(move || {
-            store::finalize_live_session(&db, &data_dir, session_id, &recording_path, duration_sec)
+            if for_close {
+                store::finalize_live_session_minimal(&db, session_id, duration_sec)
+            } else {
+                store::finalize_live_session(
+                    &db,
+                    &data_dir,
+                    session_id,
+                    &recording_path,
+                    duration_sec,
+                )
+            }
         })
         .await;
         let outcome = match outcome {
@@ -1017,6 +1115,9 @@ impl LiveSessionActor {
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(error) => {
+                if for_close {
+                    self.pending_close_finalize = Some((session_id, duration_sec));
+                }
                 self.emit(LiveEvent::Error {
                     seq: 0,
                     error: error.clone(),
@@ -1695,7 +1796,7 @@ mod tests {
         assert_eq!(persisted[0].text, "Hello.");
         assert!(persisted[0].start_sec >= 0.0);
         assert!(persisted[0].end_sec > persisted[0].start_sec);
-        fixture.actor.finish_current(None).await.unwrap();
+        fixture.actor.finish_current(None, false).await.unwrap();
         let row = fixture
             .db
             .with_connection(|conn| Ok(repo::sessions::get(conn, session_id)?.unwrap()))
@@ -1747,7 +1848,7 @@ mod tests {
         assert_eq!(rows[0].start_sec, 0.1);
         assert_eq!(rows[0].end_sec, 0.3);
         assert!(rows[0].text.is_empty());
-        fixture.actor.finish_current(None).await.unwrap();
+        fixture.actor.finish_current(None, false).await.unwrap();
         let row = fixture
             .db
             .with_connection(|conn| Ok(repo::sessions::get(conn, session_id)?.unwrap()))
@@ -1778,7 +1879,7 @@ mod tests {
             pending_before
         );
 
-        fixture.actor.finish_current(None).await.unwrap();
+        fixture.actor.finish_current(None, false).await.unwrap();
         let stopped_sequence = fixture.actor.seq;
         fixture
             .actor
@@ -1813,7 +1914,7 @@ mod tests {
             ConnectionState::Stopped
         );
         assert_eq!(fixture.actor.snapshot.connection, ConnectionState::Stopped);
-        fixture.actor.finish_current(None).await.unwrap();
+        fixture.actor.finish_current(None, false).await.unwrap();
     }
 
     #[tokio::test]
@@ -1875,7 +1976,7 @@ mod tests {
         })
         .await
         .expect("capture sample clock should advance while recording-only");
-        fixture.actor.finish_current(None).await.unwrap();
+        fixture.actor.finish_current(None, false).await.unwrap();
         assert_eq!(
             fixture.actor.snapshot.transcription,
             TranscriptionState::Stopped
@@ -1937,7 +2038,7 @@ mod tests {
         let error = fixture.actor.flush_active("recording").await.unwrap_err();
         assert_eq!(error.code, Code::Storage);
         assert_eq!(fixture.actor.running.as_ref().unwrap().pending.len(), 1);
-        assert!(fixture.actor.finish_current(None).await.is_err());
+        assert!(fixture.actor.finish_current(None, false).await.is_err());
         assert!(fixture.actor.running.is_none());
         assert_eq!(fixture.actor.snapshot.recording, RecordingState::Failed);
         assert!(fixture.capture.active_source().is_none());
@@ -2009,7 +2110,7 @@ mod tests {
         })
         .await
         .expect("capture should publish its first output chunk");
-        let stopped_id = fixture.actor.finish_current(None).await.unwrap();
+        let stopped_id = fixture.actor.finish_current(None, false).await.unwrap();
         assert_eq!(stopped_id, session_id);
 
         let path = crate::core::paths::recording_path(fixture._root.path(), session_id);
@@ -2050,7 +2151,7 @@ mod tests {
                 .len(),
             1
         );
-        busy.actor.finish_current(None).await.unwrap();
+        busy.actor.finish_current(None, false).await.unwrap();
 
         let mut no_consent = fixture();
         let error = no_consent
@@ -2101,7 +2202,7 @@ mod tests {
             storage_error_reported: false,
         });
         let started = std::time::Instant::now();
-        let result = fixture.actor.finish_current(None).await;
+        let result = fixture.actor.finish_current(None, false).await;
         assert!(started.elapsed() <= OLD_GENERATION_DRAIN + Duration::from_millis(200));
         assert!(
             result.is_err(),
@@ -2146,10 +2247,13 @@ mod tests {
         let _ = previous.await;
 
         let started = std::time::Instant::now();
-        tokio::time::timeout(Duration::from_secs(2), fixture.actor.finish_current(None))
-            .await
-            .expect("gateway drain should be bounded")
-            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            fixture.actor.finish_current(None, false),
+        )
+        .await
+        .expect("gateway drain should be bounded")
+        .unwrap();
         assert!(started.elapsed() >= OLD_GENERATION_DRAIN);
         assert_eq!(fixture.actor.snapshot.recording, RecordingState::Stopped);
         assert!(terminal_errors.borrow().is_none());
@@ -2166,6 +2270,26 @@ mod tests {
             }
         )));
         assert!(fixture.capture.active_source().is_none());
+    }
+
+    #[tokio::test]
+    async fn close_stop_flushes_live_and_commits_without_waiting_for_a_proxy() {
+        let mut fixture = fixture();
+        let (session_id, _transcript_id) = add_recording(&mut fixture, 1);
+
+        assert_eq!(
+            fixture.actor.finish_current(None, true).await.unwrap(),
+            session_id
+        );
+
+        let row = fixture
+            .db
+            .with_connection(|conn| Ok(repo::sessions::get(conn, session_id)?.unwrap()))
+            .unwrap();
+        assert_eq!(row.status, "complete");
+        assert_eq!(row.proxy_ext, None);
+        assert!(crate::core::paths::recording_path(fixture._root.path(), session_id).is_file());
+        assert!(fixture.actor.running.is_none());
     }
 
     #[tokio::test]
@@ -2188,7 +2312,7 @@ mod tests {
 
         let stopped_id = fixture
             .actor
-            .finish_current(Some(device_error.clone()))
+            .finish_current(Some(device_error.clone()), false)
             .await
             .unwrap();
 

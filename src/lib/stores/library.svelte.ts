@@ -13,6 +13,7 @@
 import { jobsStore } from './jobs.svelte';
 import {
   commands,
+  events,
   type AppError,
   type SessionDeleteOutcome,
   type SessionListItem,
@@ -161,6 +162,10 @@ export function createLibraryStore() {
     });
     activeLoad = request;
     return request;
+  }
+
+  function listenForRecoveryCompleted(callback: () => void): Promise<() => void> {
+    return events.liveRecoveryCompleted.listen(() => callback());
   }
 
   // Theo dõi `jobsStore.resultSeq` (một Job vừa commit) và tự tải lại — bộ
@@ -442,6 +447,7 @@ export function createLibraryStore() {
       return nameQuery;
     },
     load,
+    listenForRecoveryCompleted,
     rename,
     remove,
     wipeAll,

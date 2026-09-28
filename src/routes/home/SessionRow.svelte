@@ -184,6 +184,9 @@
         {/if}
         {#if session.recovered}
           <Badge variant="recover" label={i18n.t('home.sessionRow.recovered')} />
+          {#if session.kind === 'live'}
+            <span class="session-row-recovery-hint">{i18n.t('home.sessionRow.rerunHint')}</span>
+          {/if}
         {/if}
       </span>
       {#if localDate}
@@ -298,6 +301,12 @@
 
   .session-row-tag-more {
     color: var(--color-text-muted);
+  }
+
+  .session-row-recovery-hint {
+    flex: 0 0 auto;
+    color: var(--color-text-muted);
+    font-size: 11px;
   }
 
   .session-row-menu-wrap {

@@ -4,6 +4,7 @@
 //! và test `export_bindings` (sinh `src/lib/bindings.ts`).
 
 pub mod boot;
+pub mod close;
 
 #[cfg(test)]
 mod spike_channel;
@@ -33,19 +34,6 @@ use crate::transcribe::registry::{self, RerunOutcome, RerunParams};
 use crate::transcribe::rerun::{self, RerunScope};
 use boot::AppState;
 
-/// Phát mỗi khi cửa sổ chính bị yêu cầu đóng (story 3.5, spec Code Map: "đổi
-/// để luôn emit (thêm cờ `busy` vào payload event) và frontend quyết định" --
-/// trước đây chỉ emit khi registry bận, nhánh rảnh thoát thẳng từ Rust, nên
-/// không có chỗ nào chắc chắn chạy để flush ghi chú trước khi đóng). `busy`
-/// phản ánh đúng kết quả `JobRegistryHandle::snapshot` tại thời điểm nhận yêu
-/// cầu đóng: `true` mở dialog Job hiện có (`CloseConfirm`), `false` là tín
-/// hiệu để `appStore` tự flush ghi chú rồi gọi `appCloseConfirm` nếu flush
-/// thành công.
-#[derive(Debug, Clone, Serialize, Deserialize, Type, tauri_specta::Event)]
-pub struct CloseRequested {
-    pub busy: bool,
-}
-
 /// Story 3.1: `true` khi `session_id` đang bị `library_session_delete` đánh
 /// dấu "deleting" (spec Design Notes AD-1: chỉ `ipc/` đọc/ghi
 /// `AppState::deleting`). Nhận thẳng `&Mutex<HashSet<SessionId>>` (không phải
@@ -60,6 +48,27 @@ fn is_session_deleting(
         .lock()
         .map(|set| set.contains(&session_id))
         .unwrap_or(false)
+}
+
+fn is_session_recovering(
+    recovering: &std::sync::Mutex<std::collections::HashSet<SessionId>>,
+    session_id: SessionId,
+) -> bool {
+    recovering
+        .lock()
+        .map(|set| set.contains(&session_id))
+        .unwrap_or(false)
+}
+
+fn session_recovering_error() -> AppError {
+    AppError::new(Code::Request, "Phiên đang được phục hồi")
+}
+
+fn recovering_delete_outcome(
+    recovering: &std::sync::Mutex<std::collections::HashSet<SessionId>>,
+    session_id: SessionId,
+) -> Option<SessionDeleteOutcome> {
+    is_session_recovering(recovering, session_id).then_some(SessionDeleteOutcome::Busy)
 }
 
 /// Lỗi từ chối dùng chung cho `transcribe_rerun`/`library_proxy_relink`/
@@ -1111,6 +1120,9 @@ async fn transcribe_rerun_inner(
     if is_session_deleting(&state.deleting, session_id) {
         return Err(session_deleting_error());
     }
+    if is_session_recovering(&state.recovering, session_id) {
+        return Err(session_recovering_error());
+    }
     if is_wiping(&state.wiping) {
         return Err(wiping_error());
     }
@@ -1652,6 +1664,9 @@ async fn library_session_delete_inner(
 ) -> Result<SessionDeleteOutcome, AppError> {
     if is_wiping(&state.wiping) {
         return Err(wiping_error());
+    }
+    if let Some(outcome) = recovering_delete_outcome(&state.recovering, session_id) {
+        return Ok(outcome);
     }
     let db = state.db.clone()?;
     let root = state.data_dir.clone()?;
@@ -2315,38 +2330,70 @@ async fn library_wipe_all(state: tauri::State<'_, AppState>) -> Result<WipeAllOu
     track_ipc_error(&state.db, result).await
 }
 
-/// Người dùng xác nhận đóng app khi registry đang bận (spec Design Notes:
-/// "đồng ý → huỷ sạch rồi thoát"): huỷ mọi Job hiện có, chờ tối đa ~4 s để
-/// mỗi Job dọn xong (huỷ có hiệu lực ≤ 2 s — spec Always), rồi thoát tiến
-/// trình thật sự bất kể kết quả chờ, vì người dùng đã đồng ý đóng.
+/// Người dùng xác nhận đóng app: flush Live tới WAV/metadata bền vững, huỷ
+/// Jobs đang chạy, rồi mới cho phép Tauri thoát. Proxy không nằm trên đường
+/// đóng để một encode chậm không giữ app mở.
 #[tauri::command]
 #[specta::specta]
 async fn app_close_confirm(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), AppError> {
-    if let Ok(jobs) = state.jobs.clone() {
-        if let Ok(pending) = jobs.snapshot().await {
+    let live = state.live.clone();
+    let save_live = async move {
+        if let Ok(live) = live {
+            match live.is_running().await? {
+                true => {
+                    live.stop_for_close().await?;
+                }
+                false => {}
+            }
+        }
+        Ok(())
+    };
+
+    let jobs = state.jobs.clone();
+    let cancel_jobs = async move {
+        if let Ok(jobs) = jobs {
+            let pending = jobs.snapshot().await?;
             for job in &pending {
                 let _ = jobs.cancel(job.job_id).await;
             }
-        }
-        for _ in 0..40 {
-            match jobs.snapshot().await {
-                Ok(remaining) if remaining.is_empty() => break,
-                Ok(_) => {}
-                // Registry unreachable: nothing left to wait for (spec
-                // Boundaries Always P0 review: "`app_close_confirm` treats
-                // `snapshot()` `Err` as 'nothing left to wait for' (break)")
-                // -- the user already confirmed closing, so exit now instead
-                // of burning the full ~4 s poll budget.
-                Err(_) => break,
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(4);
+            loop {
+                match jobs.snapshot().await {
+                    Ok(remaining) if remaining.is_empty() => break,
+                    Ok(_) if tokio::time::Instant::now() < deadline => {}
+                    Ok(_) => {
+                        return Err(AppError::new(
+                            Code::Storage,
+                            "Transcription jobs did not stop before the close timeout",
+                        ));
+                    }
+                    Err(error) => return Err(error),
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
+        Ok(())
+    };
+
+    let result = close::confirm_then_exit(save_live, cancel_jobs, || {
+        close::authorize_exit(&state);
+        app.exit(0);
+    })
+    .await;
+    if let Err(error) = result {
+        close::release(&state);
+        return Err(error);
     }
-    app.exit(0);
     Ok(())
+}
+
+#[tauri::command]
+#[specta::specta]
+fn app_close_stay(state: tauri::State<'_, AppState>) {
+    close::release(&state);
 }
 
 /// Danh sách command/event production — nguồn duy nhất, dùng chung cho
@@ -2410,9 +2457,14 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             library_storage_stats,
             library_open_data_dir,
             library_wipe_all,
-            app_close_confirm
+            app_close_confirm,
+            app_close_stay,
         ])
-        .events(collect_events![SettingsChanged, CloseRequested])
+        .events(collect_events![
+            SettingsChanged,
+            close::CloseRequested,
+            boot::LiveRecoveryCompleted
+        ])
 }
 
 #[cfg(test)]
@@ -3641,6 +3693,24 @@ mod tests {
     // `decide_session_delete` (story 3.1) — spec Design Notes gate order
     // "Đánh dấu trước khi hỏi `is_busy`" and "gỡ ở mọi nhánh thoát, kể cả
     // lỗi".
+
+    #[test]
+    fn recovering_session_rejects_delete_and_rerun_until_recovery_releases_it() {
+        let session_id = SessionId::new();
+        let recovering = std::sync::Mutex::new(std::collections::HashSet::new());
+        recovering.lock().unwrap().insert(session_id);
+
+        assert_eq!(
+            recovering_delete_outcome(&recovering, session_id),
+            Some(SessionDeleteOutcome::Busy)
+        );
+        assert!(is_session_recovering(&recovering, session_id));
+        assert_eq!(session_recovering_error().code, Code::Request);
+
+        recovering.lock().unwrap().remove(&session_id);
+        assert_eq!(recovering_delete_outcome(&recovering, session_id), None);
+        assert!(!is_session_recovering(&recovering, session_id));
+    }
 
     fn counting_busy(
         count: std::sync::Arc<std::sync::atomic::AtomicU32>,

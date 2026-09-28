@@ -12,7 +12,7 @@
 //! chiếu file chưa tồn tại, khó phân biệt với "Proxy lỗi" hợp lệ.
 
 use std::collections::HashMap;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -200,6 +200,235 @@ pub fn append_live_batch(
 pub struct LiveFinalizeOutcome {
     pub session_id: SessionId,
     pub proxy_error: Option<AppError>,
+}
+
+/// Finalizes the durable part of a close request. A Live close must not wait
+/// for a potentially slow Proxy encode; boot recovery can still derive a
+/// Proxy from the finalized WAV later.
+pub fn finalize_live_session_minimal(
+    db: &Db,
+    session_id: SessionId,
+    duration_sec: f64,
+) -> Result<LiveFinalizeOutcome, AppError> {
+    db.with_connection(|conn| {
+        let tx = conn.transaction()?;
+        if !repo::sessions::finalize_live(&tx, session_id, duration_sec, None, now_ms())? {
+            return Err(storage_error("Live session is not in a finalizing state"));
+        }
+        #[cfg(test)]
+        if fault::should_fail(fault::Point::Commit) {
+            return Err(storage_error("injected: commit failure"));
+        }
+        tx.commit()?;
+        Ok(LiveFinalizeOutcome {
+            session_id,
+            proxy_error: None,
+        })
+    })
+}
+
+/// Returns the interrupted Live rows captured at boot. The revision is kept
+/// with each candidate so a delayed encoder cannot publish into a renamed,
+/// deleted, or otherwise changed session.
+pub fn live_recovery_candidates(
+    db: &Db,
+) -> Result<Vec<repo::sessions::LiveRecoveryCandidate>, AppError> {
+    db.with_connection(|conn| Ok(repo::sessions::list_live_recovery_candidates(conn)?))
+}
+
+pub fn live_proxy_candidates(db: &Db) -> Result<Vec<repo::sessions::LiveProxyCandidate>, AppError> {
+    db.with_connection(|conn| Ok(repo::sessions::list_live_proxy_candidates(conn)?))
+}
+
+/// Recover one interrupted Live session without ever rewriting its transcript
+/// or notes. The WAV's checkpointed data length is authoritative: uncheckpointed
+/// bytes are truncated, then a Proxy is attempted and the row is conditionally
+/// committed under an immediate transaction.
+pub fn recover_live_session(
+    db: &Db,
+    root: &Path,
+    candidate: repo::sessions::LiveRecoveryCandidate,
+) -> Result<bool, AppError> {
+    let still_current = db.with_connection(|conn| {
+        let Some(current) = repo::sessions::get(conn, candidate.id)? else {
+            return Ok(false);
+        };
+        Ok(current.kind == "live"
+            && matches!(current.status.as_str(), "recording" | "finalizing")
+            && current.updated_at == candidate.updated_at
+            && current.proxy_ext == candidate.proxy_ext)
+    })?;
+    if !still_current {
+        return Ok(false);
+    }
+
+    let recording_path = paths::recording_path(root, candidate.id);
+    let duration_sec = finalize_checkpointed_wav(&recording_path)?;
+
+    let job_id = JobId::new();
+    let staging_dir = paths::staging_dir(root, job_id);
+    let current_proxy_exists = candidate
+        .proxy_ext
+        .as_deref()
+        .is_some_and(|ext| paths::proxy_path(root, candidate.id, ext).is_file());
+    let (staged_proxy, proxy_error) = if current_proxy_exists {
+        (None, None)
+    } else {
+        match media::create_proxy(&staging_dir, &recording_path) {
+            Ok(proxy) => (Some(proxy.path), None),
+            Err(error) => (None, Some(error)),
+        }
+    };
+
+    let outcome = db.with_connection(|conn| {
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let Some(current) = repo::sessions::get(&tx, candidate.id)? else {
+            return Ok(false);
+        };
+        if current.kind != "live"
+            || !matches!(current.status.as_str(), "recording" | "finalizing")
+            || current.updated_at != candidate.updated_at
+            || current.proxy_ext != candidate.proxy_ext
+        {
+            return Ok(false);
+        }
+
+        let existing_proxy = current.proxy_ext.as_deref().filter(|ext| {
+            paths::proxy_path(root, candidate.id, ext).is_file()
+        });
+        let (proxy_ext, published_path) = if let Some(ext) = existing_proxy {
+            (Some(ext.to_owned()), None)
+        } else if let Some(staged_path) = staged_proxy.as_deref() {
+            match publish_proxy(root, candidate.id, staged_path) {
+                Ok(ext) => (Some(ext.clone()), Some(paths::proxy_path(root, candidate.id, &ext))),
+                Err(error) => {
+                    remove_media_dir_if_empty(root, candidate.id);
+                    tracing::warn!(session_id = %candidate.id, error = %error, "Live recovery kept the WAV without a Proxy");
+                    (None, None)
+                }
+            }
+        } else {
+            (None, None)
+        };
+
+        if !repo::sessions::finalize_recovered_live(
+            &tx,
+            candidate.id,
+            candidate.updated_at,
+            duration_sec,
+            proxy_ext.as_deref(),
+            now_ms(),
+        )? {
+            if let Some(path) = published_path.as_deref() {
+                let _ = fs::remove_file(path);
+            }
+            return Ok(false);
+        }
+        if let Err(error) = tx.commit() {
+            if let Some(path) = published_path.as_deref() {
+                let _ = fs::remove_file(path);
+            }
+            return Err(error.into());
+        }
+        Ok(true)
+    });
+
+    if let Err(error) = discard_staging(root, job_id) {
+        tracing::warn!(session_id = %candidate.id, error = %error, "could not clean Live recovery staging");
+    }
+    if let Some(error) = proxy_error {
+        tracing::warn!(session_id = %candidate.id, error = %error, "Live recovery kept the WAV without a Proxy");
+    }
+    outcome
+}
+
+/// Retries only the derived Proxy for a completed Live session. The row and
+/// revision are checked under an immediate transaction before the staged
+/// Proxy is published, so deletion during encoding cannot resurrect files.
+pub fn repair_live_proxy(
+    db: &Db,
+    root: &Path,
+    candidate: repo::sessions::LiveProxyCandidate,
+) -> Result<bool, AppError> {
+    let recording_path = paths::recording_path(root, candidate.id);
+    finalize_checkpointed_wav(&recording_path)?;
+    let job_id = JobId::new();
+    let staging_dir = paths::staging_dir(root, job_id);
+    let staged_proxy = match media::create_proxy(&staging_dir, &recording_path) {
+        Ok(proxy) => proxy.path,
+        Err(error) => {
+            if let Err(cleanup_error) = discard_staging(root, job_id) {
+                tracing::warn!(session_id = %candidate.id, error = %cleanup_error, "could not clean failed Live Proxy repair staging");
+            }
+            tracing::warn!(session_id = %candidate.id, error = %error, "Live Proxy repair will retry at a later boot");
+            return Ok(false);
+        }
+    };
+
+    let outcome = db.with_connection(|conn| {
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let Some(current) = repo::sessions::get(&tx, candidate.id)? else {
+            return Ok(false);
+        };
+        if current.kind != "live"
+            || current.status != "complete"
+            || current.proxy_ext.is_some()
+            || current.updated_at != candidate.updated_at
+        {
+            return Ok(false);
+        }
+        let ext = match publish_proxy(root, candidate.id, &staged_proxy) {
+            Ok(ext) => ext,
+            Err(error) => {
+                remove_media_dir_if_empty(root, candidate.id);
+                tracing::warn!(session_id = %candidate.id, error = %error, "Live Proxy repair could not publish the Proxy");
+                return Ok(false);
+            }
+        };
+        if repo::sessions::set_proxy_ext(&tx, candidate.id, Some(&ext), now_ms()).is_err() {
+            let _ = fs::remove_file(paths::proxy_path(root, candidate.id, &ext));
+            return Err(storage_error("could not save repaired Live Proxy metadata"));
+        }
+        tx.commit()?;
+        Ok(true)
+    });
+
+    if let Err(error) = discard_staging(root, job_id) {
+        tracing::warn!(session_id = %candidate.id, error = %error, "could not clean Live Proxy repair staging");
+    }
+    outcome
+}
+
+fn finalize_checkpointed_wav(recording_path: &Path) -> Result<f64, AppError> {
+    let reader = hound::WavReader::open(recording_path)
+        .map_err(|error| storage_error(&format!("invalid checkpointed Live WAV: {error}")))?;
+    let spec = reader.spec();
+    if !(1..=2).contains(&spec.channels)
+        || spec.sample_rate != crate::audio::OUTPUT_SAMPLE_RATE
+        || spec.bits_per_sample != 16
+        || spec.sample_format != hound::SampleFormat::Int
+    {
+        return Err(storage_error(
+            "checkpointed Live WAV has an unsupported format",
+        ));
+    }
+    let samples = u64::from(reader.duration());
+    drop(reader);
+    let data_bytes = samples
+        .checked_mul(u64::from(spec.channels))
+        .and_then(|frames| frames.checked_mul(u64::from(spec.bits_per_sample / 8)))
+        .ok_or_else(|| storage_error("checkpointed Live WAV is too large"))?;
+    let checkpointed_len = 44_u64
+        .checked_add(data_bytes)
+        .ok_or_else(|| storage_error("checkpointed Live WAV is too large"))?;
+    let file = OpenOptions::new().write(true).open(recording_path)?;
+    let actual_len = file.metadata()?.len();
+    if actual_len < checkpointed_len {
+        return Err(storage_error("checkpointed Live WAV data is incomplete"));
+    }
+    file.set_len(checkpointed_len)?;
+    file.sync_all()?;
+    Ok(samples as f64 / f64::from(spec.sample_rate))
 }
 
 pub fn finalize_live_session(
@@ -1199,9 +1428,81 @@ fn remove_path_any(session_id: Option<SessionId>, path: &Path) {
 /// Chạy lại nhiều lần cho cùng kết quả: sau lần đầu, không còn gì để dọn nên
 /// các lần sau là no-op (spec Always: "Reconcile chạy lại nhiều lần cho cùng
 /// kết quả").
-pub fn reconcile(db: &Db, root: &Path) -> Result<(), AppError> {
+pub fn cleanup_staging(root: &Path) -> Result<(), AppError> {
     remove_path_if_exists(&paths::staging_root(root))?;
+    Ok(())
+}
 
+/// Atomically removes the old staging tree from the writers' namespace. Boot
+/// can then start Job and recovery writers immediately and delete this detached
+/// tree in its background worker without racing files created after startup.
+pub fn detach_staging(root: &Path) -> Result<Option<std::path::PathBuf>, AppError> {
+    let staging = paths::staging_root(root);
+    let detached = root.join(format!(".staging-cleanup-{}", JobId::new()));
+    match fs::rename(&staging, &detached) {
+        Ok(()) => Ok(Some(detached)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(storage_error(&error.to_string())),
+    }
+}
+
+pub fn remove_detached_staging(path: &Path) -> Result<(), AppError> {
+    remove_path_if_exists(path)
+}
+
+/// Removes staging trees detached by this app or left by a prior force-kill
+/// between rename and cleanup. The reserved names are outside `media/`, so
+/// this background scan cannot race a running Job's current staging directory.
+pub fn cleanup_detached_staging(root: &Path) -> Result<(), AppError> {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(storage_error(&error.to_string())),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| storage_error(&error.to_string()))?;
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(".staging-cleanup-"))
+        {
+            let path = entry.path();
+            if fs::remove_file(&path).is_err() {
+                remove_path_if_exists(&path)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Full media scan from `reconcile`, split out so startup can keep it off the
+/// synchronous boot path while preserving the cleanup-before-recovery order.
+pub fn reconcile_media(db: &Db, root: &Path) -> Result<(), AppError> {
+    let known = media_refs(db)?;
+    reconcile_media_refs(db, root, known, true)
+}
+
+/// Capture lightweight DB media refs before actors start. Startup reconciliation
+/// uses this snapshot so it cannot mistake a just-created Live directory (which
+/// briefly exists before its DB insert) for an orphan and delete it.
+pub fn media_refs(db: &Db) -> Result<Vec<(SessionId, String, Option<String>)>, AppError> {
+    db.with_connection(|conn| Ok(repo::sessions::list_media_refs(conn)?))
+}
+
+pub fn reconcile_media_snapshot(
+    db: &Db,
+    root: &Path,
+    known_at_boot: Vec<(SessionId, String, Option<String>)>,
+) -> Result<(), AppError> {
+    reconcile_media_refs(db, root, known_at_boot, false)
+}
+
+fn reconcile_media_refs(
+    db: &Db,
+    root: &Path,
+    known_refs: Vec<(SessionId, String, Option<String>)>,
+    remove_orphans: bool,
+) -> Result<(), AppError> {
     let media_root = paths::media_root(root);
     let entries = match fs::read_dir(&media_root) {
         Ok(entries) => entries,
@@ -1209,12 +1510,10 @@ pub fn reconcile(db: &Db, root: &Path) -> Result<(), AppError> {
         Err(err) => return Err(storage_error(&err.to_string())),
     };
 
-    let known: HashMap<SessionId, (String, Option<String>)> = db.with_connection(|conn| {
-        Ok(repo::sessions::list_media_refs(conn)?
-            .into_iter()
-            .map(|(id, kind, proxy_ext)| (id, (kind, proxy_ext)))
-            .collect())
-    })?;
+    let known: HashMap<SessionId, (String, Option<String>)> = known_refs
+        .into_iter()
+        .map(|(id, kind, proxy_ext)| (id, (kind, proxy_ext)))
+        .collect();
 
     for entry in entries {
         let entry = match entry {
@@ -1230,18 +1529,28 @@ pub fn reconcile(db: &Db, root: &Path) -> Result<(), AppError> {
         };
         let path = entry.path();
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            remove_path_any(None, &path);
+            if remove_orphans {
+                remove_path_any(None, &path);
+            }
             continue;
         };
+        // A new writer may have recreated this directory after boot detached
+        // the old one. Never inspect or remove the live staging namespace here.
+        if name == ".staging" {
+            continue;
+        }
         let Ok(session_id) = SessionId::try_from(name.as_str()) else {
             // Không parse được thành UUIDv7 -> không phải thư mục Phiên hợp
             // lệ (bao gồm cả trường hợp `.staging` lỡ tái tạo giữa hai bước
             // trên do một tiến trình khác — vẫn dọn được an toàn).
-            remove_path_any(None, &path);
+            if remove_orphans {
+                remove_path_any(None, &path);
+            }
             continue;
         };
         match known.get(&session_id) {
-            None => remove_path_any(Some(session_id), &path),
+            None if remove_orphans => remove_path_any(Some(session_id), &path),
+            None => {}
             Some((kind, proxy_ext)) if path.is_dir() => {
                 // An error reconciling one session directory is logged and
                 // the loop continues -- it never aborts the other sessions
@@ -1261,6 +1570,11 @@ pub fn reconcile(db: &Db, root: &Path) -> Result<(), AppError> {
     }
 
     Ok(())
+}
+
+pub fn reconcile(db: &Db, root: &Path) -> Result<(), AppError> {
+    cleanup_staging(root)?;
+    reconcile_media(db, root)
 }
 
 /// Scans `dir` for a `proxy.<ext>` file and returns `<ext>` — used only to
@@ -1347,10 +1661,326 @@ fn reconcile_session_dir(
 mod tests {
     use super::*;
     use crate::db::repo::segments::{GapReason, SegmentKind};
+    use std::io::Write as _;
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+    use std::sync::mpsc;
+    use std::thread;
     use tempfile::tempdir;
 
     fn open_db(root: &Path) -> Db {
         Db::open(root).unwrap()
+    }
+
+    #[test]
+    fn checkpoint_recovery_preserves_all_channels_and_truncates_only_the_uncheckpointed_tail() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("stereo.wav");
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: crate::audio::OUTPUT_SAMPLE_RATE,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+        for frame in 0..100 {
+            writer.write_sample(frame as i16).unwrap();
+            writer.write_sample(-(frame as i16)).unwrap();
+        }
+        writer.finalize().unwrap();
+        let checkpointed_len = fs::metadata(&path).unwrap().len();
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&[1; 40])
+            .unwrap();
+
+        let duration = finalize_checkpointed_wav(&path).unwrap();
+        let mut recovered = hound::WavReader::open(&path).unwrap();
+        assert_eq!(recovered.spec().channels, 2);
+        assert_eq!(recovered.duration(), 100);
+        assert_eq!(recovered.samples::<i16>().map(Result::unwrap).count(), 200);
+        assert_eq!(fs::metadata(&path).unwrap().len(), checkpointed_len);
+        assert!((duration - 100.0 / f64::from(crate::audio::OUTPUT_SAMPLE_RATE)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn boot_recovery_commits_once_and_preserves_segments_notes_and_playable_wav() {
+        let root = tempdir().unwrap();
+        let db = open_db(root.path());
+        let (session_id, recording_path) = seed_finalizing_live(root.path(), &db);
+        db.with_connection(|conn| {
+            repo::notes::save_if_newer(
+                conn,
+                session_id,
+                &crate::core::sensitive::Sensitive::new("keep this note".to_owned()),
+                3,
+                now_ms(),
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let original = live_recovery_candidates(&db).unwrap().remove(0);
+
+        assert!(recover_live_session(&db, root.path(), original.clone()).unwrap());
+        // Reusing a stale boot candidate is a no-op; completed sessions are
+        // not selected again and no transcript/segment is added.
+        assert!(!recover_live_session(&db, root.path(), original).unwrap());
+        assert!(live_recovery_candidates(&db).unwrap().is_empty());
+
+        let row = db
+            .with_connection(|conn| Ok(repo::sessions::get(conn, session_id)?.unwrap()))
+            .unwrap();
+        assert_eq!(row.status, "complete");
+        assert!(row.recovered);
+        assert!((row.duration_sec - 1.0).abs() < 0.01);
+        let primary_id = db
+            .with_connection(|conn| {
+                Ok(repo::transcripts::primary_for_session(conn, session_id)?.unwrap())
+            })
+            .unwrap();
+        let segments = db
+            .with_connection(|conn| Ok(repo::segments::list_for_transcript(conn, primary_id)?))
+            .unwrap();
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].text, "final transcript");
+        let note = db
+            .with_connection(|conn| Ok(repo::notes::get(conn, session_id)?.unwrap()))
+            .unwrap();
+        assert_eq!(note.body.expose(), "keep this note");
+        let reader = hound::WavReader::open(recording_path).unwrap();
+        assert_eq!(reader.spec().channels, 1);
+        assert_eq!(reader.duration(), 16_000);
+        assert_eq!(
+            row.proxy_ext.is_some(),
+            paths::media_dir(root.path(), session_id)
+                .join(format!(
+                    "proxy.{}",
+                    row.proxy_ext.as_deref().unwrap_or("missing")
+                ))
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn boot_recovery_keeps_wav_and_segments_when_proxy_publish_fails() {
+        let root = tempdir().unwrap();
+        let db = open_db(root.path());
+        let (session_id, recording_path) = seed_finalizing_live(root.path(), &db);
+        let candidate = live_recovery_candidates(&db).unwrap().remove(0);
+
+        fault::set(Some(fault::Point::PublishWrite));
+        let result = recover_live_session(&db, root.path(), candidate);
+        fault::set(None);
+
+        assert!(result.unwrap());
+        let row = db
+            .with_connection(|conn| Ok(repo::sessions::get(conn, session_id)?.unwrap()))
+            .unwrap();
+        assert_eq!(row.status, "complete");
+        assert!(row.recovered);
+        assert_eq!(row.proxy_ext, None);
+        assert!(hound::WavReader::open(recording_path).is_ok());
+        let transcript_id = db
+            .with_connection(|conn| {
+                Ok(repo::transcripts::primary_for_session(conn, session_id)?.unwrap())
+            })
+            .unwrap();
+        let segments = db
+            .with_connection(|conn| Ok(repo::segments::list_for_transcript(conn, transcript_id)?))
+            .unwrap();
+        assert_eq!(segments.len(), 1);
+    }
+
+    #[test]
+    fn boot_recovery_db_failure_keeps_the_orphan_available_for_retry() {
+        let root = tempdir().unwrap();
+        let db = open_db(root.path());
+        let (session_id, recording_path) = seed_finalizing_live(root.path(), &db);
+        let candidate = live_recovery_candidates(&db).unwrap().remove(0);
+        db.with_connection(|conn| {
+            conn.execute_batch(
+                "CREATE TRIGGER fail_recovery_commit BEFORE UPDATE OF status ON sessions \
+                 WHEN NEW.status = 'complete' BEGIN SELECT RAISE(FAIL, 'injected commit failure'); END;",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(recover_live_session(&db, root.path(), candidate).is_err());
+        let row = db
+            .with_connection(|conn| Ok(repo::sessions::get(conn, session_id)?.unwrap()))
+            .unwrap();
+        assert_eq!(row.status, "finalizing");
+        assert!(!row.recovered);
+        assert!(recording_path.is_file());
+        assert_eq!(live_recovery_candidates(&db).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn force_killed_live_reopens_database_and_recovers_library_row_segment_and_wav() {
+        let root = tempdir().unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "live::recording::tests::boot_recovery_crash_child_waits_for_parent_kill",
+                "--nocapture",
+            ])
+            .env("LIVE_BOOT_RECOVERY_ROOT", root.path())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (session_tx, session_rx) = mpsc::channel();
+        thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().flatten() {
+                if let Some(raw_id) = line.strip_prefix("LIVE_BOOT_RECOVERY_CHECKPOINTED:") {
+                    let _ = session_tx.send(raw_id.to_owned());
+                    return;
+                }
+            }
+        });
+        let raw_session_id = session_rx.recv_timeout(std::time::Duration::from_secs(15));
+        if !matches!(raw_session_id, Ok(_)) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("crash writer did not checkpoint before timeout: {raw_session_id:?}");
+        }
+        child.kill().unwrap();
+        let _ = child.wait();
+        let session_id = SessionId::try_from(raw_session_id.unwrap().as_str()).unwrap();
+
+        // Reopen after the child process is gone, as a real next boot does.
+        let db = open_db(root.path());
+        let candidate = live_recovery_candidates(&db)
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == session_id)
+            .expect("force-killed Live remains recoverable in SQLite");
+        assert!(recover_live_session(&db, root.path(), candidate).unwrap());
+
+        let row = db
+            .with_connection(|conn| {
+                Ok(repo::sessions::list_for_home(conn)?
+                    .into_iter()
+                    .find(|row| row.id == session_id)
+                    .unwrap())
+            })
+            .unwrap();
+        assert_eq!(row.kind, "live");
+        assert!(row.recovered);
+        let transcript_id = db
+            .with_connection(|conn| {
+                Ok(repo::transcripts::primary_for_session(conn, session_id)?.unwrap())
+            })
+            .unwrap();
+        let segments = db
+            .with_connection(|conn| Ok(repo::segments::list_for_transcript(conn, transcript_id)?))
+            .unwrap();
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].text, "durably flushed before kill");
+        let mut wav =
+            hound::WavReader::open(paths::recording_path(root.path(), session_id)).unwrap();
+        assert_eq!(wav.spec().sample_rate, 16_000);
+        assert_eq!(wav.duration(), 80_000);
+        assert_eq!(wav.samples::<i16>().map(Result::unwrap).count(), 80_000);
+    }
+
+    #[test]
+    fn boot_media_snapshot_does_not_delete_a_new_live_directory_or_fresh_staging() {
+        let root = tempdir().unwrap();
+        let db = open_db(root.path());
+        let media_snapshot = media_refs(&db).unwrap();
+
+        let session_id = SessionId::new();
+        create_live_session(&db, session_id, "Started during boot").unwrap();
+        let recording = paths::recording_path(root.path(), session_id);
+        fs::create_dir_all(recording.parent().unwrap()).unwrap();
+        fs::write(&recording, b"writer still owns this directory").unwrap();
+        let staging_file = paths::staging_dir(root.path(), JobId::new()).join("in-progress");
+        fs::create_dir_all(staging_file.parent().unwrap()).unwrap();
+        fs::write(&staging_file, b"job staging").unwrap();
+
+        reconcile_media_snapshot(&db, root.path(), media_snapshot).unwrap();
+
+        assert!(recording.is_file());
+        assert!(staging_file.is_file());
+    }
+
+    #[test]
+    fn boot_detaches_old_staging_before_new_writers_start() {
+        let root = tempdir().unwrap();
+        let stale = paths::staging_dir(root.path(), JobId::new()).join("old-partial");
+        fs::create_dir_all(stale.parent().unwrap()).unwrap();
+        fs::write(&stale, b"stale").unwrap();
+
+        let detached = detach_staging(root.path()).unwrap().unwrap();
+        assert!(!paths::staging_root(root.path()).exists());
+        let old_relative = stale
+            .strip_prefix(paths::staging_root(root.path()))
+            .unwrap();
+        assert!(detached.join(old_relative).is_file());
+
+        let new = paths::staging_dir(root.path(), JobId::new()).join("new-partial");
+        fs::create_dir_all(new.parent().unwrap()).unwrap();
+        fs::write(&new, b"new").unwrap();
+        let orphaned_from_older_boot = root.path().join(".staging-cleanup-abandoned");
+        fs::create_dir(&orphaned_from_older_boot).unwrap();
+        cleanup_detached_staging(root.path()).unwrap();
+        assert!(new.is_file());
+        assert!(!detached.exists());
+        assert!(!orphaned_from_older_boot.exists());
+    }
+
+    #[test]
+    fn recovery_candidate_cannot_resurrect_a_row_deleted_during_proxy_work() {
+        let root = tempdir().unwrap();
+        let db = open_db(root.path());
+        let (session_id, _recording_path) = seed_finalizing_live(root.path(), &db);
+        let candidate = live_recovery_candidates(&db).unwrap().remove(0);
+        db.with_connection(|conn| {
+            repo::sessions::delete(conn, session_id)?;
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(!recover_live_session(&db, root.path(), candidate).unwrap());
+
+        assert!(db
+            .with_connection(|conn| Ok(repo::sessions::get(conn, session_id)?))
+            .unwrap()
+            .is_none());
+        assert!(!paths::media_dir(root.path(), session_id)
+            .join("proxy.flac")
+            .exists());
+        assert!(staging_root_is_empty(root.path()));
+    }
+
+    #[test]
+    fn close_minimal_completion_leaves_proxy_for_the_next_boot_repair() {
+        let root = tempdir().unwrap();
+        let db = open_db(root.path());
+        let (session_id, recording_path) = seed_finalizing_live(root.path(), &db);
+
+        finalize_live_session_minimal(&db, session_id, 1.0).unwrap();
+        let completed = db
+            .with_connection(|conn| Ok(repo::sessions::get(conn, session_id)?.unwrap()))
+            .unwrap();
+        assert_eq!(completed.status, "complete");
+        assert_eq!(completed.proxy_ext, None);
+        let repair = live_proxy_candidates(&db).unwrap().remove(0);
+
+        assert!(repair_live_proxy(&db, root.path(), repair).unwrap());
+
+        let repaired = db
+            .with_connection(|conn| Ok(repo::sessions::get(conn, session_id)?.unwrap()))
+            .unwrap();
+        assert_eq!(repaired.status, "complete");
+        assert_eq!(repaired.proxy_ext.as_deref(), Some("flac"));
+        assert!(recording_path.is_file());
+        assert!(paths::proxy_path(root.path(), session_id, "flac").is_file());
     }
 
     #[test]

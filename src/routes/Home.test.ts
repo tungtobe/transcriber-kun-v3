@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, render, screen } from '@testing-library/svelte';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import { i18n } from '../i18n/index.svelte';
 import { configureRouter } from '../lib/router';
 import Home from './Home.svelte';
@@ -63,6 +63,11 @@ const mocks = vi.hoisted(() => ({
     error: null as null | { category: string; code: string; detailRedacted: string },
     reloadError: false,
     load: vi.fn(() => Promise.resolve()),
+    recoveryCallback: null as null | (() => void),
+    listenForRecoveryCompleted: vi.fn((callback: () => void) => {
+      mocks.libraryStore.recoveryCallback = callback;
+      return Promise.resolve(() => {});
+    }),
     rename: vi.fn(() => Promise.resolve({ status: 'ok', title: 'renamed' })),
     remove: vi.fn(() => Promise.resolve({ status: 'ok', outcome: 'deleted' })),
     // Story 3.2: đọc-only trong test này (không có test nào ở đây lọc theo
@@ -114,6 +119,11 @@ beforeEach(() => {
   mocks.libraryStore.error = null;
   mocks.libraryStore.reloadError = false;
   mocks.libraryStore.load.mockReset().mockResolvedValue(undefined);
+  mocks.libraryStore.recoveryCallback = null;
+  mocks.libraryStore.listenForRecoveryCompleted.mockReset().mockImplementation((callback: () => void) => {
+    mocks.libraryStore.recoveryCallback = callback;
+    return Promise.resolve(() => {});
+  });
   mocks.libraryStore.rename.mockReset().mockResolvedValue({ status: 'ok', title: 'renamed' });
   mocks.libraryStore.remove.mockReset().mockResolvedValue({ status: 'ok', outcome: 'deleted' });
   mocks.libraryStore.tags = [];
@@ -264,9 +274,10 @@ describe('Home file intake (story 2.8)', () => {
 describe('Home mount/unmount subscribes and unsubscribes jobsStore (story 2.9)', () => {
   beforeEach(() => i18n.applyPreference('vi'));
 
-  it('subscribes jobsStore on mount and unsubscribes on unmount, and loads the library once', () => {
+  it('subscribes jobsStore on mount and unsubscribes on unmount, and loads the library once', async () => {
     const view = render(Home);
     expect(mocks.jobsStore.subscribe).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(mocks.libraryStore.listenForRecoveryCompleted).toHaveBeenCalledTimes(1));
     expect(mocks.libraryStore.load).toHaveBeenCalledTimes(1);
 
     view.unmount();
@@ -320,6 +331,7 @@ describe('Home session list (story 2.9)', () => {
     render(Home);
 
     expect(screen.getByText('Không tải được danh sách phiên.')).toBeTruthy();
+    await waitFor(() => expect(mocks.libraryStore.load).toHaveBeenCalledTimes(1));
     mocks.libraryStore.load.mockClear();
     await fireEvent.click(screen.getByRole('button', { name: 'Thử lại' }));
     expect(mocks.libraryStore.load).toHaveBeenCalledTimes(1);

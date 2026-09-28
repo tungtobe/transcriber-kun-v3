@@ -41,6 +41,22 @@ pub struct SessionRow {
     pub updated_at: i64,
 }
 
+/// The durable revision observed before a Live recovery starts doing file
+/// work. Recovery must match both the ID and `updated_at` before publishing
+/// derived media or changing lifecycle state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveRecoveryCandidate {
+    pub id: SessionId,
+    pub updated_at: i64,
+    pub proxy_ext: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveProxyCandidate {
+    pub id: SessionId,
+    pub updated_at: i64,
+}
+
 const SELECT_COLUMNS: &str = "id, kind, title, source_hash, source_name, status, recovered, \
      duration_sec, proxy_ext, created_at, updated_at";
 
@@ -182,6 +198,74 @@ pub fn finalize_live(
              status = 'complete', updated_at = ?3 \
          WHERE id = ?4 AND kind = 'live' AND status = 'finalizing'",
         params![duration_sec.max(0.0), proxy_ext, updated_at, id.to_string()],
+    )?;
+    Ok(changed == 1)
+}
+
+/// Lists only interrupted Live rows. Completed sessions are intentionally
+/// excluded so a repeated boot cannot create another transcript or revive a
+/// deleted session.
+pub fn list_live_recovery_candidates(
+    conn: &Connection,
+) -> rusqlite::Result<Vec<LiveRecoveryCandidate>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, updated_at, proxy_ext FROM sessions \
+         WHERE kind = 'live' AND status IN ('recording', 'finalizing') \
+         ORDER BY created_at, id",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        let raw_id: String = row.get(0)?;
+        Ok(LiveRecoveryCandidate {
+            id: parse_session_id(&raw_id)?,
+            updated_at: row.get(1)?,
+            proxy_ext: row.get(2)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// Lists completed Live sessions whose derived Proxy is still absent. Boot
+/// may retry this best-effort repair without changing their transcript or
+/// lifecycle state.
+pub fn list_live_proxy_candidates(conn: &Connection) -> rusqlite::Result<Vec<LiveProxyCandidate>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, updated_at FROM sessions \
+         WHERE kind = 'live' AND status = 'complete' AND proxy_ext IS NULL \
+         ORDER BY created_at, id",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        let raw_id: String = row.get(0)?;
+        Ok(LiveProxyCandidate {
+            id: parse_session_id(&raw_id)?,
+            updated_at: row.get(1)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// Completes an interrupted Live session only while its observed revision is
+/// still current. The caller wraps this in the same transaction as Proxy
+/// publication when a Proxy was generated.
+pub fn finalize_recovered_live(
+    conn: &Connection,
+    id: SessionId,
+    expected_updated_at: i64,
+    duration_sec: f64,
+    proxy_ext: Option<&str>,
+    updated_at: i64,
+) -> rusqlite::Result<bool> {
+    let changed = conn.execute(
+        "UPDATE sessions SET duration_sec = ?1, proxy_ext = ?2, status = 'complete', \
+             recovered = 1, updated_at = ?3 \
+         WHERE id = ?4 AND kind = 'live' AND status IN ('recording', 'finalizing') \
+             AND updated_at = ?5",
+        params![
+            duration_sec.max(0.0),
+            proxy_ext,
+            updated_at,
+            id.to_string(),
+            expected_updated_at,
+        ],
     )?;
     Ok(changed == 1)
 }
@@ -362,6 +446,93 @@ mod tests {
             created_at: 1_000,
             updated_at: 1_000,
         }
+    }
+
+    #[test]
+    fn live_recovery_scan_selects_only_interrupted_live_rows() {
+        let conn = open_migrated();
+        let recording = SessionId::new();
+        let finalizing = SessionId::new();
+        let completed = SessionId::new();
+        insert(
+            &conn,
+            NewSession {
+                kind: "live",
+                status: "recording",
+                source_hash: None,
+                ..sample(recording)
+            },
+        )
+        .unwrap();
+        insert(
+            &conn,
+            NewSession {
+                kind: "live",
+                status: "finalizing",
+                source_hash: None,
+                ..sample(finalizing)
+            },
+        )
+        .unwrap();
+        insert(
+            &conn,
+            NewSession {
+                kind: "live",
+                status: "complete",
+                source_hash: None,
+                ..sample(completed)
+            },
+        )
+        .unwrap();
+
+        let candidates = list_live_recovery_candidates(&conn).unwrap();
+
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates.iter().any(|candidate| candidate.id == recording));
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.id == finalizing));
+        assert!(!candidates.iter().any(|candidate| candidate.id == completed));
+    }
+
+    #[test]
+    fn recovered_finalization_requires_the_observed_revision_and_existing_row() {
+        let conn = open_migrated();
+        let id = SessionId::new();
+        insert(
+            &conn,
+            NewSession {
+                kind: "live",
+                status: "recording",
+                source_hash: None,
+                ..sample(id)
+            },
+        )
+        .unwrap();
+        set_title(&conn, id, "renamed while recovering", 1_500).unwrap();
+
+        assert!(!finalize_recovered_live(&conn, id, 1_000, 3.0, None, 2_000).unwrap());
+        assert_eq!(get(&conn, id).unwrap().unwrap().status, "recording");
+        assert!(finalize_recovered_live(&conn, id, 1_500, 3.0, None, 2_000).unwrap());
+        let recovered = get(&conn, id).unwrap().unwrap();
+        assert_eq!(recovered.status, "complete");
+        assert!(recovered.recovered);
+        assert_eq!(recovered.duration_sec, 3.0);
+
+        let deleted = SessionId::new();
+        insert(
+            &conn,
+            NewSession {
+                kind: "live",
+                status: "finalizing",
+                source_hash: None,
+                ..sample(deleted)
+            },
+        )
+        .unwrap();
+        delete(&conn, deleted).unwrap();
+        assert!(!finalize_recovered_live(&conn, deleted, 1_000, 2.0, None, 3_000).unwrap());
+        assert!(get(&conn, deleted).unwrap().is_none());
     }
 
     #[test]

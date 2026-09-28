@@ -59,6 +59,7 @@ vi.mock('./lib/stores/library.svelte', () => ({
     error: null,
     reloadError: false,
     load: vi.fn(() => Promise.resolve()),
+    listenForRecoveryCompleted: vi.fn(() => Promise.resolve(() => {})),
     tags: [],
     tagFilter: { tagIds: [], untagged: false },
     loadTags: vi.fn(() => Promise.resolve()),

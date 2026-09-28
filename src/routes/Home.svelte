@@ -6,7 +6,7 @@
   // subscribe riêng của nó, không đụng nhau) và `libraryStore` tự tải lại
   // khi một Job commit (`jobsStore.resultSeq` đổi) — không cần thao tác gì ở
   // đây ngoài `load()` lúc mount.
-  import { onDestroy, onMount } from 'svelte';
+  import { onMount } from 'svelte';
   import { link } from '@keenmate/svelte-spa-router';
   import { InfoIcon, RadioIcon, UploadIcon } from '../components/icons';
   import DisabledHint from '../components/DisabledHint.svelte';
@@ -41,15 +41,33 @@
   let sessionSearchRef = $state<{ focusAndSelect: () => void } | null>(null);
 
   onMount(() => {
+    let active = true;
+    let unlistenRecovery: (() => void) | null = null;
     void keysStore.load();
     subscribedJobs = true;
     void jobsStore.subscribe();
-    void libraryStore.load();
+    void libraryStore
+      .listenForRecoveryCompleted(() => void libraryStore.load())
+      .then((unlisten) => {
+        if (!active) {
+          unlisten();
+          return;
+        }
+        unlistenRecovery = unlisten;
+        // Subscribe before the first list request. A recovery event emitted
+        // during setup then either precedes this read (so the row is included)
+        // or follows it and queues a reactive refresh.
+        void libraryStore.load();
+      })
+      .catch(() => {
+        if (active) void libraryStore.load();
+      });
     void libraryStore.loadTags();
-  });
-
-  onDestroy(() => {
-    if (subscribedJobs) jobsStore.unsubscribe();
+    return () => {
+      active = false;
+      unlistenRecovery?.();
+      if (subscribedJobs) jobsStore.unsubscribe();
+    };
   });
 
   // Loading is treated conservatively (button stays disabled) the same way

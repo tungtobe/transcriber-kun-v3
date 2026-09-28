@@ -52,10 +52,10 @@ describe('store app', () => {
     expect(appStore.version).toEqual({ status: 'error', error: null });
   });
 
-  it('listenForCloseRequested forwards the busy flag from the event payload', async () => {
+  it('listenForCloseRequested forwards Live and Job activity from the typed payload', async () => {
     const unlisten = vi.fn();
     closeRequestedListen.mockImplementation((cb: (event: unknown) => void) => {
-      cb({ event: 'close-requested', payload: { busy: true } } as never);
+      cb({ event: 'close-requested', payload: { liveBusy: true, jobBusy: false } } as never);
       return Promise.resolve(unlisten);
     });
     const { appStore } = await import('./app.svelte');
@@ -64,7 +64,7 @@ describe('store app', () => {
     const returned = await appStore.listenForCloseRequested(callback);
 
     expect(callback).toHaveBeenCalledTimes(1);
-    expect(callback).toHaveBeenCalledWith(true);
+    expect(callback).toHaveBeenCalledWith({ liveBusy: true, jobBusy: false });
     expect(returned).toBe(unlisten);
   });
 

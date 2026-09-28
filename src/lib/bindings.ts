@@ -378,17 +378,18 @@ export const commands = {
 	 */
 	libraryWipeAll: () => typedError<WipeAllOutcome, AppError>(__TAURI_INVOKE("library_wipe_all")),
 	/**
-	 *  Người dùng xác nhận đóng app khi registry đang bận (spec Design Notes:
-	 *  "đồng ý → huỷ sạch rồi thoát"): huỷ mọi Job hiện có, chờ tối đa ~4 s để
-	 *  mỗi Job dọn xong (huỷ có hiệu lực ≤ 2 s — spec Always), rồi thoát tiến
-	 *  trình thật sự bất kể kết quả chờ, vì người dùng đã đồng ý đóng.
+	 *  Người dùng xác nhận đóng app: flush Live tới WAV/metadata bền vững, huỷ
+	 *  Jobs đang chạy, rồi mới cho phép Tauri thoát. Proxy không nằm trên đường
+	 *  đóng để một encode chậm không giữ app mở.
 	 */
 	appCloseConfirm: () => typedError<null, AppError>(__TAURI_INVOKE("app_close_confirm")),
+	appCloseStay: () => __TAURI_INVOKE<void>("app_close_stay"),
 };
 
 /** Events */
 export const events = {
 	closeRequested: makeEvent<CloseRequested>("close-requested"),
+	liveRecoveryCompleted: makeEvent<LiveRecoveryCompleted>("live-recovery-completed"),
 	settingsChanged: makeEvent<SettingsChanged>("settings-changed"),
 };
 
@@ -413,18 +414,9 @@ export type CancelOutcome = "cancelling" | "alreadyFinished";
 /**  8 category ổn định hiển thị cho người dùng — spec Boundaries. */
 export type Category = "quota" | "auth" | "model" | "network" | "format" | "permission" | "storage" | "blocked";
 
-/**
- *  Phát mỗi khi cửa sổ chính bị yêu cầu đóng (story 3.5, spec Code Map: "đổi
- *  để luôn emit (thêm cờ `busy` vào payload event) và frontend quyết định" --
- *  trước đây chỉ emit khi registry bận, nhánh rảnh thoát thẳng từ Rust, nên
- *  không có chỗ nào chắc chắn chạy để flush ghi chú trước khi đóng). `busy`
- *  phản ánh đúng kết quả `JobRegistryHandle::snapshot` tại thời điểm nhận yêu
- *  cầu đóng: `true` mở dialog Job hiện có (`CloseConfirm`), `false` là tín
- *  hiệu để `appStore` tự flush ghi chú rồi gọi `appCloseConfirm` nếu flush
- *  thành công.
- */
 export type CloseRequested = {
-	busy: boolean,
+	liveBusy: boolean,
+	jobBusy: boolean,
 };
 
 /**
@@ -590,6 +582,10 @@ export type LiveMicrophone = {
 	source: string,
 	name: string,
 	isDefault: boolean,
+};
+
+export type LiveRecoveryCompleted = {
+	sessionId: string,
 };
 
 export type LiveSegment = {

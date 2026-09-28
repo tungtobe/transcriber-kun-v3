@@ -1152,6 +1152,76 @@ mod tests {
         }
     }
 
+    #[test]
+    fn boot_recovery_crash_child_waits_for_parent_kill() {
+        let Ok(root) = std::env::var("LIVE_BOOT_RECOVERY_ROOT") else {
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        let db = Db::open(&root).unwrap();
+        let session_id = crate::core::id::SessionId::new();
+        store::create_live_session(&db, session_id, "Force killed Live").unwrap();
+        let transcript_id =
+            store::create_live_transcript(&db, session_id, "crash-test", None).unwrap();
+        store::append_live_batch(
+            &db,
+            session_id,
+            transcript_id,
+            &[crate::db::repo::segments::SegmentDraft {
+                start_sec: 0.0,
+                end_sec: 1.0,
+                kind: crate::db::repo::segments::SegmentKind::Text,
+                gap_reason: None,
+                text: "durably flushed before kill".to_owned(),
+                speaker: None,
+            }],
+            5.0,
+            "recording",
+        )
+        .unwrap();
+
+        let wav_path = paths::recording_path(&root, session_id);
+        fs::create_dir_all(wav_path.parent().unwrap()).unwrap();
+        let (writer, sync_file) = new_test_writer(&wav_path);
+        let (tx, rx) = broadcast::channel(64);
+        let (_stop_tx, stop_rx) = mpsc::channel();
+        let (terminal_tx, _terminal_rx) = watch::channel(None);
+        let written_samples = Arc::new(AtomicU64::new(0));
+        let worker_written_samples = written_samples.clone();
+        thread::spawn(move || {
+            run_consumer(
+                rx,
+                stop_rx,
+                writer,
+                sync_file,
+                None,
+                terminal_tx,
+                None,
+                worker_written_samples,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
+            .unwrap();
+        });
+        for index in 0..50_u64 {
+            tx.send(test_chunk(index * 1_600, 0.3)).unwrap();
+        }
+        while written_samples.load(Ordering::Acquire) < 80_000 {
+            thread::sleep(Duration::from_millis(10));
+        }
+        for index in 50..52_u64 {
+            tx.send(test_chunk(index * 1_600, 0.3)).unwrap();
+        }
+        while written_samples.load(Ordering::Acquire) < 83_200 {
+            thread::sleep(Duration::from_millis(10));
+        }
+        println!("LIVE_BOOT_RECOVERY_CHECKPOINTED:{session_id}");
+        use std::io::Write;
+        std::io::stdout().flush().unwrap();
+        loop {
+            thread::park();
+        }
+    }
+
     fn new_test_writer(path: &Path) -> (RecordingWriter, File) {
         let file = OpenOptions::new()
             .read(true)

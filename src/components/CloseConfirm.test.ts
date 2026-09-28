@@ -8,16 +8,15 @@ const mocks = vi.hoisted(() => ({
   appStore: {
     listenForCloseRequested: vi.fn(),
     confirmClose: vi.fn(),
+    stayOpen: vi.fn(),
   },
-  notesStore: {
-    flushAll: vi.fn(),
-  },
+  notesStore: { flushAll: vi.fn() },
 }));
 
 vi.mock('../lib/stores/app.svelte', () => ({ appStore: mocks.appStore }));
 vi.mock('../lib/stores/notes.svelte', () => ({ notesStore: mocks.notesStore }));
 
-let closeRequestedCallback: ((busy: boolean) => void) | null = null;
+let closeRequestedCallback: ((request: { liveBusy: boolean; jobBusy: boolean }) => void) | null = null;
 const unlisten = vi.fn();
 
 afterEach(() => cleanup());
@@ -26,105 +25,101 @@ beforeEach(() => {
   i18n.applyPreference('vi');
   closeRequestedCallback = null;
   unlisten.mockReset();
-  mocks.appStore.listenForCloseRequested.mockReset().mockImplementation((cb: (busy: boolean) => void) => {
-    closeRequestedCallback = cb;
-    return Promise.resolve(unlisten);
-  });
-  mocks.appStore.confirmClose.mockReset().mockResolvedValue(undefined);
+  mocks.appStore.listenForCloseRequested.mockReset().mockImplementation(
+    (cb: (request: { liveBusy: boolean; jobBusy: boolean }) => void) => {
+      closeRequestedCallback = cb;
+      return Promise.resolve(unlisten);
+    },
+  );
+  mocks.appStore.confirmClose.mockReset().mockResolvedValue(null);
+  mocks.appStore.stayOpen.mockReset().mockResolvedValue(undefined);
   mocks.notesStore.flushAll.mockReset().mockResolvedValue(true);
 });
 
+async function requestClose(request: { liveBusy: boolean; jobBusy: boolean }): Promise<void> {
+  await waitFor(() => expect(closeRequestedCallback).not.toBeNull());
+  closeRequestedCallback!(request);
+}
+
 describe('CloseConfirm', () => {
-  it('renders nothing until CloseRequested fires', async () => {
+  it('renders nothing until the shared close coordinator emits a request', async () => {
     render(CloseConfirm);
     await Promise.resolve();
-
     expect(screen.queryByRole('alertdialog')).toBeNull();
   });
 
-  // Spec Acceptance: "Given không có Job, when đóng cửa sổ và ghi chú lưu
-  // được, then app thoát như trước (không có dialog thừa)".
-  it('busy=false and flush ok: flushes notes then confirms close with no dialog', async () => {
+  it('flushes notes and closes an idle app without an extra dialog', async () => {
     render(CloseConfirm);
     await Promise.resolve();
 
-    closeRequestedCallback?.(false);
+    await requestClose({ liveBusy: false, jobBusy: false });
+    await waitFor(() => expect(mocks.appStore.confirmClose).toHaveBeenCalledTimes(1));
+
+    expect(mocks.notesStore.flushAll).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole('alertdialog')).toBeNull();
+  });
+
+  it('shows the Live prompt and saves Live when confirmed', async () => {
+    render(CloseConfirm);
     await Promise.resolve();
-    await Promise.resolve();
+    await requestClose({ liveBusy: true, jobBusy: false });
+
+    expect(screen.getByRole('alertdialog')).toBeTruthy();
+    expect(screen.getByText('Phiên đang ghi — dừng và lưu trước khi thoát?')).toBeTruthy();
+    await fireEvent.click(screen.getByRole('button', { name: 'Dừng, lưu và thoát' }));
 
     expect(mocks.notesStore.flushAll).toHaveBeenCalledTimes(1);
     expect(mocks.appStore.confirmClose).toHaveBeenCalledTimes(1);
     expect(screen.queryByRole('alertdialog')).toBeNull();
   });
 
-  // Spec Code Map: "flush lỗi → dialog cho chọn 'Ở lại' (mặc định, focus)
-  // hoặc 'Vẫn thoát'".
-  it('busy=false and flush fails: shows the stay/exit-anyway dialog without closing', async () => {
+  it('asks once for Live plus Job and confirms both through the same action', async () => {
+    render(CloseConfirm);
+    await Promise.resolve();
+    await requestClose({ liveBusy: true, jobBusy: true });
+
+    expect(screen.getByRole('alertdialog')).toBeTruthy();
+    expect(screen.getByText('Phiên đang ghi sẽ được lưu; các tác vụ transcribe đang chạy hoặc chờ sẽ bị huỷ.')).toBeTruthy();
+    await fireEvent.click(screen.getByRole('button', { name: 'Lưu phiên, huỷ tác vụ và thoát' }));
+
+    expect(mocks.appStore.confirmClose).toHaveBeenCalledTimes(1);
+    expect(mocks.notesStore.flushAll).toHaveBeenCalledTimes(1);
+  });
+
+  it('shows the Job prompt and stay leaves the app open', async () => {
+    render(CloseConfirm);
+    await Promise.resolve();
+    await requestClose({ liveBusy: false, jobBusy: true });
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Ở lại' }));
+    expect(screen.queryByRole('alertdialog')).toBeNull();
+    expect(mocks.appStore.confirmClose).not.toHaveBeenCalled();
+    expect(mocks.appStore.stayOpen).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the app open when note flush fails and offers retry or stay only', async () => {
     mocks.notesStore.flushAll.mockResolvedValue(false);
     render(CloseConfirm);
     await Promise.resolve();
+    await requestClose({ liveBusy: false, jobBusy: false });
 
-    closeRequestedCallback?.(false);
-
-    const dialog = await waitFor(() => screen.getByRole('alertdialog'));
-    expect(dialog).toBeTruthy();
+    await waitFor(() => expect(screen.getByRole('alertdialog')).toBeTruthy());
     expect(mocks.appStore.confirmClose).not.toHaveBeenCalled();
     expect(screen.getByRole('button', { name: 'Ở lại' })).toBeTruthy();
-    expect(screen.getByRole('button', { name: 'Vẫn thoát' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Thử lưu và thoát lại' })).toBeTruthy();
+    expect(screen.queryByText('Vẫn thoát')).toBeNull();
   });
 
-  it('flush-error dialog: "Ở lại" dismisses without exiting', async () => {
-    mocks.notesStore.flushAll.mockResolvedValue(false);
+  it('keeps the dialog open when Live metadata commit fails, then permits a retry', async () => {
+    mocks.appStore.confirmClose.mockResolvedValueOnce({ category: 'storage', code: 'storage' });
     render(CloseConfirm);
     await Promise.resolve();
-    closeRequestedCallback?.(false);
-    await waitFor(() => screen.getByRole('alertdialog'));
+    await requestClose({ liveBusy: true, jobBusy: false });
+    await fireEvent.click(screen.getByRole('button', { name: 'Dừng, lưu và thoát' }));
 
-    await fireEvent.click(screen.getByRole('button', { name: 'Ở lại' }));
-
-    expect(screen.queryByRole('alertdialog')).toBeNull();
-    expect(mocks.appStore.confirmClose).not.toHaveBeenCalled();
-  });
-
-  it('flush-error dialog: "Vẫn thoát" exits without a second flush attempt', async () => {
-    mocks.notesStore.flushAll.mockResolvedValue(false);
-    render(CloseConfirm);
-    await Promise.resolve();
-    closeRequestedCallback?.(false);
-    await waitFor(() => screen.getByRole('alertdialog'));
-
-    await fireEvent.click(screen.getByRole('button', { name: 'Vẫn thoát' }));
-
+    expect(await screen.findByRole('alertdialog')).toBeTruthy();
     expect(mocks.appStore.confirmClose).toHaveBeenCalledTimes(1);
-    expect(mocks.notesStore.flushAll).toHaveBeenCalledTimes(1);
-    expect(screen.queryByRole('alertdialog')).toBeNull();
-  });
-
-  it('busy=true shows the Job dialog and dismisses on "stay"', async () => {
-    render(CloseConfirm);
-    await Promise.resolve();
-
-    closeRequestedCallback?.(true);
-    await Promise.resolve();
-
-    const dialog = screen.getByRole('alertdialog');
-    expect(dialog).toBeTruthy();
-
-    await fireEvent.click(screen.getByRole('button', { name: 'Ở lại' }));
-    expect(screen.queryByRole('alertdialog')).toBeNull();
-    expect(mocks.appStore.confirmClose).not.toHaveBeenCalled();
-  });
-
-  it('busy=true: confirming flushes notes then confirms close', async () => {
-    render(CloseConfirm);
-    await Promise.resolve();
-    closeRequestedCallback?.(true);
-    await Promise.resolve();
-
-    await fireEvent.click(screen.getByRole('button', { name: 'Huỷ và thoát' }));
-
-    expect(mocks.notesStore.flushAll).toHaveBeenCalledTimes(1);
-    expect(mocks.appStore.confirmClose).toHaveBeenCalledTimes(1);
-    expect(screen.queryByRole('alertdialog')).toBeNull();
+    await fireEvent.click(screen.getByRole('button', { name: 'Thử lưu và thoát lại' }));
+    expect(mocks.appStore.confirmClose).toHaveBeenCalledTimes(2);
   });
 });
