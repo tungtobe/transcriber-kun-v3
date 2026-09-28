@@ -5,6 +5,9 @@ use std::time::Duration;
 /// Gemini REST endpoint.  Features only receive the normalized path below;
 /// URL construction remains owned by the gateway transport.
 pub const GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com";
+/// Gemini Live WebSocket endpoint. Never include this URL in logs because the
+/// production connector appends the leased API key as a query parameter.
+pub const GEMINI_LIVE_WS_ENDPOINT: &str = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
 pub const MODELS_PATH: &str = "/v1beta/models";
 /// The list operation asks for ten records at a time and follows every page
 /// under one operation deadline.

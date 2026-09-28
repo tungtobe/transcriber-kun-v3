@@ -6,7 +6,10 @@
 //! rotation, pagination, cancellation, and error redaction in one place.
 
 pub mod keys;
+pub mod live;
 pub mod params;
+
+pub use live::{LiveEvent, LiveFailure, LiveGateway, LiveRunConfig, LiveSocketConnector};
 
 use std::collections::HashSet;
 use std::fmt;

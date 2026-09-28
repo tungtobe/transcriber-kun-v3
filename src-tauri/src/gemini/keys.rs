@@ -200,11 +200,43 @@ impl KeyPoolHandle {
             .send(Command::Acquire {
                 priority,
                 budget,
+                request_id: None,
                 reply,
             })
             .await
             .map_err(|_| actor_error())?;
         response.await.map_err(|_| actor_error())?
+    }
+
+    /// Acquire a lease that can be removed from the actor when a Live session
+    /// is stopped while waiting for quota or another active lease.
+    pub async fn acquire_cancellable(
+        &self,
+        priority: Priority,
+        cancellation: &super::CancellationToken,
+    ) -> Result<KeyLease, AppError> {
+        tokio::select! {
+            result = self.wait_initialized() => result?,
+            _ = cancellation.cancelled() => return Err(super::cancelled_error()),
+        }
+        let request_id = Uuid::now_v7().to_string();
+        let (reply, response) = oneshot::channel();
+        tokio::select! {
+            result = self.commands.send(Command::Acquire {
+                priority,
+                budget: priority.default_budget(),
+                request_id: Some(request_id.clone()),
+                reply,
+            }) => result.map_err(|_| actor_error())?,
+            _ = cancellation.cancelled() => return Err(super::cancelled_error()),
+        }
+        tokio::select! {
+            result = response => result.map_err(|_| actor_error())?,
+            _ = cancellation.cancelled() => {
+                let _ = self.cancel(request_id).await;
+                Err(super::cancelled_error())
+            }
+        }
     }
 
     /// Acquire one exact key for a validation request.  A targeted lease
@@ -311,6 +343,7 @@ enum Command {
     Acquire {
         priority: Priority,
         budget: Duration,
+        request_id: Option<String>,
         reply: oneshot::Sender<Result<KeyLease, AppError>>,
     },
     AcquireForKey {
@@ -457,11 +490,12 @@ impl KeyPoolActor {
             Command::Acquire {
                 priority,
                 budget,
+                request_id,
                 reply,
             } => {
                 let now = self.clock.now();
                 let budget = budget.min(priority.default_budget());
-                let request_id = Uuid::now_v7().to_string();
+                let request_id = request_id.unwrap_or_else(|| Uuid::now_v7().to_string());
                 self.requests.insert(
                     request_id.clone(),
                     RequestState {
