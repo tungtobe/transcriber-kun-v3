@@ -16,7 +16,7 @@ use tokio::sync::{broadcast, watch};
 
 use crate::audio::{CaptureController, PcmChunk, OUTPUT_CHANNELS, OUTPUT_SAMPLE_RATE};
 use crate::core::error::{AppError, Code};
-use crate::core::id::SessionId;
+use crate::core::id::{SessionId, TagId};
 use crate::core::paths;
 use crate::db::Db;
 use crate::library::store;
@@ -140,6 +140,7 @@ pub fn start_with_locale(
         data_dir,
         ui_language,
         resolved_ui_locale,
+        &[],
         None,
     )
 }
@@ -155,6 +156,28 @@ pub fn start_with_receiver(
     ui_language: UiLanguage,
     resolved_ui_locale: Option<&str>,
 ) -> Result<RecordingHandle, AppError> {
+    start_with_receiver_and_tags(
+        capture,
+        receiver,
+        db,
+        data_dir,
+        ui_language,
+        resolved_ui_locale,
+        &[],
+    )
+}
+
+/// Starts a Recording and attaches the initially selected tags atomically
+/// with its session row.
+pub fn start_with_receiver_and_tags(
+    capture: Arc<CaptureController>,
+    receiver: broadcast::Receiver<PcmChunk>,
+    db: &Db,
+    data_dir: &Path,
+    ui_language: UiLanguage,
+    resolved_ui_locale: Option<&str>,
+    tag_ids: &[TagId],
+) -> Result<RecordingHandle, AppError> {
     start_inner_with_receiver(
         capture,
         receiver,
@@ -162,6 +185,7 @@ pub fn start_with_receiver(
         data_dir,
         ui_language,
         resolved_ui_locale,
+        tag_ids,
         None,
     )
 }
@@ -183,6 +207,7 @@ fn start_inner(
         data_dir,
         ui_language,
         resolved_ui_locale,
+        &[],
         fail_after_samples,
     )
 }
@@ -194,6 +219,7 @@ fn start_inner_with_receiver(
     data_dir: &Path,
     ui_language: UiLanguage,
     resolved_ui_locale: Option<&str>,
+    tag_ids: &[TagId],
     fail_after_samples: Option<u32>,
 ) -> Result<RecordingHandle, AppError> {
     if capture.active_source().is_none() {
@@ -220,6 +246,7 @@ fn start_inner_with_receiver(
         &recording_path,
         session_id,
         &default_title(Local::now(), ui_language, resolved_ui_locale),
+        tag_ids,
     );
     let (writer, sync_file) = match result {
         Ok(pair) => pair,
@@ -275,6 +302,7 @@ fn initialize_session(
     recording_path: &Path,
     session_id: SessionId,
     title: &str,
+    tag_ids: &[TagId],
 ) -> Result<(RecordingWriter, File), AppError> {
     let file = OpenOptions::new()
         .read(true)
@@ -288,7 +316,7 @@ fn initialize_session(
 
     // The file and a valid empty RIFF header exist before the transaction is
     // committed. Caller removes both if any database operation fails.
-    store::create_live_session(db, session_id, title)?;
+    store::create_live_session_with_tags(db, session_id, title, tag_ids)?;
     Ok((writer, sync_file))
 }
 
@@ -1033,7 +1061,6 @@ mod tests {
         });
         for index in 0..50_u64 {
             tx.send(test_chunk(index * 1_600, 0.3)).unwrap();
-            std::thread::sleep(Duration::from_millis(100));
         }
         loop {
             let mut header = [0_u8; 44];
@@ -1108,6 +1135,8 @@ mod tests {
                 }],
                 default_microphone: Some("mic:Built-in".to_owned()),
                 system_available: false,
+                microphone_permission: crate::audio::PermissionState::Unknown,
+                system_permission: crate::audio::PermissionState::Unknown,
             })
         }
 

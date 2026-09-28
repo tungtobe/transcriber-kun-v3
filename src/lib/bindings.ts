@@ -17,6 +17,12 @@ export const commands = {
 	 */
 	liveSources: (refresh: boolean) => typedError<LiveSources, AppError>(__TAURI_INVOKE("live_sources", { refresh })),
 	/**
+	 *  Open the OS privacy pane for the selected Live input. The next explicit
+	 *  source refresh rechecks permission state; frontend capabilities stay
+	 *  restricted and no generic URL is accepted here.
+	 */
+	liveOpenPermissionSettings: (system: boolean) => typedError<null, AppError>(__TAURI_INVOKE("live_open_permission_settings", { system })),
+	/**
 	 *  Prepare and switch the shared live capture source. `source` is one of
 	 *  `system`, `mic:<name>`, or `mixed:<mic>` as returned by `live_sources`.
 	 */
@@ -25,7 +31,7 @@ export const commands = {
 	 *  Starts the one process-wide Live session. Consent and model preferences
 	 *  are captured from the durable Rust settings snapshot before capture opens.
 	 */
-	liveStart: (source: string, language: TranscribeLanguage, locale: string) => typedError<string, AppError>(__TAURI_INVOKE("live_start", { source, language, locale })),
+	liveStart: (source: string, language: TranscribeLanguage, locale: string, tagIds: string[]) => typedError<string, AppError>(__TAURI_INVOKE("live_start", { source, language, locale, tagIds })),
 	/**
 	 *  Stop capture, drain the old gateway generation, flush the last transcript
 	 *  text and leave the session at the `finalizing` state for Story 4.9.
@@ -602,6 +608,8 @@ export type LiveSources = {
 	microphones: LiveMicrophone[],
 	defaultMicrophone: string | null,
 	systemAvailable: boolean,
+	microphonePermission: PermissionState,
+	systemPermission: PermissionState,
 };
 
 /**
@@ -701,6 +709,13 @@ export type NoteSnapshot = {
  *  liệu qua IPC.
  */
 export type NotesSaveOutcome = { kind: "saved"; revision: number; updatedAt: number | null } | { kind: "stale"; revision: number } | { kind: "notFound" };
+
+/**
+ *  OS-reported permission for an audio source. `Unknown` is deliberately
+ *  allowed by the UI: some platforms expose no preflight API and the OS must
+ *  be allowed to prompt during capture startup.
+ */
+export type PermissionState = "granted" | "denied" | "notDetermined" | "unknown" | "unavailable";
 
 /**
  *  Kết quả `library_proxy_relink` (spec I/O Matrix "Chọn lại khớp/sai/huỷ",

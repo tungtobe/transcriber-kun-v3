@@ -15,7 +15,7 @@ use tokio::task::JoinHandle;
 
 use crate::audio::{CaptureController, OUTPUT_SAMPLE_RATE};
 use crate::core::error::{AppError, Code};
-use crate::core::id::{SessionId, TranscriptId};
+use crate::core::id::{SessionId, TagId, TranscriptId};
 use crate::db::repo::segments::{GapReason, SegmentDraft, SegmentKind};
 use crate::db::Db;
 use crate::gemini::keys::KeyPoolHandle;
@@ -153,6 +153,7 @@ pub enum LiveEvent {
 pub struct LiveStartParams {
     pub source: String,
     pub language: TranscribeLanguage,
+    pub tag_ids: Vec<TagId>,
     pub locale: Option<String>,
     pub ui_language: UiLanguage,
     pub model: String,
@@ -367,14 +368,16 @@ impl LiveSessionActor {
         let data_dir = self.data_dir.clone();
         let ui_language = params.ui_language;
         let locale = params.locale.clone();
+        let tag_ids = params.tag_ids.clone();
         let recording_result = tokio::task::spawn_blocking(move || {
-            recording::start_with_receiver(
+            recording::start_with_receiver_and_tags(
                 capture,
                 recording_audio,
                 &db,
                 &data_dir,
                 ui_language,
                 locale.as_deref(),
+                &tag_ids,
             )
         })
         .await;
@@ -1116,6 +1119,8 @@ mod tests {
                 }],
                 default_microphone: Some("mic:test".to_owned()),
                 system_available: true,
+                microphone_permission: crate::audio::PermissionState::Unknown,
+                system_permission: crate::audio::PermissionState::Unknown,
             })
         }
 
@@ -1617,6 +1622,7 @@ mod tests {
             .start(LiveStartParams {
                 source: "mic:test".to_owned(),
                 language: TranscribeLanguage::Auto,
+                tag_ids: Vec::new(),
                 locale: None,
                 ui_language: UiLanguage::En,
                 model: "live-test".to_owned(),
@@ -1643,6 +1649,7 @@ mod tests {
             .start(LiveStartParams {
                 source: "mic:test".to_owned(),
                 language: TranscribeLanguage::Auto,
+                tag_ids: Vec::new(),
                 locale: None,
                 ui_language: UiLanguage::En,
                 model: "live-start-test".to_owned(),
@@ -1674,6 +1681,7 @@ mod tests {
             .start(LiveStartParams {
                 source: "mic:test".to_owned(),
                 language: TranscribeLanguage::Auto,
+                tag_ids: Vec::new(),
                 locale: None,
                 ui_language: UiLanguage::En,
                 model: "live-test".to_owned(),
@@ -1698,6 +1706,7 @@ mod tests {
             .start(LiveStartParams {
                 source: "mic:test".to_owned(),
                 language: TranscribeLanguage::Auto,
+                tag_ids: Vec::new(),
                 locale: None,
                 ui_language: UiLanguage::En,
                 model: "live-test".to_owned(),

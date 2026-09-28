@@ -7,6 +7,7 @@
   // khi một Job commit (`jobsStore.resultSeq` đổi) — không cần thao tác gì ở
   // đây ngoài `load()` lúc mount.
   import { onDestroy, onMount } from 'svelte';
+  import { link } from '@keenmate/svelte-spa-router';
   import { InfoIcon, RadioIcon, UploadIcon } from '../components/icons';
   import DisabledHint from '../components/DisabledHint.svelte';
   import BannerStack, { type BannerItem } from '../components/BannerStack.svelte';
@@ -153,6 +154,7 @@
       <SessionSearch bind:this={sessionSearchRef} />
     {/if}
     <div class="header-actions">
+      <a href="/live" use:link class="button button-primary">{i18n.t('home.live.action')}</a>
       {#if canChooseFile}
         <button type="button" class="button button-secondary" onclick={chooseFile}>
           {i18n.t('home.file.action')}
@@ -203,9 +205,7 @@
         <div class="empty-icon" aria-hidden="true"><RadioIcon size={18} strokeWidth={1.75} /></div>
         <h2>{i18n.t('home.live.title')}</h2>
         <p>{i18n.t('home.live.description')}</p>
-        <DisabledHint reason={i18n.t('home.live.unavailable')}>
-          <span class="button button-primary">{i18n.t('home.live.action')}</span>
-        </DisabledHint>
+        <a href="/live" use:link class="button button-primary">{i18n.t('home.live.action')}</a>
       </article>
     </div>
 

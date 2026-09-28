@@ -190,21 +190,14 @@ describe('Home missing-key banner', () => {
   });
 });
 
-describe('Home disabled actions', () => {
+describe('Home actions', () => {
   beforeEach(() => i18n.applyPreference('vi'));
 
-  it('renders Live as an aria-disabled, focusable, non-activating control', async () => {
+  it('links the Live action to the Live route', () => {
     render(Home);
 
-    const liveAction = screen.getByRole('button', { name: 'Bắt đầu Live' });
-
-    expect(liveAction.getAttribute('aria-disabled')).toBe('true');
-    expect(liveAction.hasAttribute('disabled')).toBe(false);
-    liveAction.focus();
-    expect(document.activeElement).toBe(liveAction);
-    await fireEvent.click(liveAction);
-    expect(liveAction.getAttribute('aria-disabled')).toBe('true');
-    expect(mocks.intakeStore.pick).not.toHaveBeenCalled();
+    expect(screen.getAllByRole('link', { name: 'Bắt đầu Live' })).toHaveLength(2);
+    expect(screen.getAllByRole('link', { name: 'Bắt đầu Live' }).every((link) => link.getAttribute('href') === '/live')).toBe(true);
   });
 
   it('renders both "Chọn file" actions as aria-disabled with a tooltip when there is no usable key', async () => {
@@ -289,7 +282,7 @@ describe('Home session list (story 2.9)', () => {
     render(Home);
 
     expect(screen.getByText('Kéo file vào đây hoặc')).toBeTruthy();
-    expect(screen.queryByText('Bắt đầu Live')).toBeNull();
+    expect(screen.getByRole('link', { name: 'Bắt đầu Live' }).getAttribute('href')).toBe('/live');
     expect(screen.getByText('cuộc họp A')).toBeTruthy();
     expect(screen.getByText('cuộc họp B')).toBeTruthy();
   });
@@ -403,7 +396,7 @@ describe('Home job card (story 2.9)', () => {
     render(Home);
 
     expect(screen.getByText('fixture.wav')).toBeTruthy();
-    expect(screen.queryByText('Bắt đầu Live')).toBeNull();
+    expect(screen.getByRole('link', { name: 'Bắt đầu Live' }).getAttribute('href')).toBe('/live');
   });
 
   it('renders the true empty state (two big cards) only with no Phiên and no Job', () => {

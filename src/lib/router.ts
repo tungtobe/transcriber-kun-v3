@@ -7,6 +7,7 @@ import {
 import Home from '../routes/Home.svelte';
 import Onboarding from '../routes/Onboarding.svelte';
 import Session from '../routes/Session.svelte';
+import Live from '../routes/Live.svelte';
 import Settings from '../routes/Settings.svelte';
 
 /** Route definitions cover the screens delivered by Epic 1 plus, as of story
@@ -17,6 +18,7 @@ const routeDefinition = defineRoutes({
   home: { path: '/home', component: Home },
   settings: { path: '/settings/:group', component: Settings },
   session: { path: '/session/:id', component: Session },
+  live: { path: '/live', component: Live },
 });
 
 export const routes = routeDefinition.routes;

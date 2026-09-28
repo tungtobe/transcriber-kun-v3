@@ -6,6 +6,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait};
+use objc2::msg_send;
+use objc2::runtime::AnyClass;
 use objc2::AnyThread;
 use objc2_core_audio::{
     kAudioAggregateDeviceIsPrivateKey, kAudioAggregateDeviceNameKey,
@@ -25,9 +27,31 @@ use objc2_core_foundation::{
 };
 use objc2_foundation::{NSArray, NSNumber, NSProcessInfo, NSString};
 
+use super::PermissionState;
 use crate::core::error::{AppError, Code};
 
 const DEVICE_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[link(name = "AVFoundation", kind = "framework")]
+unsafe extern "C" {}
+
+/// AVFoundation exposes the app's microphone authorization state without
+/// prompting. `NotDetermined` remains distinct so the UI can still start and
+/// let the OS present its first-use prompt.
+pub(super) fn microphone_permission() -> PermissionState {
+    let Some(device_class) = AnyClass::get(c"AVCaptureDevice") else {
+        return PermissionState::Unknown;
+    };
+    let media_type = NSString::from_str("soun");
+    let status: isize =
+        unsafe { msg_send![device_class, authorizationStatusForMediaType: &*media_type] };
+    match status {
+        0 => PermissionState::NotDetermined,
+        1 | 2 => PermissionState::Denied,
+        3 => PermissionState::Granted,
+        _ => PermissionState::Unknown,
+    }
+}
 
 pub(super) fn supported_by_os() -> bool {
     let version = NSProcessInfo::processInfo().operatingSystemVersion();

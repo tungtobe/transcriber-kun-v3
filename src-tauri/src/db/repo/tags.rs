@@ -141,6 +141,16 @@ pub fn is_attached(
     .map(|found| found.is_some())
 }
 
+pub fn exists(conn: &Connection, tag_id: TagId) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT 1 FROM tags WHERE id = ?1",
+        params![tag_id.to_string()],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|found| found.is_some())
+}
+
 /// Số tag đang gắn với một Phiên -- dùng để kiểm giới hạn 20 (spec Boundaries
 /// Always).
 pub fn count_for_session(conn: &Connection, session_id: SessionId) -> rusqlite::Result<i64> {

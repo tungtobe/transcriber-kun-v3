@@ -79,6 +79,27 @@ pub struct CommitOutcome {
 /// this function; on an insert error its caller removes the just-created
 /// session directory so no header-only recording is left behind.
 pub fn create_live_session(db: &Db, id: SessionId, title: &str) -> Result<(), AppError> {
+    create_live_session_with_tags(db, id, title, &[])
+}
+
+/// Insert a Live session and its initially selected tags in one transaction.
+/// A failed tag validation or link insert rolls the session row back too.
+pub fn create_live_session_with_tags(
+    db: &Db,
+    id: SessionId,
+    title: &str,
+    tag_ids: &[crate::core::id::TagId],
+) -> Result<(), AppError> {
+    let unique_tag_ids = tag_ids
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    if unique_tag_ids.len() > crate::library::tags::MAX_TAGS_PER_SESSION as usize {
+        return Err(AppError::new(
+            crate::core::error::Code::Request,
+            "A Live session can have at most 20 tags",
+        ));
+    }
     db.with_connection(|conn| {
         let tx = conn.transaction()?;
         repo::sessions::insert(
@@ -97,6 +118,16 @@ pub fn create_live_session(db: &Db, id: SessionId, title: &str) -> Result<(), Ap
                 updated_at: now_ms(),
             },
         )?;
+        for tag_id in unique_tag_ids {
+            let tag_exists = repo::tags::exists(&tx, tag_id)?;
+            if !tag_exists {
+                return Err(AppError::new(
+                    crate::core::error::Code::Request,
+                    "A selected tag no longer exists",
+                ));
+            }
+            repo::tags::attach(&tx, id, tag_id)?;
+        }
         tx.commit()?;
         Ok(())
     })
@@ -1258,6 +1289,39 @@ mod tests {
 
     fn open_db(root: &Path) -> Db {
         Db::open(root).unwrap()
+    }
+
+    #[test]
+    fn live_session_creation_attaches_selected_tags_in_the_same_transaction() {
+        let root = tempdir().unwrap();
+        let db = open_db(root.path());
+        let tag = crate::library::tags::create_or_get(&db, "Team meeting").unwrap();
+        let session_id = SessionId::new();
+
+        create_live_session_with_tags(&db, session_id, "Live session", &[tag.id]).unwrap();
+
+        let attached = db
+            .with_connection(|conn| Ok(repo::tags::list_for_session(conn, session_id)?))
+            .unwrap();
+        assert_eq!(attached.len(), 1);
+        assert_eq!(attached[0].id, tag.id);
+    }
+
+    #[test]
+    fn live_session_creation_rolls_back_when_a_selected_tag_no_longer_exists() {
+        let root = tempdir().unwrap();
+        let db = open_db(root.path());
+        let session_id = SessionId::new();
+        let missing_tag = crate::core::id::TagId::new();
+
+        let error = create_live_session_with_tags(&db, session_id, "Live session", &[missing_tag])
+            .unwrap_err();
+
+        assert_eq!(error.code, Code::Request);
+        let session = db
+            .with_connection(|conn| Ok(repo::sessions::get(conn, session_id)?))
+            .unwrap();
+        assert!(session.is_none());
     }
 
     fn text_segment(start: f64, end: f64, text: &str) -> SegmentDraft {

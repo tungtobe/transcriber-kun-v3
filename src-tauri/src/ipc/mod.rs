@@ -159,6 +159,42 @@ async fn live_sources(
     track_ipc_error(&state.db, result).await
 }
 
+/// Open the OS privacy pane for the selected Live input. The next explicit
+/// source refresh rechecks permission state; frontend capabilities stay
+/// restricted and no generic URL is accepted here.
+#[tauri::command]
+#[specta::specta]
+async fn live_open_permission_settings(
+    system: bool,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), AppError> {
+    let result = blocking(move || {
+        #[cfg(target_os = "windows")]
+        let url = "ms-settings:privacy-microphone";
+        #[cfg(target_os = "macos")]
+        let url = if system {
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
+        } else {
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
+        };
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        let url = {
+            let _ = system;
+            return Err(AppError::new(
+                Code::Permission,
+                "Audio settings are unavailable on this platform",
+            ));
+        };
+        use tauri_plugin_opener::OpenerExt;
+        app.opener()
+            .open_url(url, None::<&str>)
+            .map_err(|err| AppError::new(Code::Storage, err.to_string()))
+    })
+    .await;
+    track_ipc_error(&state.db, result).await
+}
+
 /// Prepare and switch the shared live capture source. `source` is one of
 /// `system`, `mic:<name>`, or `mixed:<mic>` as returned by `live_sources`.
 #[tauri::command]
@@ -183,6 +219,7 @@ async fn live_start(
     source: String,
     language: TranscribeLanguage,
     locale: String,
+    tag_ids: Vec<TagId>,
     state: tauri::State<'_, AppState>,
 ) -> Result<SessionId, AppError> {
     let result = async {
@@ -192,6 +229,7 @@ async fn live_start(
         live.start(LiveStartParams {
             source,
             language,
+            tag_ids,
             locale: Some(locale),
             ui_language: settings.ui_language,
             model: settings.live_model,
@@ -2307,6 +2345,7 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         .commands(collect_commands![
             app_version,
             live_sources,
+            live_open_permission_settings,
             live_set_source,
             live_start,
             live_stop,

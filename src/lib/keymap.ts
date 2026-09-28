@@ -39,6 +39,8 @@ function normalizeCombo(event: KeyboardEvent): string {
 
 export function installKeymap(target: Document = document): () => void {
   const handler = (event: KeyboardEvent) => {
+    if (event.repeat) return;
+    if (target.querySelector('[role="dialog"], [role="alertdialog"], dialog[open]')) return;
     const entry = keymap.find((item) => item.combo === normalizeCombo(event));
     if (!entry) {
       return;

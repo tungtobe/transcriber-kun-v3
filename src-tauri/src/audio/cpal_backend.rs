@@ -98,10 +98,26 @@ impl CaptureBackend for CpalBackend {
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         let system_available = false;
 
+        #[cfg(target_os = "macos")]
+        let microphone_permission = super::macos_tap::microphone_permission();
+        #[cfg(target_os = "windows")]
+        let microphone_permission = super::PermissionState::Unknown;
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        let microphone_permission = super::PermissionState::Unavailable;
+
+        #[cfg(target_os = "macos")]
+        let system_permission = super::PermissionState::Unknown;
+        #[cfg(target_os = "windows")]
+        let system_permission = super::PermissionState::Unknown;
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        let system_permission = super::PermissionState::Unavailable;
+
         Ok(LiveSources {
             microphones,
             default_microphone,
             system_available,
+            microphone_permission,
+            system_permission,
         })
     }
 

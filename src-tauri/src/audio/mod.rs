@@ -53,6 +53,21 @@ pub struct LiveSources {
     pub microphones: Vec<LiveMicrophone>,
     pub default_microphone: Option<String>,
     pub system_available: bool,
+    pub microphone_permission: PermissionState,
+    pub system_permission: PermissionState,
+}
+
+/// OS-reported permission for an audio source. `Unknown` is deliberately
+/// allowed by the UI: some platforms expose no preflight API and the OS must
+/// be allowed to prompt during capture startup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub enum PermissionState {
+    Granted,
+    Denied,
+    NotDetermined,
+    Unknown,
+    Unavailable,
 }
 
 /// A published mono PCM16 chunk. `start_sample` is the first sample's offset
@@ -942,6 +957,8 @@ impl CaptureBackend for UnsupportedBackend {
             microphones: Vec::new(),
             default_microphone: None,
             system_available: false,
+            microphone_permission: PermissionState::Unavailable,
+            system_permission: PermissionState::Unavailable,
         })
     }
 
@@ -1382,6 +1399,8 @@ mod tests {
                 ],
                 default_microphone: Some("mic:Built-in".to_owned()),
                 system_available: true,
+                microphone_permission: PermissionState::Unknown,
+                system_permission: PermissionState::Unknown,
             })
         }
 

@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 09-22-2026 06:12
-last_updated: 09-28-2026 17:15
+last_updated: 09-28-2026 21:45
 project: transcriber_kun
 project_key: NOKEY
 tracking_system: file-system
@@ -80,7 +80,7 @@ development_status:
   4-4-gemini-live-transport-websocket-resumption-và-reconnect-spik: review
   4-5-recording-bền-và-tạo-phiên-live-khi-mở-capture: review
   4-6-livesession-transcript-realtime-và-trạng-thái: review
-  4-7-màn-live-bắt-đầu-và-đang-ghi: backlog
+  4-7-màn-live-bắt-đầu-và-đang-ghi: review
   4-8-live-mất-kết-nối-lỗi-setup-và-trạng-thái-lỗi-trên-giao-diện: backlog
   4-9-dừng-live-và-lưu-phiên: backlog
   4-10-boot-và-đóng-cửa-sổ-phục-hồi-phiên-mồ-côi-chặn-thoát: backlog

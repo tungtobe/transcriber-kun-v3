@@ -15,6 +15,7 @@
   import { settingsStore } from '../lib/stores/settings.svelte';
   import { intakeStore } from '../lib/stores/intake.svelte';
   import { jobsStore } from '../lib/stores/jobs.svelte';
+  import { liveStore } from '../lib/stores/live.svelte';
   import { onDragDropEvent, type DragDropEvent } from '../lib/dragdrop';
   import { i18n } from '../i18n/index.svelte';
   import type { Theme } from '../lib/bindings';
@@ -36,6 +37,8 @@
       ? i18n.t('app.shell.settings')
       : currentPath === '/onboarding'
         ? i18n.t('app.shell.onboarding')
+        : currentPath === '/live'
+          ? i18n.t('app.shell.live')
         : i18n.t('app.shell.home'),
   );
 
@@ -46,9 +49,11 @@
   // xoá state của bất kỳ subscriber nào khác (Home, `/session/:id`).
   onMount(() => {
     void jobsStore.subscribe();
+    void liveStore.subscribe();
   });
   onDestroy(() => {
     jobsStore.unsubscribe();
+    liveStore.unsubscribe();
   });
 
   $effect(() => {
@@ -121,16 +126,18 @@
       </a>
       {/if}
 
-      <button
-        class="nav-disabled"
-        type="button"
-        aria-disabled="true"
-        title={i18n.t('app.shell.liveUnavailable')}
-        aria-label={i18n.t('app.shell.liveUnavailable')}
+      <a
+        href="/live"
+        use:link
+        class:active={currentPath === '/live'}
+        aria-current={currentPath === '/live' ? 'page' : undefined}
       >
         <RadioIcon size={18} strokeWidth={1.75} aria-hidden="true" />
         <span>{i18n.t('app.shell.live')}</span>
-      </button>
+        {#if liveStore.snapshot.recording === 'active'}
+          <span class="live-nav-indicator" aria-label={i18n.t('live.recording.active')}></span>
+        {/if}
+      </a>
 
       <a
         href="/settings/general"
@@ -291,8 +298,7 @@
     gap: var(--space-1);
   }
 
-  .primary-nav a,
-  .primary-nav button {
+  .primary-nav a {
     display: flex;
     width: 100%;
     min-height: 36px;
@@ -317,9 +323,13 @@
     font-weight: 600;
   }
 
-  .nav-disabled {
-    cursor: not-allowed;
-    opacity: 0.45;
+  .live-nav-indicator {
+    width: 7px;
+    height: 7px;
+    margin-left: auto;
+    border-radius: 50%;
+    background: var(--color-danger);
+    border: 2px solid var(--color-danger-soft);
   }
 
   .job-card-slot {

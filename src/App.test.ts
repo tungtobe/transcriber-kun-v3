@@ -44,6 +44,13 @@ vi.mock('./lib/stores/jobs.svelte', () => ({
     cancel: vi.fn(),
   },
 }));
+vi.mock('./lib/stores/live.svelte', () => ({
+  liveStore: {
+    snapshot: { sessionId: null, transcriptId: null, recording: 'stopped', connection: { type: 'stopped' }, durationSec: null },
+    subscribe: vi.fn(() => Promise.resolve()),
+    unsubscribe: vi.fn(),
+  },
+}));
 vi.mock('./lib/stores/library.svelte', () => ({
   libraryStore: {
     sessions: [],

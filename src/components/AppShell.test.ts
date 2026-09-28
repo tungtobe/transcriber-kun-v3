@@ -29,12 +29,18 @@ const mocks = vi.hoisted(() => ({
     unsubscribe: vi.fn(),
     cancel: vi.fn(() => Promise.resolve('cancelling')),
   },
+  liveStore: {
+    snapshot: { sessionId: null, transcriptId: null, recording: 'stopped', connection: { type: 'stopped' }, durationSec: null },
+    subscribe: vi.fn(() => Promise.resolve()),
+    unsubscribe: vi.fn(),
+  },
 }));
 
 vi.mock('../lib/stores/settings.svelte', () => ({ settingsStore: mocks.settingsStore }));
 vi.mock('../lib/stores/app.svelte', () => ({ appStore: mocks.appStore }));
 vi.mock('../lib/stores/intake.svelte', () => ({ intakeStore: mocks.intakeStore }));
 vi.mock('../lib/stores/jobs.svelte', () => ({ jobsStore: mocks.jobsStore }));
+vi.mock('../lib/stores/live.svelte', () => ({ liveStore: mocks.liveStore }));
 vi.mock('../lib/dragdrop', () => ({
   onDragDropEvent: (...args: unknown[]) => mocks.onDragDropEvent(...args),
 }));
@@ -57,6 +63,9 @@ beforeEach(() => {
   mocks.jobsStore.subscribe.mockReset().mockResolvedValue(undefined);
   mocks.jobsStore.unsubscribe.mockReset();
   mocks.jobsStore.cancel.mockReset().mockResolvedValue('cancelling');
+  mocks.liveStore.snapshot.recording = 'stopped';
+  mocks.liveStore.subscribe.mockReset().mockResolvedValue(undefined);
+  mocks.liveStore.unsubscribe.mockReset();
   dragDropHandler = null;
   mocks.onDragDropEvent.mockReset().mockImplementation((handler: (event: DragDropEvent) => void) => {
     dragDropHandler = handler;
@@ -75,7 +84,7 @@ describe('AppShell', () => {
     expect(screen.getByRole('combobox', { name: 'Chủ đề giao diện' })).toBeTruthy();
     expect(screen.getByText('Không có job nào đang chạy.')).toBeTruthy();
     expect(screen.getByRole('link', { name: 'Trang chủ' }).getAttribute('aria-current')).toBe('page');
-    expect(screen.getByRole('button', { name: 'Live — sẽ có ở story Live' }).getAttribute('aria-disabled')).toBe('true');
+    expect(screen.getByRole('link', { name: 'Live' }).getAttribute('href')).toBe('/live');
   });
 
   it('subscribes jobsStore on mount and unsubscribes on unmount (story 2.9)', () => {
@@ -84,6 +93,14 @@ describe('AppShell', () => {
 
     view.unmount();
     expect(mocks.jobsStore.unsubscribe).toHaveBeenCalledTimes(1);
+  });
+
+  it('subscribes Live at the shell and marks its navigation entry while recording', () => {
+    mocks.liveStore.snapshot.recording = 'active';
+    render(AppShell);
+
+    expect(mocks.liveStore.subscribe).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole('link', { name: /Live/ }).querySelector('.live-nav-indicator')).toBeTruthy();
   });
 
   it('shows the running Job name and percent in the compact sidebar card, linking to /session/:id (story 2.9)', () => {
