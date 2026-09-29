@@ -50,6 +50,67 @@ export function createLiveStore() {
   let generation = 0;
   let subscribers = 0;
   let pendingSubscribe: Promise<void> | null = null;
+  let channel: Channel<LiveEvent> | null = null;
+
+  // Tells the actor to forget a Channel this store no longer reads. A stale
+  // registration would otherwise keep receiving (and failing on) every event.
+  function dropChannel(): void {
+    const stale = channel;
+    channel = null;
+    if (!stale) return;
+    try {
+      void Promise.resolve(commands.liveUnsubscribe(stale)).catch(() => {});
+    } catch {
+      // Best effort: the actor also drops a Channel whose send fails.
+    }
+  }
+
+  // After a sequence gap or a remount the streamed lines may be incomplete;
+  // the persisted transcript is the source of truth for everything already
+  // flushed. Lines newer than the last persisted one (not flushed yet) stay.
+  async function reloadPersistedLines(sessionId: string, forGeneration: number): Promise<void> {
+    try {
+      const result = await commands.librarySessionDetail(sessionId);
+      if (forGeneration !== generation || snapshot.sessionId !== sessionId) return;
+      if (result.status !== 'ok' || !result.data) return;
+      const segments = result.data.transcript?.segments ?? [];
+      const persisted: LiveLine[] = [];
+      segments.forEach((segment, index) => {
+        const seq = -(index + 1);
+        if (segment.kind === 'gap') {
+          persisted.push({
+            seq,
+            kind: 'gap',
+            startSec: segment.startSec,
+            endSec: segment.endSec,
+            reason: segment.gapReason ?? 'disconnected',
+          });
+        } else if (segment.text.trim() !== '') {
+          persisted.push({
+            seq,
+            kind: 'segment',
+            segment: {
+              startSec: segment.startSec ?? 0,
+              endSec: segment.endSec ?? segment.startSec ?? 0,
+              text: segment.text,
+            },
+          });
+        }
+      });
+      const lastPersistedEnd = persisted.reduce((latest, line) => {
+        const end = line.kind === 'segment' ? line.segment.endSec : line.endSec;
+        return Math.max(latest, end ?? 0);
+      }, 0);
+      const unflushed = lines.filter((line) => {
+        if (line.seq < 0) return false;
+        const start = line.kind === 'segment' ? line.segment.startSec : line.startSec;
+        return start !== null && start >= lastPersistedEnd - 0.01;
+      });
+      lines = [...persisted, ...unflushed];
+    } catch {
+      // Keep the streamed lines; the next Ready will retry.
+    }
+  }
 
   function applyEvent(event: LiveEvent, forGeneration: number): void {
     if (forGeneration !== generation) return;
@@ -63,6 +124,9 @@ export function createLiveStore() {
         draft = '';
       }
       lastSeq = event.seq;
+      if (event.snapshot.sessionId) {
+        void reloadPersistedLines(event.snapshot.sessionId, forGeneration);
+      }
       return;
     }
     if (lastSeq !== null && event.seq !== lastSeq + 1) {
@@ -131,8 +195,10 @@ export function createLiveStore() {
     generation += 1;
     const forGeneration = generation;
     lastSeq = null;
+    dropChannel();
     const nextChannel = new Channel<LiveEvent>();
     nextChannel.onmessage = (event) => applyEvent(event, forGeneration);
+    channel = nextChannel;
     try {
       const result = await commands.liveSubscribe(nextChannel);
       if (forGeneration !== generation) return;
@@ -168,6 +234,7 @@ export function createLiveStore() {
     generation += 1;
     status = 'idle';
     pendingSubscribe = null;
+    dropChannel();
     // The process actor keeps the session. A new Channel on remount receives
     // an atomic snapshot; the singleton transcript lines remain available.
   }
@@ -196,6 +263,10 @@ export function createLiveStore() {
     locale: string,
     tagIds: string[],
   ): Promise<AppError | null> {
+    // A new session must not show the previous one's transcript.
+    finalizedSessionId = null;
+    lines = [];
+    draft = '';
     try {
       const result = await commands.liveStart(source, language, locale, tagIds);
       if (result.status === 'ok') {
@@ -268,6 +339,7 @@ export function createLiveStore() {
 
   function reset(): void {
     generation += 1;
+    dropChannel();
     finalizedSessionId = null;
     snapshot = { ...EMPTY_SNAPSHOT };
     lines = [];

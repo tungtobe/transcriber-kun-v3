@@ -215,11 +215,23 @@ impl TimedSystemMixer {
         self.active = next;
     }
 
+    #[cfg(test)]
     fn push(&mut self, endpoint_id: &str, timestamp_hns: u64, samples: &[f32]) {
         self.push_at(
             endpoint_id,
             timestamp_hns,
             samples,
+            std::time::Instant::now(),
+        );
+    }
+
+    #[cfg(any(target_os = "windows", test))]
+    fn push_packet(&mut self, endpoint_id: &str, packet: &TimedPacket) {
+        self.push_checked_at(
+            endpoint_id,
+            packet.timestamp_hns,
+            packet.trusted,
+            &packet.samples,
             std::time::Instant::now(),
         );
     }
@@ -231,16 +243,35 @@ impl TimedSystemMixer {
         samples: &[f32],
         now: std::time::Instant,
     ) {
+        self.push_checked_at(endpoint_id, timestamp_hns, true, samples, now);
+    }
+
+    /// A packet whose timestamp is not `trusted` (WASAPI reported a timestamp
+    /// error or a data discontinuity) is placed at the lane's expected next
+    /// frame instead of the reported position.
+    fn push_checked_at(
+        &mut self,
+        endpoint_id: &str,
+        timestamp_hns: u64,
+        trusted: bool,
+        samples: &[f32],
+        now: std::time::Instant,
+    ) {
         if !self.active.contains(endpoint_id) {
             return;
         }
         let anchor = *self.anchor_hns.get_or_insert(timestamp_hns);
-        let start_frame = timestamp_to_relative_frame(timestamp_hns, anchor);
+        let reported_frame = timestamp_to_relative_frame(timestamp_hns, anchor);
         self.first_packet.insert(endpoint_id.to_owned());
         let lane = self
             .lanes
             .entry(endpoint_id.to_owned())
             .or_insert_with(|| MixerLane::new(now));
+        let start_frame = if trusted {
+            reported_frame
+        } else {
+            lane.end_frame().unwrap_or(reported_frame)
+        };
         lane.last_packet_at = Some(now);
         lane.append(start_frame, samples);
     }
@@ -324,6 +355,15 @@ impl TimedSystemMixer {
         }
         Some(mixed)
     }
+}
+
+/// One captured WASAPI packet. `trusted` is false when the driver flagged the
+/// timestamp as erroneous or the data as discontinuous.
+#[cfg(any(target_os = "windows", test))]
+struct TimedPacket {
+    timestamp_hns: u64,
+    trusted: bool,
+    samples: Vec<f32>,
 }
 
 fn timestamp_to_relative_frame(timestamp_hns: u64, anchor_hns: u64) -> i64 {
@@ -530,7 +570,7 @@ impl LoopbackEndpoint {
         })
     }
 
-    fn read_packets(&self) -> Result<Vec<(u64, Vec<f32>)>, String> {
+    fn read_packets(&self) -> Result<Vec<TimedPacket>, String> {
         let mut packets = Vec::new();
         loop {
             let frames = self
@@ -557,7 +597,11 @@ impl LoopbackEndpoint {
                     .map(|sample| f32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]]))
                     .collect()
             };
-            packets.push((info.timestamp, samples));
+            packets.push(TimedPacket {
+                timestamp_hns: info.timestamp,
+                trusted: !(info.flags.timestamp_error || info.flags.data_discontinuity),
+                samples,
+            });
         }
         Ok(packets)
     }
@@ -628,8 +672,8 @@ fn run_worker(
         for (id, endpoint) in &endpoints {
             match endpoint.read_packets() {
                 Ok(packets) => {
-                    for (timestamp, samples) in packets {
-                        mixer.push(id, timestamp, &samples);
+                    for packet in packets {
+                        mixer.push_packet(id, &packet);
                         while let Some(samples) = mixer.pop_ready() {
                             on_audio(InputBlock {
                                 generation,
@@ -882,6 +926,32 @@ mod tests {
         assert!(output[80..]
             .iter()
             .all(|sample| (*sample - 0.5).abs() < 0.0001));
+    }
+
+    #[test]
+    fn packet_with_timestamp_error_or_discontinuity_uses_the_expected_next_frame() {
+        let started_at = std::time::Instant::now();
+        let mut mixer = TimedSystemMixer::default();
+        mixer.set_endpoints_at(["only".to_owned()], started_at);
+        let packet = |timestamp_hns, trusted, value: f32| TimedPacket {
+            timestamp_hns,
+            trusted,
+            samples: vec![value; 1_600],
+        };
+        mixer.push_checked_at(
+            "only",
+            10_000_000,
+            packet(10_000_000, true, 0.1).trusted,
+            &packet(10_000_000, true, 0.1).samples,
+            started_at,
+        );
+        // Reported timestamp is a wild jump; the untrusted packet must still
+        // follow the previous one contiguously.
+        let bad = packet(900_000_000, false, 0.2);
+        mixer.push_packet("only", &bad);
+        let lane = mixer.lanes.get("only").unwrap();
+        assert_eq!(lane.samples.len(), 3_200);
+        assert_eq!(lane.base_frame, Some(0));
     }
 
     #[test]

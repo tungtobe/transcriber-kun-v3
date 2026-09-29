@@ -74,9 +74,60 @@ fn try_claim(claim: &std::sync::atomic::AtomicU64, now: u64, ttl_ms: u64) -> boo
 }
 
 pub fn release(state: &AppState) {
-    state
-        .close_requested
-        .store(0, std::sync::atomic::Ordering::SeqCst);
+    release_claim(&state.close_requested);
+}
+
+fn release_claim(claim: &std::sync::atomic::AtomicU64) {
+    claim.store(0, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Stops the running Live session for a confirmed close. `is_running` is asked
+/// first so an idle app is a no-op; a stop failure propagates (stays fatal).
+pub async fn save_live_for_close<RunFut, StopFut>(
+    is_running: impl FnOnce() -> RunFut,
+    stop_for_close: impl FnOnce() -> StopFut,
+) -> Result<(), crate::core::error::AppError>
+where
+    RunFut: Future<Output = Result<bool, crate::core::error::AppError>>,
+    StopFut: Future<Output = Result<(), crate::core::error::AppError>>,
+{
+    if is_running().await? {
+        stop_for_close().await?;
+    }
+    Ok(())
+}
+
+/// Cancels every pending job, then polls until none is left or `timeout`
+/// passes. A job that ignores cancel yields a `Storage` error (which
+/// [`confirm_then_exit`] only logs).
+pub async fn cancel_jobs_until_empty<Id, SnapFut, CancelFut>(
+    snapshot: impl Fn() -> SnapFut,
+    cancel: impl Fn(Id) -> CancelFut,
+    timeout: std::time::Duration,
+    poll: std::time::Duration,
+) -> Result<(), crate::core::error::AppError>
+where
+    SnapFut: Future<Output = Result<Vec<Id>, crate::core::error::AppError>>,
+    CancelFut: Future<Output = ()>,
+{
+    for id in snapshot().await? {
+        cancel(id).await;
+    }
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        match snapshot().await {
+            Ok(remaining) if remaining.is_empty() => return Ok(()),
+            Ok(_) if tokio::time::Instant::now() < deadline => {}
+            Ok(_) => {
+                return Err(crate::core::error::AppError::new(
+                    crate::core::error::Code::Storage,
+                    "Transcription jobs did not stop before the close timeout",
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+        tokio::time::sleep(poll).await;
+    }
 }
 
 pub fn authorize_exit(state: &AppState) {
@@ -131,6 +182,94 @@ mod tests {
     fn cmd_q_exit_is_intercepted_until_the_shared_close_flow_authorizes_it() {
         assert!(should_prevent_exit(false));
         assert!(!should_prevent_exit(true));
+    }
+
+    #[test]
+    fn release_clears_the_claim_so_a_new_close_can_start() {
+        let claim = std::sync::atomic::AtomicU64::new(0);
+        assert!(try_claim(&claim, 1_000, 10_000));
+        assert!(!try_claim(&claim, 2_000, 10_000));
+        release_claim(&claim);
+        assert!(try_claim(&claim, 2_000, 10_000));
+    }
+
+    #[tokio::test]
+    async fn save_live_for_close_only_stops_a_running_session_and_keeps_failures_fatal() {
+        let stopped = Arc::new(Mutex::new(0_u32));
+        let idle = stopped.clone();
+        save_live_for_close(
+            || async { Ok(false) },
+            move || async move {
+                *idle.lock().unwrap() += 1;
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(*stopped.lock().unwrap(), 0);
+
+        let running = stopped.clone();
+        save_live_for_close(
+            || async { Ok(true) },
+            move || async move {
+                *running.lock().unwrap() += 1;
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(*stopped.lock().unwrap(), 1);
+
+        let error = save_live_for_close(
+            || async { Ok(true) },
+            || async { Err(AppError::new(Code::Storage, "stop failed")) },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, Code::Storage);
+        let error = save_live_for_close(
+            || async { Err(AppError::new(Code::Storage, "actor gone")) },
+            || async { Ok(()) },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, Code::Storage);
+    }
+
+    #[tokio::test]
+    async fn cancel_jobs_waits_for_the_queue_to_drain_and_times_out_on_a_stuck_job() {
+        let pending = Arc::new(Mutex::new(vec![1_u32, 2]));
+        let cancelled = Arc::new(Mutex::new(Vec::new()));
+        let snapshot_pending = pending.clone();
+        let cancel_pending = pending.clone();
+        let cancel_log = cancelled.clone();
+        cancel_jobs_until_empty(
+            move || {
+                let jobs = snapshot_pending.lock().unwrap().clone();
+                async move { Ok(jobs) }
+            },
+            move |id| {
+                cancel_pending.lock().unwrap().retain(|job| *job != id);
+                cancel_log.lock().unwrap().push(id);
+                async {}
+            },
+            std::time::Duration::from_millis(200),
+            std::time::Duration::from_millis(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(*cancelled.lock().unwrap(), [1, 2]);
+
+        // A job that ignores cancel exhausts the deadline.
+        let error = cancel_jobs_until_empty(
+            || async { Ok(vec![7_u32]) },
+            |_| async {},
+            std::time::Duration::from_millis(30),
+            std::time::Duration::from_millis(5),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, Code::Storage);
     }
 
     #[test]

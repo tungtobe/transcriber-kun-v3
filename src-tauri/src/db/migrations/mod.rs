@@ -715,4 +715,34 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().to_lowercase().contains("check"));
     }
+
+    #[test]
+    fn only_one_retranscribe_transcript_allowed_per_session_but_primary_is_independent() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        run(&mut conn).unwrap();
+        for id in ["s1", "s2"] {
+            conn.execute(
+                "INSERT INTO sessions (id, kind, title, status, duration_sec, created_at, updated_at) \
+                 VALUES (?1, 'live', 't', 'complete', 1.0, 0, 0)",
+                [id],
+            )
+            .unwrap();
+        }
+        let insert = |conn: &Connection, id: &str, session: &str, variant: &str| {
+            conn.execute(
+                "INSERT INTO transcripts (id, session_id, variant, status, model, created_at) \
+                 VALUES (?1, ?2, ?3, 'complete', 'm', 0)",
+                [id, session, variant],
+            )
+        };
+        insert(&conn, "p1", "s1", "primary").unwrap();
+        insert(&conn, "r1", "s1", "retranscribe").unwrap();
+        let err = insert(&conn, "r2", "s1", "retranscribe").unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("unique"));
+        // Another session may have its own retranscribe.
+        insert(&conn, "r3", "s2", "retranscribe").unwrap();
+        // The unique index is partial: a primary next to it is unaffected.
+        insert(&conn, "p2", "s2", "primary").unwrap();
+    }
 }

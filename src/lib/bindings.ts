@@ -50,6 +50,11 @@ export const commands = {
 	 *  registration through the LiveSession actor.
 	 */
 	liveSubscribe: (onEvent: Channel<LiveEvent>) => typedError<null, AppError>(__TAURI_INVOKE("live_subscribe", { onEvent })),
+	/**
+	 *  Drop the subscriber registered with `on_event` (the same Channel object the
+	 *  frontend passed to `live_subscribe`). Idempotent.
+	 */
+	liveUnsubscribe: (onEvent: Channel<LiveEvent>) => typedError<null, AppError>(__TAURI_INVOKE("live_unsubscribe", { onEvent })),
 	/**  Đọc toàn bộ settings hiện tại — xem [`get_settings`] cho logic thật. */
 	settingsGet: () => typedError<Settings, AppError>(__TAURI_INVOKE("settings_get")),
 	/**

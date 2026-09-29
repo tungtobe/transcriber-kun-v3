@@ -31,6 +31,14 @@ pub const OUTPUT_CHUNK_SAMPLES: usize = 1_600;
 const OUTPUT_CHUNK_PERIOD: Duration = Duration::from_millis(100);
 // ~60 s of 100 ms chunks: a stalled fsync must not overflow the consumer.
 const OUTPUT_BROADCAST_CAPACITY: usize = 600;
+/// Per-input backlog cap (about 500 ms at 16 kHz). A source whose device clock
+/// runs faster than the output clock drops its oldest samples beyond this.
+const MAX_INPUT_BACKLOG_SAMPLES: usize = 8_000;
+/// If the output clock falls further behind than this (for example after the
+/// machine slept) it resynchronises instead of emitting a burst of chunks.
+const MAX_CLOCK_CATCH_UP: Duration = Duration::from_secs(5);
+/// Mixed-mode soft limiter knee: below it the mix passes through unchanged.
+const LIMITER_KNEE: f32 = 0.75;
 const GATE_FLOOR: f32 = 0.004;
 const GATE_CEILING: f32 = 0.016;
 const GATE_ATTACK_ALPHA: f32 = 0.008;
@@ -387,13 +395,16 @@ impl CaptureController {
         }
 
         let generation = self.inner.next_generation.fetch_add(1, Ordering::Relaxed);
-        let missing = {
-            let mut opened = self
+        // Read-only: failed inputs are dropped from `opened` only after the
+        // replacement started successfully, so a failing `prepare()`/`start()`
+        // leaves the current state untouched.
+        let (failed_sources, missing) = {
+            let opened = self
                 .inner
                 .opened
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let mut failed_inputs = self
+            let failed_inputs = self
                 .inner
                 .failed_inputs
                 .lock()
@@ -403,18 +414,18 @@ impl CaptureController {
                 .filter_map(|input| {
                     let opened_input = opened.get(&input.source)?;
                     failed_inputs
-                        .remove(&(opened_input.generation, opened_input.format.side))
+                        .contains(&(opened_input.generation, opened_input.format.side))
                         .then(|| input.source.clone())
                 })
                 .collect::<Vec<_>>();
-            for failed_source in failed_sources {
-                opened.remove(&failed_source);
-            }
-            requested
+            let missing = requested
                 .iter()
-                .filter(|input| !opened.contains_key(&input.source))
+                .filter(|input| {
+                    !opened.contains_key(&input.source) || failed_sources.contains(&input.source)
+                })
                 .cloned()
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            (failed_sources, missing)
         };
         let pipeline = Arc::downgrade(&self.inner);
         let staged = Arc::new(Mutex::new(StagedInputs::default()));
@@ -482,6 +493,18 @@ impl CaptureController {
             .opened
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        {
+            let mut failed_inputs = self
+                .inner
+                .failed_inputs
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for failed_source in &failed_sources {
+                if let Some(old) = opened.remove(failed_source) {
+                    failed_inputs.remove(&(old.generation, old.format.side));
+                }
+            }
+        }
         let prepared_by_source = prepared
             .inputs
             .iter()
@@ -605,6 +628,17 @@ fn validate_prepared(
     Ok(())
 }
 
+/// One period after `deadline`, unless the clock is more than
+/// `MAX_CLOCK_CATCH_UP` behind `now`, in which case it resynchronises.
+fn next_deadline(deadline: Instant, now: Instant) -> Instant {
+    let next = deadline + OUTPUT_CHUNK_PERIOD;
+    if now.saturating_duration_since(next) > MAX_CLOCK_CATCH_UP {
+        tracing::warn!("live audio output clock resynchronised after a long stall");
+        return now + OUTPUT_CHUNK_PERIOD;
+    }
+    next
+}
+
 fn spawn_output_clock(inner: Weak<ControllerInner>) {
     let spawn = thread::Builder::new()
         .name("live-audio-output-clock".to_owned())
@@ -624,11 +658,10 @@ fn spawn_output_clock(inner: Weak<ControllerInner>) {
                     let _ = inner.output.send(chunk);
                 }
                 drop(inner);
-                deadline += OUTPUT_CHUNK_PERIOD;
-                let now = Instant::now();
-                if deadline < now {
-                    deadline = now + OUTPUT_CHUNK_PERIOD;
-                }
+                // Advance by exactly one period: after an overrun the next
+                // iterations emit the missed chunks back to back instead of
+                // silently losing wall-clock time.
+                deadline = next_deadline(deadline, Instant::now());
             }
         });
     if let Err(err) = spawn {
@@ -672,6 +705,9 @@ impl AudioPipeline {
                 self.inputs.push(InputState::new(generation, format));
             }
         }
+        // Inputs of dead generations must not accumulate across source swaps.
+        self.inputs
+            .retain(|input| active_inputs.contains(&(input.generation, input.format.side)));
         self.active_inputs = active_inputs;
         self.source = Some(source);
     }
@@ -752,13 +788,28 @@ impl AudioPipeline {
                 input.samples.push_back((raw, gated));
             }
         }
+        if input.samples.len() > MAX_INPUT_BACKLOG_SAMPLES {
+            let excess = input.samples.len() - MAX_INPUT_BACKLOG_SAMPLES;
+            input.samples.drain(..excess);
+            input.dropped_samples = input.dropped_samples.saturating_add(excess as u64);
+            tracing::warn!(
+                side = input.format.side.name(),
+                dropped = excess,
+                total_dropped = input.dropped_samples,
+                "live audio input backlog capped"
+            );
+        }
     }
 
     fn note_source_error(&mut self, generation: u64, side: InputSide, detail: String) {
         if !self.active_inputs.contains(&(generation, side)) {
             return;
         }
-        if let Some(input) = self.inputs.iter().find(|input| input.format.side == side) {
+        if let Some(input) = self
+            .inputs
+            .iter()
+            .find(|input| input.generation == generation && input.format.side == side)
+        {
             let guidance = match side {
                 InputSide::System => system_source_error_guidance(),
                 InputSide::Microphone => microphone_capture_guidance(),
@@ -776,6 +827,7 @@ impl AudioPipeline {
     fn tick(&mut self) -> Option<PcmChunk> {
         self.source.as_ref()?;
         let start_sample = self.clock_samples;
+        let limit = matches!(self.source, Some(CaptureSource::Mixed { .. }));
         let mut output = vec![0_i16; OUTPUT_CHUNK_SAMPLES];
         let mut gated_output = vec![0_i16; OUTPUT_CHUNK_SAMPLES];
         for output_index in 0..OUTPUT_CHUNK_SAMPLES {
@@ -790,6 +842,11 @@ impl AudioPipeline {
                     })
                     .map(|input| input.samples.pop_front().unwrap_or((0.0, 0.0)))
                     .fold((0.0, 0.0), |(raw, gated), (r, g)| (raw + r, gated + g))
+            };
+            let (mixed, gated_mixed) = if limit {
+                (soft_limit(mixed), soft_limit(gated_mixed))
+            } else {
+                (mixed, gated_mixed)
             };
             output[output_index] = float_to_pcm16(mixed);
             gated_output[output_index] = float_to_pcm16(gated_mixed);
@@ -815,6 +872,8 @@ struct InputState {
     gate: SoftGate,
     /// `(raw, gated)` pairs.
     samples: VecDeque<(f32, f32)>,
+    /// Samples discarded by the backlog cap (content-free counter).
+    dropped_samples: u64,
 }
 
 impl InputState {
@@ -826,6 +885,7 @@ impl InputState {
             resampler,
             gate: SoftGate::default(),
             samples: VecDeque::new(),
+            dropped_samples: 0,
         }
     }
 }
@@ -900,6 +960,21 @@ impl LinearResampler {
         }
         output
     }
+}
+
+/// Headroom for a two-input mix: transparent below the knee, then a smooth
+/// tanh shoulder that approaches (but never reaches) full scale.
+fn soft_limit(sample: f32) -> f32 {
+    if !sample.is_finite() {
+        return 0.0;
+    }
+    let amplitude = sample.abs();
+    if amplitude <= LIMITER_KNEE {
+        return sample;
+    }
+    let room = 1.0 - LIMITER_KNEE;
+    let limited = LIMITER_KNEE + room * ((amplitude - LIMITER_KNEE) / room).tanh();
+    limited.copysign(sample)
 }
 
 fn float_to_pcm16(sample: f32) -> i16 {
@@ -1194,7 +1269,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_sources_resample_align_by_output_sample_and_clamp() {
+    fn mixed_sources_resample_align_by_output_sample_and_limit() {
         let mut pipeline = AudioPipeline::default();
         pipeline.activate(
             9,
@@ -1217,7 +1292,8 @@ mod tests {
         ));
         let chunk = pipeline.tick().unwrap();
         assert_eq!(chunk.samples.len(), 1_600);
-        assert_eq!(chunk.samples[1_000], i16::MAX);
+        // 0.75 + 0.75 sits on the limiter shoulder: near, but below, full scale.
+        assert!(chunk.samples[1_000] > 30_000 && chunk.samples[1_000] < i16::MAX);
         assert_eq!(chunk.start_sample, 0);
     }
 
@@ -1382,6 +1458,100 @@ mod tests {
         assert_eq!(sources.default_microphone.as_deref(), Some("mic:Built-in"));
         assert_eq!(sources.microphones.len(), 2);
         assert!(sources.system_available);
+    }
+
+    #[test]
+    fn input_backlog_is_capped_and_oldest_samples_are_dropped() {
+        let mut pipeline = AudioPipeline::default();
+        pipeline.activate(
+            1,
+            CaptureSource::System,
+            vec![input_format(InputSide::System, "system", 16_000, 1)],
+        );
+        pipeline.ingest(audio_block(1, InputSide::System, 16_000, 1, 0.1, 16_000));
+        assert_eq!(pipeline.inputs[0].samples.len(), MAX_INPUT_BACKLOG_SAMPLES);
+        assert_eq!(pipeline.inputs[0].dropped_samples, 8_000);
+    }
+
+    #[test]
+    fn mixed_mode_limits_loud_inputs_without_hard_clipping() {
+        let mut pipeline = AudioPipeline::default();
+        pipeline.activate(
+            1,
+            CaptureSource::Mixed {
+                microphone: "m".to_owned(),
+            },
+            vec![
+                input_format(InputSide::System, "system", 16_000, 1),
+                input_format(InputSide::Microphone, "mic:m", 16_000, 1),
+            ],
+        );
+        pipeline.ingest(audio_block(1, InputSide::System, 16_000, 1, 0.9, 1_600));
+        pipeline.ingest(audio_block(1, InputSide::Microphone, 16_000, 1, 0.9, 1_600));
+        let chunk = pipeline.tick().unwrap();
+        assert!(chunk.samples.iter().all(|s| *s < i16::MAX));
+        assert!(chunk.samples.iter().all(|s| *s > 0));
+        assert!(soft_limit(0.5) == 0.5);
+        assert!(soft_limit(-3.0) >= -1.0);
+    }
+
+    #[test]
+    fn output_clock_catches_up_after_an_overrun_instead_of_resetting() {
+        let start = Instant::now();
+        let now = start + Duration::from_millis(350);
+        // Behind by 250 ms: the next deadline stays on the original grid so
+        // the missed chunks are emitted back to back.
+        assert_eq!(next_deadline(start, now), start + OUTPUT_CHUNK_PERIOD);
+        // After a long stall it resynchronises.
+        let late = start + Duration::from_secs(60);
+        assert_eq!(next_deadline(start, late), late + OUTPUT_CHUNK_PERIOD);
+    }
+
+    #[test]
+    fn source_errors_match_generation_and_side() {
+        let mut pipeline = AudioPipeline::default();
+        pipeline.activate(
+            2,
+            CaptureSource::System,
+            vec![input_format(InputSide::System, "system", 16_000, 1)],
+        );
+        pipeline.note_source_error(1, InputSide::System, "stale".to_owned());
+        assert!(pipeline.tick().unwrap().source_errors.is_empty());
+        pipeline.note_source_error(2, InputSide::System, "live".to_owned());
+        assert_eq!(pipeline.tick().unwrap().source_errors.len(), 1);
+    }
+
+    #[test]
+    fn inputs_of_dead_generations_are_pruned_on_activation() {
+        let mut pipeline = AudioPipeline::default();
+        pipeline.activate(
+            1,
+            CaptureSource::System,
+            vec![input_format(InputSide::System, "system", 16_000, 1)],
+        );
+        pipeline.activate(
+            2,
+            CaptureSource::Microphone {
+                name: "m".to_owned(),
+            },
+            vec![input_format(InputSide::Microphone, "mic:m", 16_000, 1)],
+        );
+        assert_eq!(pipeline.inputs.len(), 1);
+        assert_eq!(pipeline.inputs[0].generation, 2);
+    }
+
+    #[test]
+    fn failed_start_of_a_retry_does_not_forget_the_failed_input() {
+        let backend = Arc::new(FakeBackend::default());
+        let controller = CaptureController::new(backend.clone());
+        controller.set_source("system").unwrap();
+        backend.report_system_error();
+        backend.fail_start.store(true, Ordering::SeqCst);
+        assert!(controller.set_source("system").is_err());
+        // Only the never-installed candidate stream was dropped.
+        assert_eq!(backend.drop_count.load(Ordering::SeqCst), 1);
+        assert_eq!(controller.inner.failed_inputs.lock().unwrap().len(), 1);
+        assert_eq!(controller.inner.opened.lock().unwrap().len(), 1);
     }
 
     #[derive(Default)]

@@ -10,6 +10,8 @@ import Live from './Live.svelte';
 
 const mocks = vi.hoisted(() => ({
   liveSubscribe: vi.fn(),
+  liveUnsubscribe: vi.fn(),
+  librarySessionDetail: vi.fn(),
   liveSources: vi.fn(),
   liveStart: vi.fn(),
   liveStop: vi.fn(),
@@ -33,6 +35,8 @@ vi.mock('@tauri-apps/api/core', () => ({
 vi.mock('../lib/bindings', () => ({
   commands: {
     liveSubscribe: (...args: unknown[]) => mocks.liveSubscribe(...args),
+    liveUnsubscribe: (...args: unknown[]) => mocks.liveUnsubscribe(...args),
+    librarySessionDetail: (...args: unknown[]) => mocks.librarySessionDetail(...args),
     liveSources: (...args: unknown[]) => mocks.liveSources(...args),
     liveStart: (...args: unknown[]) => mocks.liveStart(...args),
     liveStop: (...args: unknown[]) => mocks.liveStop(...args),
@@ -97,6 +101,8 @@ beforeEach(() => {
   liveStore.reset();
   channels = [];
   backendSessionId = null;
+  mocks.liveUnsubscribe.mockReset().mockResolvedValue({ status: 'ok', data: null });
+  mocks.librarySessionDetail.mockReset().mockResolvedValue({ status: 'ok', data: { transcript: null } });
   mocks.liveSubscribe.mockReset().mockImplementation((channel: FakeChannel<LiveEvent>) => {
     channels.push(channel);
     channel.onmessage({ type: 'ready', seq: 0, snapshot: snapshot() });
