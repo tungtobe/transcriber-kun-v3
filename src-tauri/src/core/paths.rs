@@ -45,6 +45,16 @@ pub fn staging_dir(root: &Path, job_id: JobId) -> PathBuf {
     staging_root(root).join(job_id.to_string())
 }
 
+/// Thư mục trạng thái bền nhỏ của app: `<root>/state`.
+pub fn state_dir(root: &Path) -> PathBuf {
+    root.join("state")
+}
+
+/// Marker Ducking volume hệ thống: `<root>/state/ducking.json`.
+pub fn ducking_marker_path(root: &Path) -> PathBuf {
+    state_dir(root).join("ducking.json")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -79,6 +89,16 @@ mod tests {
         assert_eq!(
             recording_path(root, id),
             media_dir(root, id).join("recording.wav")
+        );
+    }
+
+    #[test]
+    fn ducking_marker_lives_under_the_state_dir() {
+        let root = Path::new("/data");
+        assert_eq!(state_dir(root), root.join("state"));
+        assert_eq!(
+            ducking_marker_path(root),
+            root.join("state").join("ducking.json")
         );
     }
 

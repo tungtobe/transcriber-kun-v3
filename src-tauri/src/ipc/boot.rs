@@ -143,10 +143,11 @@ pub fn boot<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
             tracing::warn!(error = %err, "không ghi được marker crash lúc boot");
         }
 
-        // Epic 5 owns the Ducking marker; its restoration hook belongs after
-        // migrations and before staging cleanup. There is no Ducking marker yet.
         match app.path().app_data_dir() {
             Ok(data_dir) => {
+                // Ducking marker: after migrations (`Db::open` above) and
+                // before staging cleanup/recovery.
+                restore_ducked_volume(&mut *crate::audio::output_volume::platform_volume(), &data_dir);
                 // Detach old staging atomically before any Job/Live writers
                 // start; recursive deletion happens off the setup path.
                 match crate::library::store::detach_staging(&data_dir) {
@@ -257,6 +258,10 @@ pub fn boot<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
             tauri::async_runtime::spawn(actor
                     .with_recovering(recovering.clone())
                     .with_playback(crate::audio::playback::platform_backend)
+                    .with_ducking(
+                        crate::audio::output_volume::platform_volume(),
+                        crate::core::paths::ducking_marker_path(data_dir),
+                    )
                     .run());
             Ok(handle)
         }
@@ -281,6 +286,19 @@ pub fn boot<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
         close_confirmed: Arc::new(AtomicBool::new(false)),
         _log_guard: log_guard,
     }
+}
+
+/// Restores the system volume a crashed run left ducked (marker-guarded: only
+/// the recorded device, only while its volume is still the app's ducked
+/// level), then drops the marker. Also used on app exit.
+pub fn restore_ducked_volume(
+    volume: &mut dyn crate::audio::output_volume::OutputVolume,
+    data_dir: &std::path::Path,
+) {
+    crate::audio::output_volume::restore_from_marker(
+        volume,
+        &crate::core::paths::ducking_marker_path(data_dir),
+    );
 }
 
 /// The startup recovery worker body. Interrupted sessions (`recovery_ids`)
@@ -359,6 +377,21 @@ fn run_boot_recovery(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn boot_restores_a_crashed_duck_and_drops_the_marker() {
+        use crate::audio::output_volume::{fake::FakeVolume, Ducker};
+        let root = tempfile::tempdir().unwrap();
+        let marker = crate::core::paths::ducking_marker_path(root.path());
+        let fake = FakeVolume::with_device("spk", 0.8);
+        let mut ducker = Ducker::new(Box::new(fake.clone()), marker.clone());
+        ducker.duck();
+        drop(ducker); // crash while ducked
+        assert!(fake.level("spk").unwrap() < 0.3);
+        restore_ducked_volume(&mut fake.clone(), root.path());
+        assert!((fake.level("spk").unwrap() - 0.8).abs() < 1e-4);
+        assert!(!marker.exists());
+    }
 
     #[test]
     fn claim_guard_releases_claims_on_panic() {
