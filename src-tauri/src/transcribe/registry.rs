@@ -976,10 +976,14 @@ impl JobRegistryActor {
 /// cancellation first (see `run_job_inner`) before treating a `Blocked`
 /// error as fatal.
 fn is_fatal(error: &AppError) -> bool {
-    matches!(
-        error.category,
-        Category::Auth | Category::Model | Category::Blocked
-    )
+    // `Shape` (phản hồi của một chunk không đọc được) cùng category `Model`
+    // nhưng chỉ hỏng chunk đó: ghi thành khoảng thiếu để Job vẫn commit bản
+    // `partial`, thay vì mất cả Job vì một chunk (thường là chunk đuôi rất ngắn).
+    error.code != Code::Shape
+        && matches!(
+            error.category,
+            Category::Auth | Category::Model | Category::Blocked
+        )
 }
 
 fn consent_revoked_error() -> AppError {
@@ -3077,6 +3081,45 @@ mod tests {
             })
             .unwrap();
         assert_eq!(text, "replacement recording transcript");
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_chunk_response_becomes_a_gap_instead_of_failing_the_job() {
+        let root = tempdir().unwrap();
+        let db = Arc::new(Db::open(root.path()).unwrap());
+        seed_current_consent(&db);
+        let session_id = SessionId::new();
+        let primary_id = TranscriptId::new();
+        let source = seed_live_retranscribe_session(root.path(), &db, session_id, primary_id);
+        let transcriber = FakeTranscriber::new(vec![Behavior::Fail {
+            code: Code::Shape,
+            retryable: false,
+        }]);
+        let (handle, actor) = channel(db.clone(), root.path().to_path_buf(), transcriber);
+        tokio::spawn(actor.run());
+
+        assert!(matches!(
+            handle
+                .start_retranscribe(retranscribe_params(session_id, Some(primary_id), source))
+                .await
+                .unwrap(),
+            RerunOutcome::Started { .. }
+        ));
+        wait_until_empty(&handle, Duration::from_secs(5)).await;
+
+        let committed_id = primary_of(&db, session_id).unwrap();
+        assert_ne!(
+            committed_id, primary_id,
+            "the job committed a partial transcript"
+        );
+        let committed = db
+            .with_connection(|conn| Ok(repo::transcripts::get(conn, committed_id)?))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            committed.status,
+            crate::db::repo::transcripts::Status::Partial
+        );
     }
 
     #[tokio::test]

@@ -119,7 +119,8 @@ pub fn parse_general_text(text: &str, chunk: &Chunk) -> Result<ChunkTranscript, 
         }
         let parsed: Vec<_> = items.iter().filter_map(parse_general_item).collect();
         let incomplete = items.len() != parsed.len();
-        return normalize(parsed, chunk, incomplete);
+        let unparsed = items.len() - parsed.len();
+        return normalize(parsed, chunk, incomplete, unparsed);
     }
     let mut parsed = Vec::new();
     let mut start = None;
@@ -160,7 +161,7 @@ pub fn parse_general_text(text: &str, chunk: &Chunk) -> Result<ChunkTranscript, 
             _ => {}
         }
     }
-    normalize(parsed, chunk, true)
+    normalize(parsed, chunk, true, 0)
 }
 
 fn parse_general_item(item: &Value) -> Option<Segment> {
@@ -191,16 +192,37 @@ fn parse_clock(value: &str) -> Option<f64> {
     Some(minutes as f64 * 60.0 + seconds)
 }
 
+/// Khe chưa phủ ngắn hơn ngưỡng này không được coi là nội dung bị thiếu.
+const MIN_UNRESOLVED_SEC: f64 = 2.0;
+
 fn normalize(
     raw: Vec<Segment>,
     chunk: &Chunk,
     mut incomplete: bool,
+    unparsed: usize,
 ) -> Result<ChunkTranscript, AppError> {
     let duration = chunk.duration_ms as f64 / 1000.0;
     let offset = chunk.start_ms as f64 / 1000.0;
+    // Chỉ số liệu (không nội dung) để chẩn đoán khi mọi đoạn bị loại.
+    let raw_count = raw.len();
+    let min_start = raw
+        .iter()
+        .map(|item| item.start)
+        .fold(f64::INFINITY, f64::min);
+    let max_end = raw
+        .iter()
+        .map(|item| item.end)
+        .fold(f64::NEG_INFINITY, f64::max);
     let mut seen = HashSet::new();
     let mut valid = Vec::new();
-    for item in raw {
+    for mut item in raw {
+        // Chunk ngắn (đặc biệt chunk đuôi 1-2 giây) thường bị model làm tròn
+        // lên: đoạn bắt đầu trong chunk nhưng `end` vượt độ dài chunk. Cắt
+        // `end` về cuối chunk thay vì bỏ cả đoạn; đoạn bắt đầu ngoài chunk
+        // vẫn bị loại.
+        if item.end.is_finite() && item.start.is_finite() && item.start < duration {
+            item.end = item.end.min(duration);
+        }
         if !item.start.is_finite()
             || !item.end.is_finite()
             || item.start < 0.0
@@ -230,9 +252,11 @@ fn normalize(
             .last()
             .map(|segment| segment.end - offset)
             .unwrap_or(0.0);
+        // Model trả timestamp MM:SS (làm tròn giây) nên các đoạn liền kề hay
+        // chồng nhau vài trăm ms: dồn `start` lên sau đoạn trước là chuyện
+        // bình thường, không phải dấu hiệu thiếu nội dung.
         if item.start < previous_end {
             item.start = previous_end;
-            incomplete = true;
         }
         if item.end <= item.start {
             incomplete = true;
@@ -243,13 +267,25 @@ fn normalize(
         segments.push(item);
     }
     if segments.is_empty() {
+        tracing::warn!(
+            parsed_items = raw_count,
+            unparsed_items = unparsed,
+            chunk_start_s = offset,
+            chunk_duration_s = duration,
+            min_start_s = min_start,
+            max_end_s = max_end,
+            "Gemini transcription had no usable segment (timestamps outside the chunk, or unparsable items)"
+        );
         return Err(shape("no valid segments after normalization"));
     }
+    // Chỉ khi chunk có đoạn bị loại mới liệt kê khoảng chưa phủ, và bỏ qua
+    // các khe ngắn hơn `MIN_UNRESOLVED_SEC` (khoảng lặng, sai số làm tròn
+    // giây): nếu không, mọi quãng nghỉ giữa hai câu đều thành "khoảng thiếu".
     let mut unresolved = Vec::new();
     if incomplete {
         let mut cursor = offset;
         for segment in &segments {
-            if segment.start > cursor {
+            if segment.start - cursor >= MIN_UNRESOLVED_SEC {
                 unresolved.push(MissingRange {
                     start: cursor,
                     end: segment.start,
@@ -257,15 +293,9 @@ fn normalize(
             }
             cursor = cursor.max(segment.end);
         }
-        if cursor < offset + duration {
+        if offset + duration - cursor >= MIN_UNRESOLVED_SEC {
             unresolved.push(MissingRange {
                 start: cursor,
-                end: offset + duration,
-            });
-        }
-        if unresolved.is_empty() {
-            unresolved.push(MissingRange {
-                start: offset,
                 end: offset + duration,
             });
         }
@@ -332,8 +362,81 @@ mod tests {
     }
 
     #[test]
+    fn an_end_past_the_chunk_is_clamped_instead_of_dropping_the_segment() {
+        // Chunk 20 s: một đoạn 00:19-00:21 giữ lại và cắt end về 20 s.
+        let result = parse_general_text(
+            r#"[{"start":"00:19","end":"00:21","text":"tail"}]"#,
+            &chunk(),
+        )
+        .unwrap();
+        assert_eq!(result.segments.len(), 1);
+        assert_eq!(
+            (result.segments[0].start, result.segments[0].end),
+            (29.0, 30.0)
+        );
+        assert!(result.unresolved.is_empty());
+
+        // Chunk đuôi 1 s mà model trả 00:00-00:03.
+        let tiny = Chunk {
+            start_ms: 313_000,
+            duration_ms: 1_000,
+            ..chunk()
+        };
+        let result = parse_general_text(
+            r#"[{"start":"00:00","end":"00:03","text":"cuối file"}]"#,
+            &tiny,
+        )
+        .unwrap();
+        assert_eq!(result.segments.len(), 1);
+        assert_eq!(
+            (result.segments[0].start, result.segments[0].end),
+            (313.0, 314.0)
+        );
+    }
+
+    #[test]
+    fn second_precision_overlaps_and_short_pauses_are_not_missing_ranges() {
+        // Chunk 20 s: đoạn chồng nhau 1 s và khe 1 s giữa các đoạn -- kết quả
+        // bình thường của timestamp MM:SS, không được thành khoảng thiếu.
+        let result = parse_general_text(
+            r#"[{"start":"00:00","end":"00:06","text":"a"},{"start":"00:05","end":"00:10","text":"b"},{"start":"00:11","end":"00:20","text":"c"}]"#,
+            &chunk(),
+        )
+        .unwrap();
+        assert_eq!(result.segments.len(), 3);
+        assert!(result.unresolved.is_empty());
+        assert_eq!(
+            result.segments[1].start, 16.0,
+            "start pushed past the previous end"
+        );
+    }
+
+    #[test]
+    fn a_dropped_item_only_reports_uncovered_spans_of_at_least_two_seconds() {
+        // Một đoạn hỏng bị loại nhưng phần còn lại phủ kín chunk -> không có
+        // khoảng thiếu; khi có lỗ hổng lớn thì vẫn được liệt kê.
+        let covered = parse_general_text(
+            r#"[{"start":"00:00","end":"00:10","text":"a"},{"start":"bad","end":"00:12","text":"x"},{"start":"00:10","end":"00:20","text":"b"}]"#,
+            &chunk(),
+        )
+        .unwrap();
+        assert!(covered.unresolved.is_empty());
+
+        let hole = parse_general_text(
+            r#"[{"start":"00:00","end":"00:05","text":"a"},{"start":"bad","end":"00:12","text":"x"},{"start":"00:15","end":"00:20","text":"b"}]"#,
+            &chunk(),
+        )
+        .unwrap();
+        assert_eq!(hole.unresolved.len(), 1);
+        assert_eq!(
+            (hole.unresolved[0].start, hole.unresolved[0].end),
+            (15.0, 25.0)
+        );
+    }
+
+    #[test]
     fn duplicate_and_invalid_timestamps_do_not_become_silence() {
-        let result = parse_general_text(r#"[{"start":"00:01","end":"00:02","text":"A"},{"start":"00:01","end":"00:02","text":"A"},{"start":"00:19","end":"00:21","text":"bad"}]"#, &chunk()).unwrap();
+        let result = parse_general_text(r#"[{"start":"00:01","end":"00:02","text":"A"},{"start":"00:01","end":"00:02","text":"A"},{"start":"00:22","end":"00:24","text":"bad"}]"#, &chunk()).unwrap();
         assert_eq!(result.segments.len(), 1);
         assert!(!result.unresolved.is_empty());
         assert!(parse_general_text(
