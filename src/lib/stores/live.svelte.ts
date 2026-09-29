@@ -7,6 +7,7 @@ import {
   type Category,
   type ConnectionState,
   type LiveEvent,
+  type LiveTarget,
   type LiveSegment,
   type LiveSnapshot,
   type LiveSources,
@@ -19,6 +20,9 @@ export type LiveLine =
   | { seq: number; kind: 'segment'; segment: LiveSegment }
   | { seq: number; kind: 'gap'; startSec: number | null; endSec: number | null; reason: string };
 
+/** A translated sentence. Translations live only in memory (never persisted). */
+export type TranslatedLine = { seq: number; segment: LiveSegment };
+
 const EMPTY_SNAPSHOT: LiveSnapshot = {
   sessionId: null,
   transcriptId: null,
@@ -27,6 +31,7 @@ const EMPTY_SNAPSHOT: LiveSnapshot = {
   transcription: 'stopped',
   errorCategory: null,
   durationSec: null,
+  target: 'none',
 };
 
 const UNAVAILABLE_ERROR: AppError = {
@@ -47,6 +52,8 @@ export function createLiveStore() {
   let deniedSource = $state<string | null>(null);
   let lines = $state<LiveLine[]>([]);
   let draft = $state('');
+  let translatedLines = $state<TranslatedLine[]>([]);
+  let translatedDraft = $state('');
   let error = $state<Category | null>(null);
   let status = $state<'idle' | 'subscribed' | 'error'>('idle');
   let lastSeq: number | null = null;
@@ -132,6 +139,8 @@ export function createLiveStore() {
         finalizedSessionId = null;
         lines = [];
         draft = '';
+        translatedLines = [];
+        translatedDraft = '';
       }
       lastSeq = event.seq;
       if (incoming.sessionId) {
@@ -154,6 +163,17 @@ export function createLiveStore() {
       case 'segment':
         lines = [...lines, { seq: event.seq, kind: 'segment', segment: event.segment }];
         draft = '';
+        break;
+      case 'deltaTranslated':
+        translatedDraft += event.text;
+        break;
+      case 'segmentTranslated':
+        translatedLines = [...translatedLines, { seq: event.seq, segment: event.segment }];
+        translatedDraft = '';
+        break;
+      case 'target':
+        snapshot = { ...snapshot, target: event.target };
+        translatedDraft = '';
         break;
       case 'gap':
         lines = [...lines, {
@@ -270,6 +290,7 @@ export function createLiveStore() {
   async function start(
     source: string,
     language: TranscribeLanguage,
+    target: LiveTarget,
     locale: string,
     tagIds: string[],
   ): Promise<AppError | null> {
@@ -277,8 +298,10 @@ export function createLiveStore() {
     finalizedSessionId = null;
     lines = [];
     draft = '';
+    translatedLines = [];
+    translatedDraft = '';
     try {
-      const result = await commands.liveStart(source, language, locale, tagIds);
+      const result = await commands.liveStart(source, language, target, locale, tagIds);
       if (result.status === 'ok') {
         finalizedSessionId = null;
         snapshot = {
@@ -289,6 +312,7 @@ export function createLiveStore() {
           transcription: 'active',
           errorCategory: null,
           durationSec: 0,
+          target,
         };
         error = null;
         return null;
@@ -342,6 +366,22 @@ export function createLiveStore() {
     }
   }
 
+  /** Changes the translation Target of the running session. A failure keeps
+   * the previous Target (the caller restores its dropdown from
+   * `snapshot.target`); model-side failures also raise the in-place banner. */
+  async function setTarget(target: LiveTarget): Promise<AppError | null> {
+    try {
+      const result = await commands.liveSetTarget(target);
+      if (result.status === 'ok') return null;
+      if (['model', 'quota', 'auth'].includes(result.error.category)) {
+        error = result.error.category;
+      }
+      return result.error;
+    } catch {
+      return UNAVAILABLE_ERROR;
+    }
+  }
+
   function clearPermissionDenial(): void {
     deniedSource = null;
     if (error === 'permission') error = null;
@@ -358,6 +398,8 @@ export function createLiveStore() {
     snapshot = { ...EMPTY_SNAPSHOT };
     lines = [];
     draft = '';
+    translatedLines = [];
+    translatedDraft = '';
     error = null;
   }
 
@@ -369,6 +411,8 @@ export function createLiveStore() {
     snapshot = { ...EMPTY_SNAPSHOT };
     lines = [];
     draft = '';
+    translatedLines = [];
+    translatedDraft = '';
     error = null;
     deniedSource = null;
     status = 'idle';
@@ -385,6 +429,8 @@ export function createLiveStore() {
     get finalizedSessionId() { return finalizedSessionId; },
     get lines() { return lines; },
     get draft() { return draft; },
+    get translatedLines() { return translatedLines; },
+    get translatedDraft() { return translatedDraft; },
     get error() { return error; },
     get status() { return status; },
     get sources() { return sources; },
@@ -398,6 +444,7 @@ export function createLiveStore() {
     stop,
     continueRecordingOnly,
     setSource,
+    setTarget,
     clearPermissionDenial,
     clearFinishedSession,
     reset,

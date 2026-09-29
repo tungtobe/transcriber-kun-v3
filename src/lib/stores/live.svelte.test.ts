@@ -11,6 +11,7 @@ const mocks = vi.hoisted(() => ({
   liveStop: vi.fn(),
   liveContinueRecordingOnly: vi.fn(),
   liveSetSource: vi.fn(),
+  liveSetTarget: vi.fn(),
 }));
 
 let nextChannelId = 1;
@@ -30,6 +31,7 @@ vi.mock('../bindings', () => ({
     liveStop: (...args: unknown[]) => mocks.liveStop(...args),
     liveContinueRecordingOnly: (...args: unknown[]) => mocks.liveContinueRecordingOnly(...args),
     liveSetSource: (...args: unknown[]) => mocks.liveSetSource(...args),
+    liveSetTarget: (...args: unknown[]) => mocks.liveSetTarget(...args),
   },
 }));
 
@@ -44,6 +46,7 @@ function snapshot(sessionId: string | null = 'session-1') {
     transcription: sessionId ? 'active' as const : 'stopped' as const,
     errorCategory: null,
     durationSec: 0,
+    target: 'none' as const,
   };
 }
 
@@ -68,6 +71,7 @@ beforeEach(() => {
   mocks.liveStop.mockReset().mockResolvedValue({ status: 'ok', data: 'session-1' });
   mocks.liveContinueRecordingOnly.mockReset().mockResolvedValue({ status: 'ok', data: null });
   mocks.liveSetSource.mockReset().mockResolvedValue({ status: 'ok', data: null });
+  mocks.liveSetTarget.mockReset().mockResolvedValue({ status: 'ok', data: null });
 });
 
 describe('liveStore', () => {
@@ -79,9 +83,9 @@ describe('liveStore', () => {
     channel.onmessage({ type: 'ready', seq: 0, snapshot: snapshot() });
 
     const tagIds = ['tag-a', 'tag-b'];
-    expect(await store.start('mixed:mic-1', 'vi', 'vi', tagIds)).toBeNull();
+    expect(await store.start('mixed:mic-1', 'vi', 'vi', 'vi', tagIds)).toBeNull();
     expect(mocks.liveStart).toHaveBeenCalledTimes(1);
-    expect(mocks.liveStart).toHaveBeenCalledWith('mixed:mic-1', 'vi', 'vi', tagIds);
+    expect(mocks.liveStart).toHaveBeenCalledWith('mixed:mic-1', 'vi', 'vi', 'vi', tagIds);
 
     channel.onmessage({ type: 'connection', seq: 1, state: { type: 'connected' } });
     channel.onmessage({ type: 'delta', seq: 2, text: 'Xin chào.' });
@@ -184,7 +188,7 @@ describe('liveStore', () => {
       error: { category: 'permission', code: 'permission', detailRedacted: 'capture denied' },
     });
 
-    const error = await store.start('mic:device-a', 'auto', 'en', []);
+    const error = await store.start('mic:device-a', 'auto', 'none', 'en', []);
     expect(error?.category).toBe('permission');
     expect(store.deniedSource).toBe('mic:device-a');
     store.clearPermissionDenial();
@@ -317,10 +321,57 @@ describe('liveStore', () => {
     expect(store.draft).toBe('half a sentence');
     expect(store.finalizedSessionId).toBe('session-1');
 
-    expect(await store.start('system', 'auto', 'en', [])).toBeNull();
+    expect(await store.start('system', 'auto', 'none', 'en', [])).toBeNull();
 
     expect(store.lines).toEqual([]);
     expect(store.draft).toBe('');
     expect(store.finalizedSessionId).toBeNull();
+  });
+
+  it('keeps translated text in memory only, resets it per session and follows the confirmed Target', async () => {
+    const { createLiveStore } = await import('./live.svelte');
+    const store = createLiveStore();
+    await store.subscribe();
+    const channel = channels[0];
+    channel.onmessage({ type: 'ready', seq: 0, snapshot: { ...snapshot(), target: 'vi' as const } });
+
+    channel.onmessage({ type: 'deltaTranslated', seq: 1, text: 'Xin ' });
+    channel.onmessage({ type: 'deltaTranslated', seq: 2, text: 'chào.' });
+    expect(store.translatedDraft).toBe('Xin chào.');
+    channel.onmessage({
+      type: 'segmentTranslated', seq: 3,
+      segment: { startSec: 0, endSec: 1, text: 'Xin chào.' },
+    });
+    expect(store.translatedDraft).toBe('');
+    expect(store.translatedLines.map((line) => line.segment.text)).toEqual(['Xin chào.']);
+    expect(store.lines).toEqual([]);
+
+    channel.onmessage({ type: 'target', seq: 4, target: 'en' });
+    expect(store.snapshot.target).toBe('en');
+
+    // A different session starts with a clean translation.
+    channel.onmessage({ type: 'ready', seq: 9, snapshot: snapshot('session-2') });
+    expect(store.translatedLines).toEqual([]);
+  });
+
+  it('setTarget forwards the choice and surfaces a model failure as a banner category', async () => {
+    const { createLiveStore } = await import('./live.svelte');
+    const store = createLiveStore();
+    expect(await store.setTarget('en')).toBeNull();
+    expect(mocks.liveSetTarget).toHaveBeenCalledWith('en');
+
+    mocks.liveSetTarget.mockResolvedValueOnce({
+      status: 'error',
+      error: { category: 'model', code: 'model', detailRedacted: 'x' },
+    });
+    const error = await store.setTarget('ja');
+    expect(error?.category).toBe('model');
+    expect(store.error).toBe('model');
+
+    mocks.liveSetTarget.mockResolvedValueOnce({
+      status: 'error',
+      error: { category: 'network', code: 'network', detailRedacted: 'x' },
+    });
+    expect((await store.setTarget('vi'))?.category).toBe('network');
   });
 });

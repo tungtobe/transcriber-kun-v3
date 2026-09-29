@@ -60,3 +60,17 @@ or transcript content:
 
 Until this evidence is added, acknowledgement, replay deduplication, handle
 expiry recovery, and end-to-end loss/duplication behavior remain open.
+
+## Story 5.1 addendum: translation setup and the "No translation" cost claim
+
+With a translation Target the setup carries `outputAudioTranscription: {}` and
+`translationConfig { targetLanguageCode, echoTargetLanguage: true }`. In
+"No translation" mode the setup omits `outputAudioTranscription` and
+`echoTargetLanguage`, and targets the source language (`ja` when the source is
+`auto`). Both shapes are locked by exact-JSON unit tests; the payloads are
+still source-derived candidates until the S3 spike runs against the real model.
+
+Unverified: whether "No translation" mode avoids translation token cost. The
+model may still be billed for generating output audio that the client drops.
+Until the S3 spike records a cost observation for both modes, the UI must not
+claim "no translation token cost" for "No translation".

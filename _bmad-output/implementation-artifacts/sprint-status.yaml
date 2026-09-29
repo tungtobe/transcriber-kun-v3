@@ -88,8 +88,8 @@ development_status:
   4-12-tải-recording-wav-hoặc-flac: done
   epic-4-retrospective: optional
 
-  epic-5: backlog
-  5-1-dịch-realtime-song-song-và-đổi-target-giữa-phiên: backlog
+  epic-5: in-progress
+  5-1-dịch-realtime-song-song-và-đổi-target-giữa-phiên: done
   5-2-nhận-diện-lại-ngôn-ngữ: backlog
   5-3-đọc-bản-dịch-tts-trong-tiến-trình-app: backlog
   5-4-ducking-volume-hệ-thống: backlog

@@ -5,6 +5,7 @@
   import { settingsStore } from '../lib/stores/settings.svelte';
   import SettingsGeneral from './settings/SettingsGeneral.svelte';
   import SettingsGemini from './settings/SettingsGemini.svelte';
+  import SettingsLive from './settings/SettingsLive.svelte';
   import SettingsChunking from './settings/SettingsChunking.svelte';
   import SettingsMemo from './settings/SettingsMemo.svelte';
   import SettingsStorage from './settings/SettingsStorage.svelte';
@@ -17,6 +18,7 @@
   const groups: Array<{ key: string; labelKey: TranslationKey }> = [
     { key: 'general', labelKey: 'settings.group.general' },
     { key: 'gemini', labelKey: 'settings.group.gemini' },
+    { key: 'live', labelKey: 'settings.group.live' },
     { key: 'chunking', labelKey: 'settings.group.chunking' },
     { key: 'memo', labelKey: 'settings.group.memo' },
     { key: 'storage', labelKey: 'settings.group.storage' },
@@ -59,6 +61,8 @@
         <SettingsGeneral />
       {:else if group === 'gemini'}
         <SettingsGemini />
+      {:else if group === 'live'}
+        <SettingsLive />
       {:else if group === 'chunking'}
         <SettingsChunking />
       {:else if group === 'memo'}

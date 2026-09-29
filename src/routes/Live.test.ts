@@ -5,7 +5,7 @@ import { i18n } from '../i18n/index.svelte';
 import { installKeymap, keymap } from '../lib/keymap';
 import { liveStore } from '../lib/stores/live.svelte';
 import { configureRouter } from '../lib/router';
-import type { LiveEvent, LiveSnapshot } from '../lib/bindings';
+import type { LiveEvent, LiveSnapshot, LiveTarget } from '../lib/bindings';
 import Live from './Live.svelte';
 
 const mocks = vi.hoisted(() => ({
@@ -17,6 +17,7 @@ const mocks = vi.hoisted(() => ({
   liveStop: vi.fn(),
   liveContinueRecordingOnly: vi.fn(),
   liveSetSource: vi.fn(),
+  liveSetTarget: vi.fn(),
   liveOpenPermissionSettings: vi.fn(),
   keysLoad: vi.fn(),
   tagsLoad: vi.fn(),
@@ -42,6 +43,7 @@ vi.mock('../lib/bindings', () => ({
     liveStop: (...args: unknown[]) => mocks.liveStop(...args),
     liveContinueRecordingOnly: (...args: unknown[]) => mocks.liveContinueRecordingOnly(...args),
     liveSetSource: (...args: unknown[]) => mocks.liveSetSource(...args),
+    liveSetTarget: (...args: unknown[]) => mocks.liveSetTarget(...args),
     liveOpenPermissionSettings: (...args: unknown[]) => mocks.liveOpenPermissionSettings(...args),
   },
 }));
@@ -57,7 +59,7 @@ vi.mock('../lib/stores/library.svelte', () => ({
   },
 }));
 vi.mock('../lib/stores/settings.svelte', () => ({
-  settingsStore: { transcribeLanguage: 'auto' },
+  settingsStore: { transcribeLanguage: 'auto', liveTarget: 'none' },
 }));
 vi.mock('../lib/stores/notes.svelte', () => ({
   MAX_NOTE_BODY_LENGTH: 10_000,
@@ -72,6 +74,7 @@ vi.mock('../lib/stores/notes.svelte', () => ({
 
 let channels: FakeChannel<LiveEvent>[] = [];
 let backendSessionId: string | null = null;
+let backendTarget: LiveTarget = 'none';
 let removeKeymap: (() => void) | null = null;
 
 function snapshot(sessionId: string | null = backendSessionId, durationSec = 0): LiveSnapshot {
@@ -83,6 +86,7 @@ function snapshot(sessionId: string | null = backendSessionId, durationSec = 0):
     transcription: sessionId ? 'active' : 'stopped',
     errorCategory: null,
     durationSec,
+    target: backendTarget,
   };
 }
 
@@ -101,6 +105,7 @@ beforeEach(() => {
   liveStore.reset();
   channels = [];
   backendSessionId = null;
+  backendTarget = 'none';
   mocks.liveUnsubscribe.mockReset().mockResolvedValue({ status: 'ok', data: null });
   mocks.librarySessionDetail.mockReset().mockResolvedValue({ status: 'ok', data: { transcript: null } });
   mocks.liveSubscribe.mockReset().mockImplementation((channel: FakeChannel<LiveEvent>) => {
@@ -122,6 +127,7 @@ beforeEach(() => {
   mocks.liveStop.mockReset().mockResolvedValue({ status: 'ok', data: 'session-1' });
   mocks.liveContinueRecordingOnly.mockReset().mockResolvedValue({ status: 'ok', data: null });
   mocks.liveSetSource.mockReset().mockResolvedValue({ status: 'ok', data: null });
+  mocks.liveSetTarget.mockReset().mockResolvedValue({ status: 'ok', data: null });
   mocks.liveOpenPermissionSettings.mockReset().mockResolvedValue({ status: 'ok', data: null });
   mocks.keysLoad.mockReset().mockResolvedValue(undefined);
   mocks.tagsLoad.mockReset().mockResolvedValue(undefined);
@@ -170,7 +176,7 @@ describe('Live setup and status UI', () => {
       status: 'error',
       error: { category: 'permission', code: 'permission', detailRedacted: 'capture denied' },
     });
-    await liveStore.start('mixed:device-a', 'auto', 'en', []);
+    await liveStore.start('mixed:device-a', 'auto', 'none', 'en', []);
     render(Live);
     await waitFor(() => expect(screen.getByText('System settings have denied access to this audio source.')).toBeTruthy());
 
@@ -440,5 +446,103 @@ describe('Live failure handling', () => {
     });
     await waitFor(() => expect(screen.getByText('hai')).toBeTruthy());
     expect(list.scrollTop).toBe(200);
+  });
+});
+
+describe('Live translation', () => {
+  it('starts with the chosen "Translate to" language', async () => {
+    render(Live);
+    await waitFor(() => expect((screen.getByRole('button', { name: 'Start recording' }) as HTMLButtonElement).disabled).toBe(false));
+
+    const select = screen.getByLabelText('Translate to') as HTMLSelectElement;
+    expect(Array.from(select.options).map((option) => option.value)).toEqual(['none', 'ja', 'vi', 'en']);
+    expect(select.value).toBe('none');
+    await fireEvent.change(select, { target: { value: 'vi' } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Start recording' }));
+
+    await waitFor(() => expect(mocks.liveStart).toHaveBeenCalledTimes(1));
+    expect(mocks.liveStart).toHaveBeenCalledWith('mixed:device-a', 'auto', 'vi', 'en', []);
+  });
+
+  it('without a Target shows only the Source column and a disabled read-aloud placeholder', async () => {
+    backendSessionId = 'session-1';
+    const view = render(Live);
+    await screen.findByRole('button', { name: 'Stop recording' });
+
+    expect(view.container.querySelector('[data-column="source"]')).toBeTruthy();
+    expect(view.container.querySelector('[data-column="translated"]')).toBeNull();
+    expect(screen.queryByRole('group', { name: 'Transcript view' })).toBeNull();
+    const tts = screen.getByRole('button', { name: 'Read translation aloud' }) as HTMLButtonElement;
+    expect(tts.disabled).toBe(true);
+    expect(tts.getAttribute('aria-pressed')).toBe('false');
+  });
+
+  it('shows translated text in its own column and lets the segmented control pick Source, Translation or Both', async () => {
+    backendSessionId = 'session-1';
+    backendTarget = 'vi';
+    const view = render(Live);
+    await screen.findByRole('button', { name: 'Stop recording' });
+    await waitFor(() => expect(channels).toHaveLength(1));
+
+    channels[0].onmessage({ type: 'segment', seq: 1, segment: { startSec: 0, endSec: 1, text: 'Hello there.' } });
+    channels[0].onmessage({ type: 'deltaTranslated', seq: 2, text: 'Xin ch' });
+    await waitFor(() => expect(screen.getByText(/Xin ch/)).toBeTruthy());
+    channels[0].onmessage({ type: 'segmentTranslated', seq: 3, segment: { startSec: 0, endSec: 1, text: 'Xin chào.' } });
+
+    await waitFor(() => expect(screen.getByText('Xin chào.')).toBeTruthy());
+    expect(screen.getByText('Hello there.')).toBeTruthy();
+    expect(screen.getByText('Source (auto)')).toBeTruthy();
+    expect(screen.getByText('Translation (→ vi)')).toBeTruthy();
+    expect(view.container.querySelector('.transcript-columns.two-columns')).toBeTruthy();
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Source' }));
+    expect(view.container.querySelector('[data-column="translated"]')).toBeNull();
+    expect(screen.getByText('Hello there.')).toBeTruthy();
+    expect(view.container.querySelector('.two-columns')).toBeNull();
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Translation' }));
+    expect(view.container.querySelector('[data-column="source"]')).toBeNull();
+    expect(screen.getByText('Xin chào.')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Translation' }).getAttribute('aria-pressed')).toBe('true');
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Both' }));
+    expect(view.container.querySelector('.two-columns')).toBeTruthy();
+  });
+
+  it('switches the Target mid-session and follows the value the backend confirms', async () => {
+    backendSessionId = 'session-1';
+    backendTarget = 'vi';
+    render(Live);
+    await screen.findByRole('button', { name: 'Stop recording' });
+    await waitFor(() => expect(channels).toHaveLength(1));
+
+    const select = screen.getByLabelText('Translate to') as HTMLSelectElement;
+    await waitFor(() => expect(select.value).toBe('vi'));
+    await fireEvent.change(select, { target: { value: 'en' } });
+    await waitFor(() => expect(mocks.liveSetTarget).toHaveBeenCalledWith('en'));
+
+    channels[0].onmessage({ type: 'target', seq: 1, target: 'en' });
+    await waitFor(() => expect(screen.getByText('Translation (→ en)')).toBeTruthy());
+    expect(select.value).toBe('en');
+  });
+
+  it('puts the dropdown back to the real Target and explains a failed switch', async () => {
+    backendSessionId = 'session-1';
+    backendTarget = 'vi';
+    mocks.liveSetTarget.mockResolvedValueOnce({
+      status: 'error',
+      error: { category: 'model', code: 'model', detailRedacted: 'rejected' },
+    });
+    render(Live);
+    await screen.findByRole('button', { name: 'Stop recording' });
+    const select = screen.getByLabelText('Translate to') as HTMLSelectElement;
+    await waitFor(() => expect(select.value).toBe('vi'));
+
+    await fireEvent.change(select, { target: { value: 'ja' } });
+
+    await waitFor(() => expect(screen.getByText(/Could not switch the translation language/)).toBeTruthy());
+    expect(select.value).toBe('vi');
+    // A model-side failure also raises the in-place banner with the Settings link.
+    expect(screen.getByText('The selected Live model is unavailable.')).toBeTruthy();
   });
 });
