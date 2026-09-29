@@ -10,6 +10,7 @@ mod flac;
 mod hash;
 mod probe;
 mod proxy;
+mod recording_export;
 mod resample;
 
 pub use chunk::{serialize_transcribe_request, Chunk, ChunkBudget, ChunkOptions, Chunker};
@@ -17,6 +18,7 @@ pub use decode::{decode_mono_16khz, DecodeStats};
 pub use hash::sha256_file;
 pub use probe::{check_supported_extension, probe, MediaInfo, SUPPORTED_EXTENSIONS};
 pub use proxy::{create_proxy, ProxyInfo};
+pub use recording_export::{export_recording, RecordingExportFormat, RecordingExportOutcome};
 
 pub(crate) const OUTPUT_SAMPLE_RATE: u32 = 16_000;
 pub(crate) const SUGGESTED_FORMATS: &str =

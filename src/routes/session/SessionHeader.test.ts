@@ -48,6 +48,8 @@ function props(overrides: Partial<Record<string, unknown>> = {}) {
     sessionId: 'session-1',
     title: 'cuộc họp',
     kind: 'file',
+    status: 'complete',
+    recordingAvailable: false,
     createdAtMs: Date.UTC(2026, 0, 15),
     durationSec: 125,
     segmentTextCount: 42,
@@ -88,6 +90,22 @@ describe('SessionHeader', () => {
 
     expect(screen.getByText('Live')).toBeTruthy();
     expect(screen.queryByText('Tệp')).toBeNull();
+  });
+
+  it('offers Download Recording for a saved Live Recording and disables it while active', async () => {
+    const { unmount } = render(
+      SessionHeader,
+      props({ kind: 'live', recordingAvailable: true }),
+    );
+    await fireEvent.click(screen.getByRole('button', { name: 'Thao tác khác' }));
+    expect(screen.getByRole('menuitem', { name: 'Tải Recording' })).toBeTruthy();
+
+    unmount();
+    render(SessionHeader, props({ kind: 'live', status: 'finalizing', recordingAvailable: true }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Thao tác khác' }));
+    const download = screen.getByRole('menuitem', { name: /Tải Recording/ }) as HTMLButtonElement;
+    expect(download.disabled).toBe(true);
+    expect(download.textContent).toContain('Chỉ tải sau khi phiên đã lưu xong.');
   });
 
   it('shows the recover badge when recovered, and the partial badge when partial', () => {

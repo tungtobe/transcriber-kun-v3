@@ -78,6 +78,9 @@ pub struct AppState {
     /// khác được phép xoá khooản này ngoại trừ khi Phiên bị xoá/wipe (huỷ
     /// token trước, để `memo_generate` tự gỡ khoá khi tỉnh dậy).
     pub memo_running: Arc<Mutex<HashMap<(SessionId, MemoTemplateId), CancellationToken>>>,
+    /// One export at a time. The token is installed before the native save
+    /// dialog opens so cancellation and duplicate requests share one owner.
+    pub recording_export: Arc<Mutex<Option<Arc<AtomicBool>>>>,
     /// Coalesces window/menu/Cmd+Q close requests and lets an approved exit
     /// pass through Tauri's `ExitRequested` callback exactly once.
     pub close_requested: Arc<AtomicBool>,
@@ -329,6 +332,7 @@ pub fn boot<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
         recovering,
         wiping: Arc::new(AtomicBool::new(false)),
         memo_running: Arc::new(Mutex::new(HashMap::new())),
+        recording_export: Arc::new(Mutex::new(None)),
         close_requested: Arc::new(AtomicBool::new(false)),
         close_confirmed: Arc::new(AtomicBool::new(false)),
         _log_guard: log_guard,

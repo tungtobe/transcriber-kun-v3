@@ -10,6 +10,8 @@ function sessions(count: number): SessionListItem[] {
   return Array.from({ length: count }, (_, i) => ({
     sessionId: `s${i}`,
     kind: 'file',
+    status: 'complete',
+    recordingAvailable: false,
     title: `phiên ${i}`,
     createdAt: i,
     durationSec: 10,

@@ -22,6 +22,7 @@
   import CloseConfirm from './CloseConfirm.svelte';
   import DropOverlay from './DropOverlay.svelte';
   import JobCard from './JobCard.svelte';
+  import RecordingExportStatus from './RecordingExportStatus.svelte';
 
   let { children }: { children?: Snippet } = $props();
 
@@ -227,6 +228,7 @@
 
 <DropOverlay active={dragging && dropEnabled} />
 <CloseConfirm />
+<RecordingExportStatus />
 
 <style>
   .app-shell {

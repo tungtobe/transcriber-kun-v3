@@ -3032,28 +3032,61 @@ mod tests {
         tokio::spawn(actor.run());
 
         assert!(matches!(
-            handle.start_retranscribe(retranscribe_params(session_id, None, source.clone())).await.unwrap(),
+            handle
+                .start_retranscribe(retranscribe_params(session_id, None, source.clone()))
+                .await
+                .unwrap(),
             RerunOutcome::Started { .. }
         ));
         wait_until_empty(&handle, Duration::from_secs(5)).await;
-        let first_id = db.with_connection(|conn| Ok(repo::transcripts::retranscribe_for_session(conn, session_id)?)).unwrap().unwrap();
+        let first_id = db
+            .with_connection(|conn| {
+                Ok(repo::transcripts::retranscribe_for_session(
+                    conn, session_id,
+                )?)
+            })
+            .unwrap()
+            .unwrap();
 
         assert!(matches!(
-            handle.start_retranscribe(retranscribe_params(session_id, Some(first_id), source)).await.unwrap(),
+            handle
+                .start_retranscribe(retranscribe_params(session_id, Some(first_id), source))
+                .await
+                .unwrap(),
             RerunOutcome::Started { .. }
         ));
         wait_until_empty(&handle, Duration::from_secs(5)).await;
-        let current_id = db.with_connection(|conn| Ok(repo::transcripts::retranscribe_for_session(conn, session_id)?)).unwrap().unwrap();
+        let current_id = db
+            .with_connection(|conn| {
+                Ok(repo::transcripts::retranscribe_for_session(
+                    conn, session_id,
+                )?)
+            })
+            .unwrap()
+            .unwrap();
         assert_ne!(current_id, first_id);
-        let count: i64 = db.with_connection(|conn| Ok(conn.query_row(
+        let count: i64 = db
+            .with_connection(|conn| {
+                Ok(conn.query_row(
             "SELECT count(*) FROM transcripts WHERE session_id = ?1 AND variant = 'retranscribe'",
             [session_id.to_string()],
             |row| row.get(0),
-        )?)).unwrap();
+        )?)
+            })
+            .unwrap();
         assert_eq!(count, 1);
-        let primary = db.with_connection(|conn| Ok(repo::transcripts::get(conn, primary_id)?)).unwrap().unwrap();
+        let primary = db
+            .with_connection(|conn| Ok(repo::transcripts::get(conn, primary_id)?))
+            .unwrap()
+            .unwrap();
         assert_eq!(primary.variant, Variant::Primary);
-        let text = db.with_connection(|conn| Ok(repo::segments::list_for_transcript(conn, current_id)?[0].text.clone())).unwrap();
+        let text = db
+            .with_connection(|conn| {
+                Ok(repo::segments::list_for_transcript(conn, current_id)?[0]
+                    .text
+                    .clone())
+            })
+            .unwrap();
         assert_eq!(text, "replacement recording transcript");
     }
 
@@ -3073,25 +3106,55 @@ mod tests {
             Some(old_retranscribe_id),
         );
         let transcriber = FakeTranscriber::new(vec![
-            Behavior::Fail { code: Code::Network, retryable: false },
+            Behavior::Fail {
+                code: Code::Network,
+                retryable: false,
+            },
             Behavior::BlockUntilCancelled,
         ]);
         let (handle, actor) = channel(db.clone(), root.path().to_path_buf(), transcriber);
         tokio::spawn(actor.run());
 
         assert!(matches!(
-            handle.start_retranscribe(retranscribe_params(session_id, Some(old_retranscribe_id), source.clone())).await.unwrap(),
+            handle
+                .start_retranscribe(retranscribe_params(
+                    session_id,
+                    Some(old_retranscribe_id),
+                    source.clone()
+                ))
+                .await
+                .unwrap(),
             RerunOutcome::Started { .. }
         ));
         wait_until_empty(&handle, Duration::from_secs(5)).await;
-        let partial_id = db.with_connection(|conn| Ok(repo::transcripts::retranscribe_for_session(conn, session_id)?)).unwrap().unwrap();
+        let partial_id = db
+            .with_connection(|conn| {
+                Ok(repo::transcripts::retranscribe_for_session(
+                    conn, session_id,
+                )?)
+            })
+            .unwrap()
+            .unwrap();
         assert_ne!(partial_id, old_retranscribe_id);
-        let partial = db.with_connection(|conn| Ok(repo::transcripts::get(conn, partial_id)?)).unwrap().unwrap();
-        assert_eq!(partial.status, crate::db::repo::transcripts::Status::Partial);
-        let partial_segments = db.with_connection(|conn| Ok(repo::segments::list_for_transcript(conn, partial_id)?)).unwrap();
-        assert!(partial_segments.iter().any(|segment| segment.kind == SegmentKind::Gap));
+        let partial = db
+            .with_connection(|conn| Ok(repo::transcripts::get(conn, partial_id)?))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            partial.status,
+            crate::db::repo::transcripts::Status::Partial
+        );
+        let partial_segments = db
+            .with_connection(|conn| Ok(repo::segments::list_for_transcript(conn, partial_id)?))
+            .unwrap();
+        assert!(partial_segments
+            .iter()
+            .any(|segment| segment.kind == SegmentKind::Gap));
 
-        let outcome = handle.start_retranscribe(retranscribe_params(session_id, Some(partial_id), source)).await.unwrap();
+        let outcome = handle
+            .start_retranscribe(retranscribe_params(session_id, Some(partial_id), source))
+            .await
+            .unwrap();
         let job_id = match outcome {
             RerunOutcome::Started { job_id } => job_id,
             other => panic!("expected a new retranscribe job, got {other:?}"),
@@ -3100,12 +3163,18 @@ mod tests {
         handle.cancel(job_id).await.unwrap();
         wait_until_empty(&handle, Duration::from_secs(3)).await;
         assert_eq!(
-            db.with_connection(|conn| Ok(repo::transcripts::retranscribe_for_session(conn, session_id)?)).unwrap(),
+            db.with_connection(|conn| Ok(repo::transcripts::retranscribe_for_session(
+                conn, session_id
+            )?))
+            .unwrap(),
             Some(partial_id),
             "cancel leaves the published retranscribe variant intact"
         );
         assert_eq!(
-            db.with_connection(|conn| Ok(repo::transcripts::primary_for_session(conn, session_id)?)).unwrap(),
+            db.with_connection(|conn| Ok(repo::transcripts::primary_for_session(
+                conn, session_id
+            )?))
+            .unwrap(),
             Some(primary_id),
             "recording retranscribe never replaces live primary"
         );

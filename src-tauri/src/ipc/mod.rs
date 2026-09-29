@@ -1522,6 +1522,8 @@ async fn library_transcript_export(
 pub struct SessionListItem {
     pub session_id: SessionId,
     pub kind: String,
+    pub status: String,
+    pub recording_available: bool,
     pub title: String,
     pub created_at: f64,
     pub duration_sec: f64,
@@ -1530,10 +1532,16 @@ pub struct SessionListItem {
     pub tag_ids: Vec<TagId>,
 }
 
-fn session_list_row_to_item(row: repo::sessions::SessionListRow) -> SessionListItem {
+fn session_list_row_to_item(
+    root: &std::path::Path,
+    row: repo::sessions::SessionListRow,
+) -> SessionListItem {
+    let recording_available = row.kind == "live" && paths::recording_path(root, row.id).is_file();
     SessionListItem {
         session_id: row.id,
         kind: row.kind,
+        status: row.status,
+        recording_available,
         title: row.title,
         created_at: row.created_at as f64,
         duration_sec: row.duration_sec,
@@ -1552,16 +1560,218 @@ async fn library_sessions_list(
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<SessionListItem>, AppError> {
     let db = state.db.clone();
+    let root = state.data_dir.clone();
     let result = async {
         let db = db?;
+        let root = root?;
         blocking(move || {
             db.with_connection(|conn| Ok(repo::sessions::list_for_home(conn)?))
-                .map(|rows| rows.into_iter().map(session_list_row_to_item).collect())
+                .map(|rows| {
+                    rows.into_iter()
+                        .map(|row| session_list_row_to_item(&root, row))
+                        .collect()
+                })
         })
         .await
     }
     .await;
     track_ipc_error(&state.db, result).await
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingExportProgress {
+    pub processed_seconds: f64,
+    pub total_seconds: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub enum RecordingExportFormat {
+    Wav,
+    Flac,
+}
+
+impl RecordingExportFormat {
+    fn extension(self) -> &'static str {
+        match self {
+            Self::Wav => "wav",
+            Self::Flac => "flac",
+        }
+    }
+
+    fn media_format(self) -> crate::media::RecordingExportFormat {
+        match self {
+            Self::Wav => crate::media::RecordingExportFormat::Wav,
+            Self::Flac => crate::media::RecordingExportFormat::Flac,
+        }
+    }
+}
+
+/// Open the system save dialog on Tauri's main thread. The picker returns a
+/// Rust-only path; only progress crosses IPC while export work is running.
+fn pick_recording_export_destination(
+    app: &tauri::AppHandle,
+    format: RecordingExportFormat,
+) -> Result<Option<std::path::PathBuf>, AppError> {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        let (tx, rx) = std::sync::mpsc::channel::<Option<std::path::PathBuf>>();
+        let extension = format.extension();
+        let file_name = format!("recording.{extension}");
+        app.run_on_main_thread(move || {
+            let picked = rfd::FileDialog::new()
+                .set_file_name(&file_name)
+                .add_filter(
+                    if extension == "wav" { "WAV" } else { "FLAC" },
+                    &[extension],
+                )
+                .save_file();
+            let _ = tx.send(picked);
+        })
+        .map_err(|err| AppError::new(Code::Storage, err.to_string()))?;
+        let picked = rx
+            .recv()
+            .map_err(|err| AppError::new(Code::Storage, err.to_string()))?;
+        let Some(path) = picked else {
+            return Ok(None);
+        };
+        let mut path = path;
+        path.set_extension(format.extension());
+        Ok(Some(path))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = app;
+        Err(AppError::new(
+            Code::Permission,
+            "Recording export is available on macOS and Windows.",
+        ))
+    }
+}
+
+/// Export a persisted Live Recording. Session kind/status/source are read from
+/// SQLite and the canonical path is checked again after the dialog returns.
+#[tauri::command]
+#[specta::specta]
+async fn library_recording_export(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    session_id: SessionId,
+    format: RecordingExportFormat,
+    on_progress: tauri::ipc::Channel<RecordingExportProgress>,
+) -> Result<bool, AppError> {
+    let cancel_token = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reservation = state
+        .recording_export
+        .lock()
+        .map_err(|_| AppError::new(Code::Storage, "Recording export state is unavailable."))
+        .and_then(|mut current| {
+            if current.is_some() {
+                Err(AppError::new(
+                    Code::Request,
+                    "Another Recording export is already running.",
+                ))
+            } else {
+                *current = Some(cancel_token.clone());
+                Ok(())
+            }
+        });
+    if let Err(error) = reservation {
+        return track_ipc_error(&state.db, Err(error)).await;
+    }
+
+    let result = async {
+        if is_wiping(&state.wiping) || is_session_deleting(&state.deleting, session_id) {
+            return Err(if is_wiping(&state.wiping) {
+                wiping_error()
+            } else {
+                session_deleting_error()
+            });
+        }
+        let db = state.db.clone();
+        let root = state.data_dir.clone();
+        blocking(move || {
+            let db = db?;
+            let root = root?;
+            library::store::recording_export_source(&db, &root, session_id)
+        })
+        .await?;
+
+        let app_for_dialog = app.clone();
+        let picked = tauri::async_runtime::spawn_blocking(move || {
+            pick_recording_export_destination(&app_for_dialog, format)
+        })
+        .await
+        .map_err(|err| AppError::new(Code::Storage, err.to_string()))??;
+        let Some(destination) = picked else {
+            return Ok(false);
+        };
+        if cancel_token.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(false);
+        }
+        if is_wiping(&state.wiping) || is_session_deleting(&state.deleting, session_id) {
+            return Err(if is_wiping(&state.wiping) {
+                wiping_error()
+            } else {
+                session_deleting_error()
+            });
+        }
+
+        let db = state.db.clone();
+        let root = state.data_dir.clone();
+        let source = blocking(move || {
+            let db = db?;
+            let root = root?;
+            library::store::recording_export_source(&db, &root, session_id)
+        })
+        .await?;
+        let total_seconds = source.duration_seconds;
+        let channel = on_progress;
+        let cancel = cancel_token.clone();
+        let outcome = tauri::async_runtime::spawn_blocking(move || {
+            crate::media::export_recording(
+                &source.path,
+                &destination,
+                format.media_format(),
+                total_seconds,
+                &cancel,
+                |processed_seconds| {
+                    let _ = channel.send(RecordingExportProgress {
+                        processed_seconds,
+                        total_seconds,
+                    });
+                },
+            )
+        })
+        .await
+        .map_err(|err| AppError::new(Code::Storage, err.to_string()))??;
+        Ok(outcome == crate::media::RecordingExportOutcome::Saved)
+    }
+    .await;
+
+    if let Ok(mut active) = state.recording_export.lock() {
+        if active
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &cancel_token))
+        {
+            *active = None;
+        }
+    }
+    track_ipc_error(&state.db, result).await
+}
+
+#[tauri::command]
+#[specta::specta]
+fn library_recording_export_cancel(state: tauri::State<'_, AppState>) -> Result<(), AppError> {
+    let active = state
+        .recording_export
+        .lock()
+        .map_err(|_| AppError::new(Code::Storage, "Recording export state is unavailable."))?;
+    if let Some(token) = active.as_ref() {
+        token.store(true, std::sync::atomic::Ordering::Release);
+    }
+    Ok(())
 }
 
 /// Kết quả `library_proxy_relink` (spec I/O Matrix "Chọn lại khớp/sai/huỷ",
@@ -2531,6 +2741,8 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             library_session_detail,
             library_transcript_export,
             library_sessions_list,
+            library_recording_export,
+            library_recording_export_cancel,
             library_proxy_relink,
             library_session_rename,
             library_session_delete,

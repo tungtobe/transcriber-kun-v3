@@ -17,6 +17,7 @@
   import { i18n } from '../../i18n/index.svelte';
   import { formatTimestamp } from '../../lib/time';
   import { libraryStore } from '../../lib/stores/library.svelte';
+  import { recordingExportStore } from '../../lib/stores/recordingExport.svelte';
   import Badge from '../../components/Badge.svelte';
   import SessionMenu from '../../components/SessionMenu.svelte';
   import InlineRename from '../../components/InlineRename.svelte';
@@ -48,6 +49,17 @@
   );
   const durationLabel = $derived(
     session.durationSec === null ? null : formatTimestamp(session.durationSec),
+  );
+  const canOfferRecordingExport = $derived(
+    session.kind === 'live'
+      && (session.recordingAvailable || session.status === 'recording' || session.status === 'finalizing'),
+  );
+  const recordingExportDisabledReason = $derived(
+    session.status === 'recording' || session.status === 'finalizing'
+      ? i18n.t('sessionMenu.item.downloadDisabledReason')
+      : recordingExportStore.active
+        ? i18n.t('recordingExport.status.alreadyRunning')
+        : undefined,
   );
 
   let menuRef = $state<{ focusTrigger: () => void } | null>(null);
@@ -202,7 +214,14 @@
     </a>
   {/if}
   <div class="session-row-menu-wrap" bind:this={menuWrapEl}>
-    <SessionMenu bind:this={menuRef} onRename={startRename} onDelete={startDelete} onTag={openTagPicker} />
+    <SessionMenu
+      bind:this={menuRef}
+      onRename={startRename}
+      onDelete={startDelete}
+      onTag={openTagPicker}
+      onDownloadRecording={canOfferRecordingExport ? () => recordingExportStore.request(session.sessionId) : undefined}
+      downloadDisabledReason={recordingExportDisabledReason}
+    />
     {#if tagPickerOpen}
       <TagPicker
         mode="assign"

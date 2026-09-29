@@ -225,12 +225,16 @@ fn capture_inputs(
 ) -> Result<CapturedInputs, AppError> {
     let settings = crate::settings::load(db);
     db.with_connection(|conn| {
-        let transcript_id = selected_transcript_id.or(repo::transcripts::primary_for_session(conn, session_id)?)
+        let transcript_id = selected_transcript_id
+            .or(repo::transcripts::primary_for_session(conn, session_id)?)
             .ok_or_else(|| AppError::new(Code::Request, "Phiên chưa có transcript"))?;
         let transcript = repo::transcripts::get(conn, transcript_id)?
             .ok_or_else(|| AppError::new(Code::Request, "Phiên chưa có transcript"))?;
         if transcript.session_id != session_id {
-            return Err(AppError::new(Code::Request, "Transcript không thuộc Phiên này"));
+            return Err(AppError::new(
+                Code::Request,
+                "Transcript không thuộc Phiên này",
+            ));
         }
         let segments = repo::segments::list_for_transcript(conn, transcript_id)?;
         if segments
@@ -691,8 +695,7 @@ mod tests {
         let (_dir, db) = open_db();
         let session_id = SessionId::new();
         insert_session(&db, session_id);
-        let primary_id =
-            insert_transcript(&db, session_id, vec![draft_text(0.0, 2.0, "bản live")]);
+        let primary_id = insert_transcript(&db, session_id, vec![draft_text(0.0, 2.0, "bản live")]);
         let retranscribe_id = TranscriptId::new();
         db.with_connection(|conn| {
             Ok(repo::transcripts::insert_with_segments(
@@ -739,10 +742,20 @@ mod tests {
         assert!(matches!(outcome, GenerateOutcome::Generated(_)));
         let request = transport.requests().pop().unwrap();
         let body: Value = serde_json::from_str(request.body.as_ref().unwrap().expose()).unwrap();
-        let prompt = body.pointer("/contents/0/parts/0/text").unwrap().as_str().unwrap();
+        let prompt = body
+            .pointer("/contents/0/parts/0/text")
+            .unwrap()
+            .as_str()
+            .unwrap();
         assert!(prompt.contains("[00:00] bản từ recording"));
         assert!(!prompt.contains("bản live"));
-        assert_eq!(view(&db, session_id, template.id).unwrap().unwrap().from_previous_transcript, true);
+        assert_eq!(
+            view(&db, session_id, template.id)
+                .unwrap()
+                .unwrap()
+                .from_previous_transcript,
+            true
+        );
         assert_ne!(primary_id, retranscribe_id);
     }
 

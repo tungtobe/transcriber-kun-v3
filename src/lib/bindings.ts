@@ -162,11 +162,13 @@ export const commands = {
 	librarySessionDetail: (sessionId: string) => typedError<{
 	sessionId: string,
 	kind: string,
+	status: string,
 	title: string,
 	createdAt: number | null,
 	durationSec: number | null,
 	recovered: boolean,
 	sourceName: string | null,
+	recordingAvailable: boolean,
 	proxyPath: string | null,
 	transcript: TranscriptDetail | null,
 	retranscribe: TranscriptDetail | null,
@@ -196,6 +198,12 @@ export const commands = {
 	 *  [`repo::sessions::list_for_home`] cho logic đọc thật.
 	 */
 	librarySessionsList: () => typedError<SessionListItem[], AppError>(__TAURI_INVOKE("library_sessions_list")),
+	/**
+	 *  Export a persisted Live Recording. Session kind/status/source are read from
+	 *  SQLite and the canonical path is checked again after the dialog returns.
+	 */
+	libraryRecordingExport: (sessionId: string, format: RecordingExportFormat, onProgress: Channel<RecordingExportProgress>) => typedError<boolean, AppError>(__TAURI_INVOKE("library_recording_export", { sessionId, format, onProgress })),
+	libraryRecordingExportCancel: () => typedError<null, AppError>(__TAURI_INVOKE("library_recording_export_cancel")),
 	/**
 	 *  Chọn lại file nguồn cho một Phiên `file` đã lưu (spec Approach, FR-15):
 	 *  hash file được chọn phải khớp đúng `source_hash` của Phiên trước khi
@@ -737,6 +745,13 @@ export type PermissionState = "granted" | "denied" | "notDetermined" | "unknown"
  */
 export type ProxyRelinkOutcome = "relinked" | "hashMismatch" | "cancelled" | "liveUnsupported";
 
+export type RecordingExportFormat = "wav" | "flac";
+
+export type RecordingExportProgress = {
+	processedSeconds: number | null,
+	totalSeconds: number | null,
+};
+
 export type RecordingState = "active" | "stopped" | "failed";
 
 /**
@@ -800,11 +815,13 @@ export type SessionDeleteOutcome = "deleted" | "busy";
 export type SessionDetail = {
 	sessionId: string,
 	kind: string,
+	status: string,
 	title: string,
 	createdAt: number | null,
 	durationSec: number | null,
 	recovered: boolean,
 	sourceName: string | null,
+	recordingAvailable: boolean,
 	proxyPath: string | null,
 	transcript: TranscriptDetail | null,
 	retranscribe: TranscriptDetail | null,
@@ -836,6 +853,8 @@ export type SessionDetail = {
 export type SessionListItem = {
 	sessionId: string,
 	kind: string,
+	status: string,
+	recordingAvailable: boolean,
 	title: string,
 	createdAt: number | null,
 	durationSec: number | null,

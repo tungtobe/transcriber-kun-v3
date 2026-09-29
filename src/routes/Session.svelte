@@ -496,6 +496,8 @@
       sessionId={sessionId}
       title={detail.title}
       kind={detail.kind}
+      status={detail.status}
+      recordingAvailable={detail.recordingAvailable}
       createdAtMs={detail.createdAt}
       durationSec={detail.durationSec}
       segmentTextCount={segmentTextCount}

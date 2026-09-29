@@ -15,6 +15,7 @@
   import { i18n } from '../../i18n/index.svelte';
   import { formatTimestamp } from '../../lib/time';
   import { libraryStore } from '../../lib/stores/library.svelte';
+  import { recordingExportStore } from '../../lib/stores/recordingExport.svelte';
   import { ArrowLeftIcon, XIcon } from '../../components/icons';
   import Badge from '../../components/Badge.svelte';
   import SessionMenu from '../../components/SessionMenu.svelte';
@@ -27,6 +28,8 @@
     sessionId,
     title,
     kind,
+    status,
+    recordingAvailable,
     createdAtMs,
     durationSec,
     segmentTextCount,
@@ -45,6 +48,8 @@
      * (spec I/O Matrix "Phiên live thiếu Proxy": một Phiên live vẫn có thể
      * mở ở `/session/:id`, chỉ khác ở trình phát, không phải header). */
     kind: string;
+    status: string;
+    recordingAvailable: boolean;
     createdAtMs: number | null;
     durationSec: number | null;
     segmentTextCount: number;
@@ -73,6 +78,17 @@
       : new Date(createdAtMs).toLocaleDateString(LOCALE_TAG[i18n.locale] ?? undefined),
   );
   const durationLabel = $derived(durationSec === null ? null : formatTimestamp(durationSec));
+  const canOfferRecordingExport = $derived(
+    kind === 'live'
+      && (recordingAvailable || status === 'recording' || status === 'finalizing'),
+  );
+  const recordingExportDisabledReason = $derived(
+    status === 'recording' || status === 'finalizing'
+      ? i18n.t('sessionMenu.item.downloadDisabledReason')
+      : recordingExportStore.active
+        ? i18n.t('recordingExport.status.alreadyRunning')
+        : undefined,
+  );
 
   let titleButtonRef = $state<HTMLButtonElement | null>(null);
   let menuRef = $state<{ focusTrigger: () => void } | null>(null);
@@ -293,6 +309,8 @@
     onRename={() => openRename('menu')}
     onDelete={startDelete}
     onRetranscribe={kind === 'live' ? onRetranscribe : undefined}
+    onDownloadRecording={canOfferRecordingExport ? () => recordingExportStore.request(sessionId) : undefined}
+    downloadDisabledReason={recordingExportDisabledReason}
   />
 </header>
 

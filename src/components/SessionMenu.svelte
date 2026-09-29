@@ -9,11 +9,21 @@
   import { EllipsisVerticalIcon } from './icons';
   import { floating } from '../lib/floating';
 
+  type MenuItem = {
+    label: string;
+    run: () => void;
+    danger?: boolean;
+    disabled?: boolean;
+    description?: string;
+  };
+
   let {
     onRename,
     onDelete,
     onTag,
     onRetranscribe,
+    onDownloadRecording,
+    downloadDisabledReason,
   }: {
     onRename: () => void;
     onDelete: () => void;
@@ -21,6 +31,8 @@
      * (spec Code Map: "thêm mục tuỳ chọn `onTag`"). */
     onTag?: () => void;
     onRetranscribe?: () => void;
+    onDownloadRecording?: () => void;
+    downloadDisabledReason?: string;
   } = $props();
 
   let open = $state(false);
@@ -31,9 +43,17 @@
   let rootEl = $state<HTMLDivElement | null>(null);
   let itemEls = $state<(HTMLButtonElement | null)[]>([]);
 
-  const items = $derived([
+  const items = $derived<MenuItem[]>([
     ...(onTag ? [{ label: i18n.t('sessionMenu.item.tag'), run: onTag }] : []),
     ...(onRetranscribe ? [{ label: i18n.t('sessionMenu.item.transcribeRecording'), run: onRetranscribe }] : []),
+    ...(onDownloadRecording
+      ? [{
+          label: i18n.t('sessionMenu.item.downloadRecording'),
+          run: onDownloadRecording,
+          disabled: Boolean(downloadDisabledReason),
+          description: downloadDisabledReason,
+        }]
+      : []),
     { label: i18n.t('sessionMenu.item.rename'), run: onRename },
     { label: i18n.t('sessionMenu.item.delete'), run: onDelete, danger: true },
   ]);
@@ -58,11 +78,17 @@
     open = !open;
   }
 
-  function focusItem(index: number): void {
+  function focusItem(index: number, direction = 1): void {
     const count = itemEls.length;
     if (count === 0) return;
-    const next = ((index % count) + count) % count;
-    itemEls[next]?.focus();
+    for (let offset = 0; offset < count; offset += 1) {
+      const position = index + offset * direction;
+      const next = ((position % count) + count) % count;
+      if (itemEls[next] && !itemEls[next]?.disabled) {
+        itemEls[next]?.focus();
+        return;
+      }
+    }
   }
 
   $effect(() => {
@@ -86,7 +112,7 @@
       focusItem(index + 1);
     } else if (event.key === 'ArrowUp') {
       event.preventDefault();
-      focusItem(index - 1);
+      focusItem(index - 1, -1);
     } else if (event.key === 'Tab') {
       close();
     }
@@ -124,6 +150,8 @@
           role="menuitem"
           class="session-menu-item"
           class:session-menu-item-danger={item.danger}
+          class:session-menu-item-disabled={item.disabled}
+          disabled={item.disabled}
           bind:this={itemEls[index]}
           onclick={() => {
             close();
@@ -131,7 +159,10 @@
           }}
           onkeydown={(event) => handleItemKeydown(event, index)}
         >
-          {item.label}
+          <span>{item.label}</span>
+          {#if item.description}
+            <span class="session-menu-item-hint">{item.description}</span>
+          {/if}
         </button>
       {/each}
     </div>
@@ -186,9 +217,11 @@
 
   .session-menu-item {
     display: flex;
+    flex-direction: column;
     min-height: 34px;
-    align-items: center;
-    padding: 0 var(--space-3);
+    align-items: flex-start;
+    justify-content: center;
+    padding: var(--space-1) var(--space-3);
     border: none;
     border-radius: var(--radius-md);
     background: transparent;
@@ -199,8 +232,23 @@
     cursor: pointer;
   }
 
+  .session-menu-item-hint {
+    color: var(--color-text-muted);
+    font-size: var(--text-help-size);
+    line-height: 1.3;
+  }
+
   .session-menu-item:hover {
     background: var(--color-surface-sunken);
+  }
+
+  .session-menu-item-disabled {
+    color: var(--color-text-muted);
+    cursor: not-allowed;
+  }
+
+  .session-menu-item-disabled:hover {
+    background: transparent;
   }
 
   .session-menu-item-danger {

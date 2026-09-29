@@ -15,6 +15,8 @@ function item(sessionId: string, tagIds: string[], title = `phiên ${sessionId}`
   return {
     sessionId,
     kind: 'file',
+    status: 'complete',
+    recordingAvailable: false,
     title,
     createdAt: 0,
     durationSec: 1,

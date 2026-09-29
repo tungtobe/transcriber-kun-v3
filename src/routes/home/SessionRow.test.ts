@@ -34,6 +34,8 @@ function item(overrides: Partial<SessionListItem> = {}): SessionListItem {
   return {
     sessionId: 'abc',
     kind: 'file',
+    status: 'complete',
+    recordingAvailable: false,
     title: 'cuộc họp',
     createdAt: Date.UTC(2026, 0, 15),
     durationSec: 65,
@@ -119,6 +121,29 @@ describe('SessionRow', () => {
 
       expect(screen.getByRole('menuitem', { name: 'Đổi tên' })).toBeTruthy();
       expect(screen.getByRole('menuitem', { name: 'Xoá' })).toBeTruthy();
+    });
+
+    it('offers Download Recording only for persisted Live recordings and explains active sessions', async () => {
+      const { unmount } = render(SessionRow, {
+        session: item({ kind: 'live', status: 'complete', recordingAvailable: true }),
+      });
+      await fireEvent.click(screen.getByRole('button', { name: 'Thao tác khác' }));
+      expect(screen.getByRole('menuitem', { name: 'Tải Recording' })).toBeTruthy();
+
+      unmount();
+      render(SessionRow, {
+        session: item({ kind: 'live', status: 'recording', recordingAvailable: true }),
+      });
+      await fireEvent.click(screen.getByRole('button', { name: 'Thao tác khác' }));
+      const itemButton = screen.getByRole('menuitem', { name: /Tải Recording/ }) as HTMLButtonElement;
+      expect(itemButton.disabled).toBe(true);
+      expect(itemButton.textContent).toContain('Chỉ tải sau khi phiên đã lưu xong.');
+    });
+
+    it('does not offer Download Recording for file sessions', async () => {
+      render(SessionRow, { session: item({ kind: 'file', status: 'complete', recordingAvailable: false }) });
+      await fireEvent.click(screen.getByRole('button', { name: 'Thao tác khác' }));
+      expect(screen.queryByText('Tải Recording')).toBeNull();
     });
 
     it('choosing Đổi tên replaces the link with an inline input preselected to the current title', async () => {

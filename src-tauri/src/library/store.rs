@@ -857,11 +857,13 @@ pub struct TranscriptExportData {
 pub struct SessionDetail {
     pub session_id: SessionId,
     pub kind: String,
+    pub status: String,
     pub title: String,
     pub created_at: f64,
     pub duration_sec: f64,
     pub recovered: bool,
     pub source_name: Option<String>,
+    pub recording_available: bool,
     pub proxy_path: Option<String>,
     pub transcript: Option<TranscriptDetail>,
     pub retranscribe: Option<TranscriptDetail>,
@@ -954,7 +956,10 @@ pub fn get_detail(
 
     Ok(Some(SessionDetail {
         session_id: session.id,
+        recording_available: session.kind == "live"
+            && paths::recording_path(root, session_id).is_file(),
         kind: session.kind,
+        status: session.status,
         title: session.title,
         created_at: session.created_at as f64,
         duration_sec: session.duration_sec,
@@ -966,6 +971,48 @@ pub fn get_detail(
         tags,
         has_memo,
     }))
+}
+
+/// Backend-validated source for exporting the canonical durable Live WAV.
+/// The caller must invoke this after the native dialog too, so a stale menu
+/// state can never export a file session or an unfinished Recording.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecordingExportSource {
+    pub path: std::path::PathBuf,
+    pub duration_seconds: f64,
+}
+
+pub fn recording_export_source(
+    db: &Db,
+    root: &Path,
+    session_id: SessionId,
+) -> Result<RecordingExportSource, AppError> {
+    let session = db
+        .with_connection(|conn| Ok(repo::sessions::get(conn, session_id)?))?
+        .ok_or_else(|| AppError::new(Code::Request, "The requested session no longer exists."))?;
+    if session.kind != "live" {
+        return Err(AppError::new(
+            Code::Request,
+            "Only a Live session Recording can be exported.",
+        ));
+    }
+    if session.status != "complete" {
+        return Err(AppError::new(
+            Code::Request,
+            "The Live Recording is still active or being finalized.",
+        ));
+    }
+
+    let path = paths::recording_path(root, session_id);
+    if !path.is_file() {
+        return Err(storage_error(
+            "The saved Recording is unavailable. Check that the app data folder is accessible and try again.",
+        ));
+    }
+    Ok(RecordingExportSource {
+        path,
+        duration_seconds: session.duration_sec.max(0.0),
+    })
 }
 
 /// Read one transcript and all of its segments for export. The caller passes
@@ -2106,6 +2153,52 @@ mod tests {
         }
         writer.finalize().unwrap();
         (session_id, recording_path)
+    }
+
+    #[test]
+    fn recording_export_source_accepts_only_complete_live_sessions_with_a_recording() {
+        let root = tempdir().unwrap();
+        let db = open_db(root.path());
+        let (complete_id, _) = seed_finalizing_live(root.path(), &db);
+        finalize_live_session_minimal(&db, complete_id, 1.0).unwrap();
+
+        let complete = recording_export_source(&db, root.path(), complete_id).unwrap();
+        assert!(complete.path.is_file());
+        assert_eq!(complete.duration_seconds, 1.0);
+
+        let recording_id = SessionId::new();
+        create_live_session(&db, recording_id, "Active recording").unwrap();
+        let recording_error = recording_export_source(&db, root.path(), recording_id).unwrap_err();
+        assert_eq!(recording_error.code, Code::Request);
+
+        let (finalizing_id, _) = seed_finalizing_live(root.path(), &db);
+        let finalizing_error =
+            recording_export_source(&db, root.path(), finalizing_id).unwrap_err();
+        assert_eq!(finalizing_error.code, Code::Request);
+
+        let file_id = SessionId::new();
+        db.with_connection(|conn| {
+            repo::sessions::insert(
+                conn,
+                repo::sessions::NewSession {
+                    id: file_id,
+                    kind: "file",
+                    title: "File session",
+                    source_hash: None,
+                    source_name: None,
+                    status: "complete",
+                    recovered: false,
+                    duration_sec: 1.0,
+                    proxy_ext: None,
+                    created_at: now_ms(),
+                    updated_at: now_ms(),
+                },
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let file_error = recording_export_source(&db, root.path(), file_id).unwrap_err();
+        assert_eq!(file_error.code, Code::Request);
     }
 
     #[test]

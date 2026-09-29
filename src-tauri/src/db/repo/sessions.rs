@@ -337,6 +337,7 @@ pub fn find_by_source_hash(
 pub struct SessionListRow {
     pub id: SessionId,
     pub kind: String,
+    pub status: String,
     pub title: String,
     pub created_at: i64,
     pub duration_sec: f64,
@@ -357,7 +358,7 @@ pub struct SessionListRow {
 /// hai JOIN, `COALESCE` về 0.
 pub fn list_for_home(conn: &Connection) -> rusqlite::Result<Vec<SessionListRow>> {
     let mut stmt = conn.prepare(
-        "SELECT s.id, s.kind, s.title, s.created_at, s.duration_sec, s.recovered, \
+        "SELECT s.id, s.kind, s.status, s.title, s.created_at, s.duration_sec, s.recovered, \
              COALESCE(gap_counts.cnt, 0) AS missing_gap_count \
          FROM sessions s \
          LEFT JOIN transcripts t ON t.session_id = s.id AND t.variant = 'primary' \
@@ -375,11 +376,12 @@ pub fn list_for_home(conn: &Connection) -> rusqlite::Result<Vec<SessionListRow>>
             Ok(SessionListRow {
                 id: parse_session_id(&id)?,
                 kind: row.get(1)?,
-                title: row.get(2)?,
-                created_at: row.get(3)?,
-                duration_sec: row.get(4)?,
-                recovered: row.get::<_, i64>(5)? != 0,
-                missing_gap_count: row.get(6)?,
+                status: row.get(2)?,
+                title: row.get(3)?,
+                created_at: row.get(4)?,
+                duration_sec: row.get(5)?,
+                recovered: row.get::<_, i64>(6)? != 0,
+                missing_gap_count: row.get(7)?,
                 tag_ids: Vec::new(),
             })
         })?

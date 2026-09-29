@@ -46,6 +46,35 @@ describe('SessionMenu', () => {
     expect(screen.queryByRole('menu')).toBeNull();
   });
 
+  it('shows and invokes the optional Download Recording action', async () => {
+    const onDownloadRecording = vi.fn();
+    render(SessionMenu, {
+      onRename: vi.fn(),
+      onDelete: vi.fn(),
+      onDownloadRecording,
+    });
+    await fireEvent.click(screen.getByRole('button', { name: 'Thao tác khác' }));
+
+    const item = screen.getByRole('menuitem', { name: 'Tải Recording' });
+    expect(item).toBeTruthy();
+    await fireEvent.click(item);
+    expect(onDownloadRecording).toHaveBeenCalledTimes(1);
+  });
+
+  it('disables recording export with the supplied active-session reason', async () => {
+    render(SessionMenu, {
+      onRename: vi.fn(),
+      onDelete: vi.fn(),
+      onDownloadRecording: vi.fn(),
+      downloadDisabledReason: 'Chỉ tải sau khi phiên đã lưu xong.',
+    });
+    await fireEvent.click(screen.getByRole('button', { name: 'Thao tác khác' }));
+
+    const item = screen.getByRole('menuitem', { name: /Tải Recording/ }) as HTMLButtonElement;
+    expect(item.disabled).toBe(true);
+    expect(item.textContent).toContain('Chỉ tải sau khi phiên đã lưu xong.');
+  });
+
   it('Escape closes the menu and returns focus to the trigger', async () => {
     render(SessionMenu, { onRename: vi.fn(), onDelete: vi.fn() });
     const trigger = screen.getByRole('button', { name: 'Thao tác khác' });
@@ -70,7 +99,7 @@ describe('SessionMenu', () => {
     await fireEvent.click(screen.getByRole('button', { name: 'Thao tác khác' }));
 
     const items = screen.getAllByRole('menuitem');
-    expect(items.map((el) => el.textContent)).toEqual(['Gắn tag', 'Đổi tên', 'Xoá']);
+    expect(items.map((el) => el.textContent?.trim())).toEqual(['Gắn tag', 'Đổi tên', 'Xoá']);
 
     await fireEvent.click(screen.getByRole('menuitem', { name: 'Gắn tag' }));
     expect(onTag).toHaveBeenCalledTimes(1);
