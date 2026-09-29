@@ -15,6 +15,7 @@ use tauri::ipc::Channel;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
+use crate::audio::output_volume::Ducker;
 use crate::audio::playback::{PlaybackBackend, PlaybackHandle};
 use crate::audio::{CaptureController, PcmChunk, OUTPUT_SAMPLE_RATE};
 use crate::core::error::{AppError, Category, Code};
@@ -473,6 +474,8 @@ pub struct LiveSessionActor {
     playback: Option<PlaybackHandle>,
     tts_enabled: bool,
     speaking: bool,
+    /// System volume ducking while the model speaks (None = not wired).
+    ducker: Option<Ducker>,
     seq: u64,
     subscribers: Vec<Channel<LiveEvent>>,
     snapshot: LiveSnapshot,
@@ -509,6 +512,7 @@ pub fn channel(
             playback: None,
             tts_enabled: false,
             speaking: false,
+            ducker: None,
             seq: 0,
             subscribers: Vec::new(),
             snapshot: LiveSnapshot {
@@ -553,6 +557,17 @@ impl LiveSessionActor {
                 let _ = sender.try_send(Internal::Speaking(speaking));
             }),
         ));
+        self
+    }
+
+    /// Wires system-volume ducking over `volume`, persisting its crash marker
+    /// at `marker`.
+    pub fn with_ducking(
+        mut self,
+        volume: Box<dyn crate::audio::output_volume::OutputVolume>,
+        marker: PathBuf,
+    ) -> Self {
+        self.ducker = Some(Ducker::new(volume, marker));
         self
     }
 
@@ -614,6 +629,9 @@ impl LiveSessionActor {
                     }
                 }
                 _ = flush_check.tick() => {
+                    if let Some(ducker) = &mut self.ducker {
+                        ducker.sync(self.speaking);
+                    }
                     self.check_running_session().await;
                 }
             }
@@ -634,6 +652,10 @@ impl LiveSessionActor {
         }
         if !on {
             self.set_speaking(false);
+            // Covers a user-overridden duck too; a no-op when idle.
+            if let Some(ducker) = &mut self.ducker {
+                ducker.restore();
+            }
         }
     }
 
@@ -643,6 +665,13 @@ impl LiveSessionActor {
         }
         self.speaking = speaking;
         self.snapshot.speaking = speaking;
+        if let Some(ducker) = &mut self.ducker {
+            if speaking {
+                ducker.duck();
+            } else {
+                ducker.restore();
+            }
+        }
         self.emit(LiveEvent::Speaking { seq: 0, speaking });
     }
 
@@ -4308,6 +4337,73 @@ mod tests {
         pump_until(&mut fx.actor, |a| !a.speaking).await;
         assert_eq!(speaking_events(&events), vec![true, false]);
         fx.actor.finish_current(None, false).await.unwrap();
+    }
+
+    fn attach_fake_ducking(
+        actor: &mut LiveSessionActor,
+        root: &std::path::Path,
+    ) -> (crate::audio::output_volume::fake::FakeVolume, PathBuf) {
+        let volume = crate::audio::output_volume::fake::FakeVolume::with_device("spk", 0.8);
+        let marker = crate::core::paths::ducking_marker_path(root);
+        actor.ducker = Some(Ducker::new(Box::new(volume.clone()), marker.clone()));
+        (volume, marker)
+    }
+
+    #[tokio::test]
+    async fn ducking_follows_speaking_and_restores_when_playback_drains() {
+        let (mut fx, conn) = scripted_fixture(&[]).await;
+        let backend = attach_fake_playback(&mut fx.actor);
+        let root = tempfile::tempdir().unwrap();
+        let (volume, marker) = attach_fake_ducking(&mut fx.actor, root.path());
+        fx.actor.set_tts(true);
+        fx.actor
+            .start(target_params(LiveTarget::Vi))
+            .await
+            .unwrap();
+        pump_until(&mut fx.actor, |a| {
+            a.running.as_ref().unwrap().connection == ConnectionState::Connected
+        })
+        .await;
+        assert_eq!(volume.level("spk"), Some(0.8), "no duck before speaking");
+        feed(&conn, 0, &audio_frame(2_400));
+        pump_until(&mut fx.actor, |a| a.speaking).await;
+        assert!((volume.level("spk").unwrap() - 0.24).abs() < 1e-4);
+        assert!(marker.exists());
+        backend.pump(10_000);
+        pump_until(&mut fx.actor, |a| !a.speaking).await;
+        assert!((volume.level("spk").unwrap() - 0.8).abs() < 1e-4);
+        assert!(!marker.exists());
+        fx.actor.finish_current(None, false).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ducking_is_restored_when_tts_is_turned_off_or_live_stops() {
+        for stop in [false, true] {
+            let (mut fx, conn) = scripted_fixture(&[]).await;
+            let _backend = attach_fake_playback(&mut fx.actor);
+            let root = tempfile::tempdir().unwrap();
+            let (volume, marker) = attach_fake_ducking(&mut fx.actor, root.path());
+            fx.actor.set_tts(true);
+            fx.actor
+                .start(target_params(LiveTarget::Vi))
+                .await
+                .unwrap();
+            pump_until(&mut fx.actor, |a| {
+                a.running.as_ref().unwrap().connection == ConnectionState::Connected
+            })
+            .await;
+            feed(&conn, 0, &audio_frame(2_400));
+            pump_until(&mut fx.actor, |a| a.speaking).await;
+            assert!(volume.level("spk").unwrap() < 0.3);
+            if stop {
+                fx.actor.finish_current(None, false).await.unwrap();
+            } else {
+                fx.actor.set_tts(false);
+                fx.actor.finish_current(None, false).await.unwrap();
+            }
+            assert!((volume.level("spk").unwrap() - 0.8).abs() < 1e-4);
+            assert!(!marker.exists());
+        }
     }
 
     #[tokio::test]

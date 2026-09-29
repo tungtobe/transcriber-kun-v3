@@ -64,6 +64,14 @@ pub fn run() {
                 // boot recovery uses the durable WAV checkpoints.
                 tauri::RunEvent::Exit => {
                     let state = app_handle.state::<ipc::boot::AppState>();
+                    // Last-resort ducking restore (marker-guarded, no-op when
+                    // Live already restored it on Stop).
+                    if let Ok(data_dir) = &state.data_dir {
+                        ipc::boot::restore_ducked_volume(
+                            &mut *audio::output_volume::platform_volume(),
+                            data_dir,
+                        );
+                    }
                     if let Ok(db) = &state.db {
                         if let Err(err) = crate::diagnostics::mark_clean_shutdown(db) {
                             tracing::warn!(error = %err, "could not mark clean shutdown");

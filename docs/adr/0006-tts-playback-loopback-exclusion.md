@@ -72,3 +72,21 @@ macOS and Windows and could not be built or run on the development machine.
 `serverContent.interrupted` (accepted also as `audioInterrupted`) is parsed
 and clears playback. The exact field name and timing on the real model are
 candidates from documentation and remain to be confirmed by the S3 spike.
+
+## Ducking (Story 5.4)
+
+`audio/output_volume` lowers the default output device to 30 % of its level
+while the model speaks and restores it afterwards. The backend is a private
+trait of `audio/` (not a fourth architecture port). macOS uses Core Audio
+(`VirtualMainVolume`, device identified by UID so it survives reboots).
+**Windows is unverified**: the pinned `wasapi` crate has no endpoint-volume
+interface and no new dependency is allowed, so the Windows backend is an inert
+stub that reports an error (the Ducker then never ducks; TTS is unaffected).
+It needs a real `IAudioEndpointVolume` implementation and a Windows spike.
+
+A durable marker `state/ducking.json` (written temp-then-rename before the first
+change) lets boot restore after a crash, only for the recorded device and only
+while its volume is still the level the app applied; a manual change
+invalidates the marker at once. Boot restores before staging cleanup; Stop,
+TTS off, output-device change and app exit restore too.
+
