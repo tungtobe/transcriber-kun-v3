@@ -27,7 +27,8 @@ pub struct ChunkTranscript {
     pub confirmed_silence: bool,
 }
 
-fn shape() -> AppError {
+fn shape(reason: &'static str) -> AppError {
+    tracing::warn!(reason, "Gemini transcription response rejected as Shape");
     AppError::new(
         Code::Shape,
         "Gemini transcription response is incomplete or invalid",
@@ -35,14 +36,17 @@ fn shape() -> AppError {
 }
 
 pub fn parse_general_response(body: &str, chunk: &Chunk) -> Result<ChunkTranscript, AppError> {
-    let response: Value = serde_json::from_str(body).map_err(|_| shape())?;
+    let response: Value =
+        serde_json::from_str(body).map_err(|_| shape("body is not valid JSON"))?;
     if response.pointer("/promptFeedback/blockReason").is_some() {
         return Err(AppError::new(
             Code::Blocked,
             "Gemini blocked the transcription",
         ));
     }
-    let candidate = response.pointer("/candidates/0").ok_or_else(shape)?;
+    let candidate = response
+        .pointer("/candidates/0")
+        .ok_or_else(|| shape("no candidates[0] in response"))?;
     if candidate.get("finishReason").and_then(Value::as_str) == Some("SAFETY") {
         return Err(AppError::new(
             Code::Blocked,
@@ -52,11 +56,19 @@ pub fn parse_general_response(body: &str, chunk: &Chunk) -> Result<ChunkTranscri
     let text = candidate
         .pointer("/content/parts/0/text")
         .and_then(Value::as_str)
-        .ok_or_else(shape)?;
+        .ok_or_else(|| shape("candidate has no content.parts[0].text"))?;
+    let finish_reason = candidate.get("finishReason").and_then(Value::as_str);
+    tracing::debug!(
+        finish_reason,
+        text_chars = text.chars().count(),
+        chunk_start_ms = chunk.start_ms,
+        chunk_duration_ms = chunk.duration_ms,
+        "Gemini transcription response received"
+    );
     let mut result = parse_general_text(text, chunk)?;
     if candidate.get("finishReason").and_then(Value::as_str) != Some("STOP") {
         if result.confirmed_silence {
-            return Err(shape());
+            return Err(shape("non-STOP finishReason with empty transcript"));
         }
         if result.unresolved.is_empty() {
             result.unresolved.push(MissingRange {
@@ -92,10 +104,12 @@ pub fn parse_general_text(text: &str, chunk: &Chunk) -> Result<ChunkTranscript, 
         .trim_end_matches("```")
         .trim();
     if clean.is_empty() {
-        return Err(shape());
+        return Err(shape("response text is empty"));
     }
     if let Ok(value) = serde_json::from_str::<Value>(clean) {
-        let items = value.as_array().ok_or_else(shape)?;
+        let items = value
+            .as_array()
+            .ok_or_else(|| shape("response JSON is not an array"))?;
         if items.is_empty() {
             return Ok(ChunkTranscript {
                 segments: vec![],
@@ -229,7 +243,7 @@ fn normalize(
         segments.push(item);
     }
     if segments.is_empty() {
-        return Err(shape());
+        return Err(shape("no valid segments after normalization"));
     }
     let mut unresolved = Vec::new();
     if incomplete {

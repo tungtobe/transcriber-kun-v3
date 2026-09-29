@@ -37,6 +37,9 @@ const UNAVAILABLE_ERROR: AppError = {
 
 export function createLiveStore() {
   let snapshot = $state<LiveSnapshot>({ ...EMPTY_SNAPSHOT });
+  // Phiên đã kết thúc mà người dùng rời đi: backend vẫn giữ snapshot 'stopped'
+  // của nó và gửi lại trong `ready` khi đăng ký lại, nên phải bỏ qua.
+  let dismissedSessionId: string | null = null;
   let finalizedSessionId = $state<string | null>(null);
   let sources = $state<LiveSources | null>(null);
   let sourceStatus = $state<'idle' | 'loading' | 'ready' | 'error'>('idle');
@@ -115,17 +118,24 @@ export function createLiveStore() {
   function applyEvent(event: LiveEvent, forGeneration: number): void {
     if (forGeneration !== generation) return;
     if (event.type === 'ready') {
-      const changedSession = snapshot.sessionId !== event.snapshot.sessionId;
-      snapshot = event.snapshot;
-      error = event.snapshot.errorCategory;
+      const incoming = event.snapshot.sessionId === dismissedSessionId
+        && event.snapshot.recording === 'stopped'
+        ? { ...EMPTY_SNAPSHOT }
+        : event.snapshot;
+      if (event.snapshot.sessionId && event.snapshot.sessionId !== dismissedSessionId) {
+        dismissedSessionId = null;
+      }
+      const changedSession = snapshot.sessionId !== incoming.sessionId;
+      snapshot = incoming;
+      error = incoming.errorCategory;
       if (changedSession) {
         finalizedSessionId = null;
         lines = [];
         draft = '';
       }
       lastSeq = event.seq;
-      if (event.snapshot.sessionId) {
-        void reloadPersistedLines(event.snapshot.sessionId, forGeneration);
+      if (incoming.sessionId) {
+        void reloadPersistedLines(incoming.sessionId, forGeneration);
       }
       return;
     }
@@ -337,7 +347,22 @@ export function createLiveStore() {
     if (error === 'permission') error = null;
   }
 
+  /** Phiên vừa kết thúc và đã lưu: dọn transcript/snapshot của nó để lần vào
+   * màn Live kế tiếp là màn khởi tạo phiên mới. Không đụng tới channel hay
+   * bộ đếm subscriber (AppShell vẫn theo dõi trạng thái Live). Phiên đang
+   * chạy hoặc bị lỗi ghi âm được giữ nguyên. */
+  function clearFinishedSession(): void {
+    if (snapshot.sessionId === null || snapshot.recording !== 'stopped') return;
+    dismissedSessionId = snapshot.sessionId;
+    finalizedSessionId = null;
+    snapshot = { ...EMPTY_SNAPSHOT };
+    lines = [];
+    draft = '';
+    error = null;
+  }
+
   function reset(): void {
+    dismissedSessionId = null;
     generation += 1;
     dropChannel();
     finalizedSessionId = null;
@@ -374,6 +399,7 @@ export function createLiveStore() {
     continueRecordingOnly,
     setSource,
     clearPermissionDenial,
+    clearFinishedSession,
     reset,
   };
 }

@@ -77,7 +77,7 @@ describe('Onboarding language step', () => {
     render(Onboarding);
 
     expect(screen.getByRole('radio', { name: /日本語/ })).toHaveProperty('checked', true);
-    expect(screen.getByRole('heading', { name: 'trans-kun へようこそ' })).toBeTruthy();
+    expect(screen.getByRole('heading', { name: 'Transcriber-kun へようこそ' })).toBeTruthy();
     expect(screen.getByText('システム言語')).toBeTruthy();
   });
 
@@ -87,7 +87,7 @@ describe('Onboarding language step', () => {
     await fireEvent.click(screen.getByRole('radio', { name: /日本語/ }));
 
     expect(mocks.settingsStore.setUiLanguage).toHaveBeenCalledWith('ja');
-    expect(await screen.findByRole('heading', { name: 'trans-kun へようこそ' })).toBeTruthy();
+    expect(await screen.findByRole('heading', { name: 'Transcriber-kun へようこそ' })).toBeTruthy();
     expect(screen.getByLabelText('セットアップの進行状況').textContent).toContain('データ');
     expect(document.documentElement.lang).toBe('ja');
   });

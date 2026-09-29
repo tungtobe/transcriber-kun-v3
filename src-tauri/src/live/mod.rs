@@ -449,6 +449,7 @@ impl LiveSessionActor {
     }
 
     async fn start(&mut self, params: LiveStartParams) -> Result<SessionId, AppError> {
+        tracing::debug!("Live start requested");
         if self.running.is_some() {
             return Err(AppError::new(
                 Code::Request,
@@ -462,12 +463,14 @@ impl LiveSessionActor {
             ));
         }
         if !params.consent.is_current() {
+            tracing::warn!("Live start refused: Gemini consent is not current");
             return Err(AppError::new(
                 Code::Blocked,
                 "Gemini Live requires current consent",
             ));
         }
         if !self.key_pool.has_eligible_key().await? {
+            tracing::warn!("Live start refused: no eligible Gemini credential");
             return Err(AppError::new(
                 Code::Auth,
                 "No configured Gemini key is available",
@@ -779,6 +782,18 @@ impl LiveSessionActor {
                     .is_some_and(|running| running.generation == generation);
                 if !current {
                     return;
+                }
+                match &result {
+                    Ok(()) => tracing::info!("Live gateway ended normally"),
+                    Err(crate::gemini::live::LiveFailure::Cancelled) => {
+                        tracing::debug!("Live gateway cancelled")
+                    }
+                    Err(crate::gemini::live::LiveFailure::Gateway(error)) => {
+                        tracing::warn!(error = %error, "Live gateway failed")
+                    }
+                    Err(crate::gemini::live::LiveFailure::SetupRejected) => {
+                        tracing::warn!("Live gateway setup rejected by Gemini")
+                    }
                 }
                 let emit_stopped = if let Some(running) = self.running.as_mut() {
                     let changed = running.connection != ConnectionState::Stopped;

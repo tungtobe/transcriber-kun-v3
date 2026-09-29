@@ -295,6 +295,7 @@
             onCreate={createHeaderTag}
             onDeleteTag={deleteHeaderTag}
             onClose={closeTagPicker}
+            anchor={addTagButtonRef}
           />
         {/if}
       </div>

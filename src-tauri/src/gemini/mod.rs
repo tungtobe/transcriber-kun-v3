@@ -368,15 +368,31 @@ impl GeminiTransport for ReqwestTransport {
                 builder = builder.body(body.into_inner());
             }
 
+            let started = Instant::now();
             let response = builder.send().await.map_err(map_reqwest_error)?;
             let status = response.status().as_u16();
             let body = response.text().await.map_err(map_reqwest_error)?;
+            tracing::debug!(
+                status,
+                body_bytes = body.len(),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "Gemini HTTP response"
+            );
             Ok(TransportResponse { status, body })
         })
     }
 }
 
 fn map_reqwest_error(error: reqwest::Error) -> TransportError {
+    // `without_url` để URL (có thể mang khoá API) không vào log; `redact` vẫn
+    // là lớp chặn thứ hai ở writer.
+    let error = error.without_url();
+    tracing::warn!(
+        timeout = error.is_timeout(),
+        connect = error.is_connect(),
+        error = %error,
+        "Gemini HTTP transport error"
+    );
     if error.is_timeout() {
         return TransportError::Timeout;
     }
@@ -759,6 +775,12 @@ impl GeminiGateway {
             };
 
             if let Some((outcome, error)) = classify_http_status(response.status) {
+                tracing::warn!(
+                    status = response.status,
+                    ?outcome,
+                    error = %error,
+                    "Gemini job request rejected"
+                );
                 match outcome {
                     RequestOutcome::Quota | RequestOutcome::Auth | RequestOutcome::Server => {
                         let request_id = lease.request_id.clone();

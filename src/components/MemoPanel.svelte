@@ -10,6 +10,7 @@
   // unmount khi đổi tab, cùng mẫu `NotesPanel`) -- `active` cho biết tab này
   // có đang thật sự hiển thị hay không, để `memoStore` biết khi nào cần bắn
   // toast thay vì chỉ âm thầm cập nhật state (spec Boundaries Always).
+  import { untrack } from 'svelte';
   import { commands } from '../lib/bindings';
   import { i18n } from '../i18n/index.svelte';
   import { errorHint, errorTitle } from '../lib/errors';
@@ -69,8 +70,12 @@
 
   $effect(() => {
     const id = selectedTemplateId;
-    if (!id || !transcriptId) return;
-    void memoStore.load(sessionId, id, transcriptId);
+    const tid = transcriptId;
+    const sid = sessionId;
+    if (!id || !tid) return;
+    // `untrack`: `load()` đọc rồi ghi `entries` đồng bộ -- nếu bị theo dõi,
+    // effect tự chạy lại vô hạn (`effect_update_depth_exceeded`) và treo màn.
+    untrack(() => void memoStore.load(sid, id, tid));
   });
 
   $effect(() => {

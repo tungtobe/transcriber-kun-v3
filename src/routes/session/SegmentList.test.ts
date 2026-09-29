@@ -22,6 +22,24 @@ function segments(): SegmentDetailView[] {
 }
 
 describe('SegmentList', () => {
+  it('hides the time column when showTime is false but keeps click-to-seek', async () => {
+    const onSeek = vi.fn();
+    render(SegmentList, {
+      segments: segments(),
+      currentTime: 0,
+      playing: false,
+      rerunStarting: false,
+      showTime: false,
+      onSeek,
+      onTogglePlay: vi.fn(),
+      onRerun: vi.fn(),
+    });
+
+    expect(document.querySelector('.segment-time')).toBeNull();
+    await fireEvent.click(screen.getByText('đoạn hai'));
+    expect(onSeek).toHaveBeenCalledWith(10);
+  });
+
   it('highlights only the segment whose [start, end) contains currentTime (acceptance: currentTime=12)', () => {
     render(SegmentList, {
       segments: segments(),

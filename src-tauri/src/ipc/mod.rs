@@ -1243,8 +1243,8 @@ async fn transcribe_rerun(
     track_ipc_error(&state.db, result).await
 }
 
-/// Transcribe the persisted audio of a finalized live session into its
-/// independent retranscribe variant. The registry owns queueing and cancel.
+/// Transcribe the persisted audio of a finalized live session and overwrite
+/// its single transcript. The registry owns queueing and cancel.
 #[tauri::command]
 #[specta::specta]
 async fn transcribe_recording(
@@ -1279,8 +1279,7 @@ async fn transcribe_recording(
                 db.with_connection(|conn| {
                     let session = repo::sessions::get(conn, session_id)?
                         .ok_or_else(|| AppError::new(Code::Request, "Phiên không tồn tại"))?;
-                    let expected_id =
-                        repo::transcripts::retranscribe_for_session(conn, session_id)?;
+                    let expected_id = repo::transcripts::primary_for_session(conn, session_id)?;
                     Ok((session, expected_id))
                 })
             }

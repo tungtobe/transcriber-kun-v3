@@ -62,7 +62,7 @@ use rusqlite_migration::{Migrations, M};
 /// `transcript_id` đã lưu với transcript `primary` hiện tại để suy
 /// `fromPreviousTranscript` -- một FK ở đây sẽ chặn chính transaction xoá
 /// đó. `notes_revision` để `NULL` khi Phiên chưa từng có ghi chú lúc sinh.
-static MIGRATIONS: [M; 8] = [
+static MIGRATIONS: [M; 9] = [
     M::up(
         "CREATE TABLE settings (\n\
              key TEXT PRIMARY KEY,\n\
@@ -168,6 +168,15 @@ static MIGRATIONS: [M; 8] = [
         "CREATE UNIQUE INDEX transcripts_one_retranscribe_per_session\n\
              ON transcripts (session_id) WHERE variant = 'retranscribe';",
     ),
+    // Mỗi Phiên chỉ còn một transcript: bản `retranscribe` (nếu có) là bản
+    // mới nhất nên thay `primary` cũ và trở thành `primary`. Ràng buộc/chỉ
+    // mục cũ giữ nguyên (schema không đổi), chỉ dữ liệu được chuyển.
+    M::up(
+        "DELETE FROM transcripts\n\
+             WHERE variant = 'primary'\n\
+               AND session_id IN (SELECT session_id FROM transcripts WHERE variant = 'retranscribe');\n\
+         UPDATE transcripts SET variant = 'primary' WHERE variant = 'retranscribe';",
+    ),
 ];
 
 fn runner() -> Migrations<'static> {
@@ -201,8 +210,8 @@ mod tests {
         let version_after_second: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version_after_first, 8);
-        assert_eq!(version_after_second, 8);
+        assert_eq!(version_after_first, 9);
+        assert_eq!(version_after_second, 9);
     }
 
     #[test]
@@ -250,6 +259,48 @@ mod tests {
             )
             .unwrap_err();
         assert!(err.to_string().to_lowercase().contains("check"));
+    }
+
+    #[test]
+    fn migration_9_promotes_retranscribe_over_primary_and_keeps_lone_primaries() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        runner().to_version(&mut conn, 8).unwrap();
+        for id in ["s1", "s2"] {
+            conn.execute(
+                "INSERT INTO sessions (id, kind, title, status, duration_sec, created_at, updated_at) \
+                 VALUES (?1, 'live', 't', 'complete', 1.0, 0, 0)",
+                [id],
+            )
+            .unwrap();
+        }
+        for (id, session, variant) in [
+            ("p1", "s1", "primary"),
+            ("r1", "s1", "retranscribe"),
+            ("p2", "s2", "primary"),
+        ] {
+            conn.execute(
+                "INSERT INTO transcripts (id, session_id, variant, status, model, created_at) \
+                 VALUES (?1, ?2, ?3, 'complete', 'm', 0)",
+                [id, session, variant],
+            )
+            .unwrap();
+        }
+        run(&mut conn).unwrap();
+        let rows: Vec<(String, String)> = conn
+            .prepare("SELECT id, variant FROM transcripts ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("p2".to_string(), "primary".to_string()),
+                ("r1".to_string(), "primary".to_string()),
+            ]
+        );
     }
 
     #[test]
@@ -377,7 +428,7 @@ mod tests {
         let version_after: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version_after, 8);
+        assert_eq!(version_after, 9);
         assert!(table_exists(&conn, "tags"));
         assert!(table_exists(&conn, "session_tags"));
         let title: String = conn

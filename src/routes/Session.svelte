@@ -14,6 +14,9 @@
   import SegmentList from './session/SegmentList.svelte';
   import Player from './session/Player.svelte';
   import JobProgress from './session/JobProgress.svelte';
+  import ExportMenu from '../components/ExportMenu.svelte';
+  import { CopyIcon } from '../components/icons';
+  import { recordingExportStore } from '../lib/stores/recordingExport.svelte';
   import IntakeNotices from '../components/IntakeNotices.svelte';
   import NotesPanel from '../components/NotesPanel.svelte';
   import MemoPanel from '../components/MemoPanel.svelte';
@@ -48,9 +51,6 @@
   let relinking = $state(false);
   let relinkMessage = $state<string | null>(null);
   let searchQuery = $state('');
-  let operationSource = $state<'live' | 'retranscribe'>('live');
-  let singleViewSource = $state<'live' | 'retranscribe'>('live');
-  let compareMode = $state(false);
   let activeMatchIndex = $state(-1);
   let searchInput = $state<HTMLInputElement | null>(null);
   let exporting = $state(false);
@@ -80,39 +80,28 @@
   // tab panel"), vì `$effect` cleanup của nó chỉ chạy lúc unmount/đổi Phiên.
   // Story 3.7: thêm tab thứ ba "Memo" cùng mẫu (panel luôn mount, ẩn bằng
   // CSS -- spec Code Map: "thêm tab `memo` cùng mẫu").
-  let asideTab = $state<'info' | 'notes' | 'memo'>('info');
+  let asideTab = $state<'notes' | 'memo'>('notes');
   let notesPanelRef = $state<{ flush: () => Promise<boolean> } | null>(null);
 
-  function switchAsideTab(tab: 'info' | 'notes' | 'memo'): void {
+  function switchAsideTab(tab: 'notes' | 'memo'): void {
     if (tab === asideTab) return;
     if (asideTab === 'notes') void notesPanelRef?.flush();
     asideTab = tab;
   }
 
-  const operationTranscript = $derived(view.kind === 'saved'
-    ? (operationSource === 'retranscribe' ? view.detail.retranscribe ?? view.detail.transcript : view.detail.transcript)
-    : null);
-  const visibleTranscript = $derived(view.kind === 'saved'
-    ? (singleViewSource === 'retranscribe' ? view.detail.retranscribe ?? view.detail.transcript : view.detail.transcript)
-    : null);
+  const currentTranscript = $derived(view.kind === 'saved' ? view.detail.transcript : null);
 
   const searchMatches = $derived.by(() => {
-    const segments = compareMode
-      ? (operationTranscript?.segments ?? [])
-      : (visibleTranscript?.segments ?? []);
-    return findTranscriptMatches(segments, searchQuery);
+    return findTranscriptMatches(currentTranscript?.segments ?? [], searchQuery);
   });
 
   $effect(() => {
     const query = searchQuery;
-    const transcriptId = compareMode ? (operationTranscript?.id ?? null) : (visibleTranscript?.id ?? null);
+    const transcriptId = currentTranscript?.id ?? null;
     if (query === previousSearchQuery && transcriptId === previousTranscriptId) return;
     previousSearchQuery = query;
     previousTranscriptId = transcriptId;
-    const segments = compareMode
-      ? (operationTranscript?.segments ?? [])
-      : (visibleTranscript?.segments ?? []);
-    activeMatchIndex = findTranscriptMatches(segments, query).length > 0 ? 0 : -1;
+    activeMatchIndex = findTranscriptMatches(currentTranscript?.segments ?? [], query).length > 0 ? 0 : -1;
   });
   const searchCountLabel = $derived(i18n.t('session.search.count', {
     current: activeMatchIndex >= 0 && searchMatches.length > 0 ? activeMatchIndex + 1 : 0,
@@ -138,7 +127,7 @@
   }
 
   function focusTranscriptSearch(): void {
-    if (view.kind !== 'saved' || (!view.detail.transcript && !view.detail.retranscribe)) return;
+    if (view.kind !== 'saved' || !view.detail.transcript) return;
     searchInput?.focus();
     searchInput?.select();
   }
@@ -273,12 +262,7 @@
     // displayed"). Everything below, and every in-flight async handler from
     // the previous session, compares against this new value from now on.
     const token = ++loadToken;
-    if (loadedRouteId !== id) {
-      operationSource = 'live';
-      singleViewSource = 'live';
-      compareMode = false;
-      loadedRouteId = id;
-    }
+    loadedRouteId = id;
     view = { kind: 'loading' };
     setSearchQuery('');
     transcriptActionError = null;
@@ -484,13 +468,10 @@
   {@const sessionId = view.sessionId}
   {@const detail = view.detail}
   {@const transcript = detail.transcript}
-  {@const retranscribe = detail.retranscribe}
-  {@const actionTranscript = operationSource === 'retranscribe' ? retranscribe ?? transcript : transcript}
-  {@const shownTranscript = singleViewSource === 'retranscribe' ? retranscribe ?? transcript : transcript}
-  {@const gapRanges = (shownTranscript?.segments ?? [])
+  {@const gapRanges = (transcript?.segments ?? [])
     .filter((s) => s.kind === 'gap' && s.gapReason === 'chunk_failed')
     .map((s) => ({ startSec: s.startSec ?? 0, endSec: s.endSec ?? 0 }))}
-  {@const segmentTextCount = (actionTranscript?.segments ?? []).filter((s) => s.kind === 'text').length}
+  {@const segmentTextCount = (transcript?.segments ?? []).filter((s) => s.kind === 'text').length}
   <section class="session-shell" aria-labelledby="session-title">
     <SessionHeader
       sessionId={sessionId}
@@ -511,7 +492,7 @@
       onRetranscribe={() => handleTranscribeRecording(sessionId)}
     />
 
-      {#if transcript || retranscribe}
+      {#if transcript}
         <div class="transcript-toolbar">
         <div class="transcript-search">
           <label for="transcript-search-input">{i18n.t('session.search.label')}</label>
@@ -543,30 +524,44 @@
           </button>
         </div>
         <div class="transcript-export-actions">
-          {#if retranscribe}
-            <label class="transcript-source-select">
-              <span>{i18n.t('session.source.label')}</span>
-              <select
-                aria-label={i18n.t('session.source.label')}
-                value={operationSource}
-                onchange={(event) => (operationSource = (event.currentTarget as HTMLSelectElement).value as 'live' | 'retranscribe')}
-              >
-                <option value="live">{i18n.t('session.source.live')}</option>
-                <option value="retranscribe">{i18n.t('session.source.retranscribe')}</option>
-              </select>
-            </label>
+          {#if detail.kind !== 'live' && transcript.status !== 'partial'}
+            <button
+              type="button"
+              class="transcript-toolbar-button"
+              disabled={rerunStarting || retranscribeStarting}
+              onclick={() => handleRerun(sessionId, transcript.id, { kind: 'all' })}
+            >
+              {i18n.t('session.action.rerunAll')}
+            </button>
+          {:else if detail.kind === 'live' && detail.recordingAvailable}
+            <button
+              type="button"
+              class="transcript-toolbar-button"
+              disabled={rerunStarting || retranscribeStarting}
+              onclick={() => handleTranscribeRecording(sessionId)}
+            >
+              {i18n.t('session.action.transcribeRecording')}
+            </button>
           {/if}
-          <button type="button" class="transcript-toolbar-button" disabled={exporting || !actionTranscript} onclick={() => actionTranscript && handleExportTranscript(sessionId, actionTranscript.id, 'txt')}>
-            {i18n.t('session.export.txt')}
-          </button>
-          <button type="button" class="transcript-toolbar-button" disabled={exporting || !actionTranscript} onclick={() => actionTranscript && handleExportTranscript(sessionId, actionTranscript.id, 'srt')}>
-            {i18n.t('session.export.srt')}
-          </button>
-          <button type="button" class="transcript-toolbar-button" disabled={exporting || !actionTranscript} onclick={() => actionTranscript && handleExportTranscript(sessionId, actionTranscript.id, 'json')}>
-            {i18n.t('session.export.json')}
-          </button>
-          <button type="button" class="transcript-toolbar-button transcript-copy-button" disabled={!actionTranscript} onclick={() => actionTranscript && handleCopyTranscript(actionTranscript)}>
-            {i18n.t('session.export.copy')}
+          <ExportMenu
+            disabled={exporting || !transcript}
+            onExport={(format) => transcript && handleExportTranscript(sessionId, transcript.id, format)}
+            onDownloadRecording={detail.kind === 'live' && detail.recordingAvailable
+              ? () => recordingExportStore.request(sessionId)
+              : undefined}
+            downloadDisabledReason={recordingExportStore.active
+              ? i18n.t('recordingExport.status.alreadyRunning')
+              : undefined}
+          />
+          <button
+            type="button"
+            class="transcript-icon-button"
+            aria-label={i18n.t('session.export.copy')}
+            title={i18n.t('session.export.copy')}
+            disabled={!transcript}
+            onclick={() => transcript && handleCopyTranscript(transcript)}
+          >
+            <CopyIcon size={18} strokeWidth={1.75} aria-hidden="true" />
           </button>
         </div>
         {#if retranscribeError}<p class="transcript-action-error" role="alert">{retranscribeError}</p>{/if}
@@ -581,90 +576,35 @@
 
     <div class="session-body">
       <div class="session-main">
-        {#if retranscribe}
-          <div class="transcript-view-controls">
-            <div class="transcript-view-buttons" role="group" aria-label={i18n.t('session.compare.label')}>
-              <button type="button" class:active={!compareMode && singleViewSource === 'live'} aria-pressed={!compareMode && singleViewSource === 'live'} onclick={() => { compareMode = false; singleViewSource = 'live'; }}>{i18n.t('session.source.live')}</button>
-              <button type="button" class:active={!compareMode && singleViewSource === 'retranscribe'} aria-pressed={!compareMode && singleViewSource === 'retranscribe'} onclick={() => { compareMode = false; singleViewSource = 'retranscribe'; }}>{i18n.t('session.source.retranscribe')}</button>
-              <button type="button" class:active={compareMode} aria-pressed={compareMode} onclick={() => (compareMode = true)}>{i18n.t('session.compare.sideBySide')}</button>
-            </div>
-            {#if compareMode}
-              <span class="transcript-offset">{i18n.t('session.compare.offset', { seconds: settingsStore.timestampOffsetSec })}</span>
-            {/if}
-          </div>
-        {/if}
-        {#if !compareMode && shownTranscript?.status === 'partial' && (detail.kind !== 'live' || shownTranscript.variant === 'retranscribe')}
+        {#if transcript?.status === 'partial'}
           <div class="session-partial-banner">
             <PartialBanner
               {gapRanges}
               starting={rerunStarting || retranscribeStarting}
               errorMessage={rerunError}
-              onRerun={(scope) => handleRerun(sessionId, shownTranscript?.id, scope)}
+              onRerun={(scope) => handleRerun(sessionId, transcript?.id, scope)}
             />
           </div>
         {/if}
-        {#if compareMode && transcript && retranscribe}
-          <div class="transcript-columns">
-            <section class="transcript-column" aria-label={i18n.t('session.source.live')}>
-              <h3>{i18n.t('session.source.live')}</h3>
-              <SegmentList
-                segments={transcript.segments}
-                {currentTime}
-                {playing}
-                matches={operationSource === 'live' ? searchMatches : []}
-                {activeMatchIndex}
-                rerunStarting={rerunStarting || retranscribeStarting}
-                rerunAvailable={false}
-                disconnectedHint={true}
-                onSeek={seekTo}
-                onTogglePlay={() => playerRef?.toggle()}
-                onRerun={(scope) => handleRerun(sessionId, transcript.id, scope)}
-              />
-            </section>
-            <section class="transcript-column" aria-label={i18n.t('session.source.retranscribe')}>
-              <h3>{i18n.t('session.source.retranscribe')}</h3>
-              <SegmentList
-                segments={retranscribe.segments}
-                {currentTime}
-                {playing}
-                matches={operationSource === 'retranscribe' ? searchMatches : []}
-                {activeMatchIndex}
-                rerunStarting={rerunStarting || retranscribeStarting}
-                rerunAvailable={true}
-                onSeek={seekTo}
-                onTogglePlay={() => playerRef?.toggle()}
-                onRerun={(scope) => handleRerun(sessionId, retranscribe.id, scope)}
-              />
-            </section>
-          </div>
-        {:else if shownTranscript}
+        {#if transcript}
           <SegmentList
-            segments={shownTranscript.segments}
+            segments={transcript.segments}
             matches={searchMatches}
             {activeMatchIndex}
             {currentTime}
             {playing}
             rerunStarting={rerunStarting || retranscribeStarting}
-            rerunAvailable={shownTranscript.variant === 'retranscribe' || detail.kind !== 'live'}
-            disconnectedHint={detail.kind === 'live' && shownTranscript.variant === 'primary'}
+            rerunAvailable={true}
+            showTime={detail.kind !== 'live'}
+            disconnectedHint={detail.kind === 'live'}
             onSeek={seekTo}
             onTogglePlay={() => playerRef?.toggle()}
-            onRerun={(scope) => handleRerun(sessionId, shownTranscript.id, scope)}
+            onRerun={(scope) => handleRerun(sessionId, transcript.id, scope)}
           />
         {/if}
       </div>
       <aside class="session-aside">
         <div class="session-aside-tabs" role="tablist" aria-label={i18n.t('session.aside.title')}>
-          <button
-            type="button"
-            role="tab"
-            aria-selected={asideTab === 'info'}
-            class="session-aside-tab"
-            class:active={asideTab === 'info'}
-            onclick={() => switchAsideTab('info')}
-          >
-            {i18n.t('session.aside.tabInfo')}
-          </button>
           <button
             type="button"
             role="tab"
@@ -686,26 +626,16 @@
             {i18n.t('session.aside.tabMemo')}
           </button>
         </div>
-        <div class="session-aside-panel" class:hidden-panel={asideTab !== 'info'}>
-          <dl>
-            <dt>{i18n.t('session.aside.source')}</dt>
-            <dd>{detail.sourceName ?? i18n.t('session.aside.unknown')}</dd>
-            <dt>{i18n.t('session.aside.model')}</dt>
-            <dd>{transcript?.model ?? i18n.t('session.aside.unknown')}</dd>
-            <dt>{i18n.t('session.aside.language')}</dt>
-            <dd>{transcript?.language ?? i18n.t('session.aside.languageAuto')}</dd>
-          </dl>
-        </div>
         <div class="session-aside-panel session-aside-notes" class:hidden-panel={asideTab !== 'notes'}>
           <NotesPanel bind:this={notesPanelRef} {sessionId} />
         </div>
         <div class="session-aside-panel session-aside-memo" class:hidden-panel={asideTab !== 'memo'}>
           <MemoPanel
             {sessionId}
-            transcriptId={actionTranscript?.id ?? null}
-            sourceVariant={operationSource === 'retranscribe' && retranscribe ? 'retranscribe' : 'primary'}
+            transcriptId={transcript?.id ?? null}
+            sourceVariant="primary"
             active={asideTab === 'memo'}
-            hasTranscript={actionTranscript != null}
+            hasTranscript={transcript != null}
             {segmentTextCount}
             onMemoAvailable={handleMemoAvailable}
           />
@@ -812,8 +742,12 @@
   .session-body {
     display: grid;
     grid-template-columns: minmax(0, 1fr) var(--panel-detail-width);
+    /* Hàng phải bị chặn bởi chiều cao còn lại: hàng `auto` mặc định co theo
+       nội dung nên transcript dài làm danh sách tràn xuống đè lên Player. */
+    grid-template-rows: minmax(0, 1fr);
     flex: 1;
     min-height: 0;
+    overflow: hidden;
   }
 
   .transcript-toolbar {
@@ -833,91 +767,6 @@
     flex-wrap: wrap;
     align-items: center;
     gap: var(--space-2);
-  }
-
-  .transcript-source-select {
-    display: inline-flex;
-    align-items: center;
-    gap: var(--space-2);
-    color: var(--color-text-secondary);
-    font-size: var(--text-help-size);
-  }
-
-  .transcript-source-select select {
-    min-height: 34px;
-    padding: 0 var(--space-2);
-    border: 1px solid var(--color-border-strong);
-    border-radius: var(--radius-md);
-    background: var(--color-surface);
-    color: var(--color-text);
-    font: inherit;
-  }
-
-  .transcript-view-controls {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: var(--space-3);
-    padding: var(--space-2) var(--space-4);
-    border-bottom: 1px solid var(--color-border);
-    background: var(--color-surface);
-  }
-
-  .transcript-view-buttons {
-    display: flex;
-    flex-wrap: wrap;
-    gap: var(--space-1);
-  }
-
-  .transcript-view-buttons button {
-    min-height: 32px;
-    padding: 0 var(--space-3);
-    border: 1px solid var(--color-border-strong);
-    border-radius: var(--radius-md);
-    background: var(--color-surface);
-    color: var(--color-text-secondary);
-    font: inherit;
-    font-size: var(--text-label-size);
-    cursor: pointer;
-  }
-
-  .transcript-view-buttons button.active {
-    border-color: var(--color-accent);
-    color: var(--color-text);
-    background: var(--color-accent-soft);
-  }
-
-  .transcript-offset {
-    color: var(--color-text-muted);
-    font-family: var(--font-mono);
-    font-size: var(--text-help-size);
-  }
-
-  .transcript-columns {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-    flex: 1;
-    min-height: 0;
-  }
-
-  .transcript-column {
-    display: flex;
-    min-width: 0;
-    min-height: 0;
-    flex-direction: column;
-  }
-
-  .transcript-column + .transcript-column {
-    border-left: 1px solid var(--color-border);
-  }
-
-  .transcript-column h3 {
-    flex: 0 0 auto;
-    margin: 0;
-    padding: var(--space-2) var(--space-4);
-    border-bottom: 1px solid var(--color-border);
-    color: var(--color-text-secondary);
-    font-size: var(--text-label-size);
   }
 
   .transcript-search label {
@@ -970,9 +819,30 @@
     opacity: 0.5;
   }
 
-  .transcript-copy-button {
-    border-color: var(--color-accent-border);
-    background: var(--color-accent-soft);
+  .transcript-icon-button {
+    display: grid;
+    width: 34px;
+    height: 34px;
+    place-items: center;
+    border: 1px solid var(--color-border-strong);
+    border-radius: var(--radius-md);
+    background: var(--color-surface);
+    color: var(--color-text);
+    cursor: pointer;
+  }
+
+  .transcript-icon-button:hover:not(:disabled) {
+    background: var(--color-surface-sunken);
+  }
+
+  .transcript-icon-button:disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
+  }
+
+  .transcript-icon-button:focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 2px;
   }
 
   .transcript-action-error {
@@ -994,21 +864,11 @@
     display: flex;
     flex-direction: column;
     min-height: 0;
-  }
-
-  @media (max-width: 820px) {
-    .transcript-columns {
-      grid-template-columns: 1fr;
-      grid-template-rows: minmax(0, 1fr) minmax(0, 1fr);
-    }
-
-    .transcript-column + .transcript-column {
-      border-top: 1px solid var(--color-border);
-      border-left: 0;
-    }
+    overflow: hidden;
   }
 
   .session-partial-banner {
+    flex: 0 0 auto;
     padding: var(--space-4) var(--space-4) 0;
   }
 
@@ -1061,23 +921,6 @@
     flex: 1;
     min-height: 0;
     flex-direction: column;
-  }
-
-  .session-aside dl {
-    display: grid;
-    gap: var(--space-1);
-    margin: 0;
-  }
-
-  .session-aside dt {
-    color: var(--color-text-muted);
-    font-size: var(--text-help-size);
-  }
-
-  .session-aside dd {
-    margin: 0 0 var(--space-3);
-    color: var(--color-text);
-    font-size: var(--text-body-size);
   }
 
   @media (max-width: 1279px) {

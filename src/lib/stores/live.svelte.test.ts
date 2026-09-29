@@ -140,6 +140,42 @@ describe('liveStore', () => {
     expect(store.snapshot.recording).toBe('stopped');
   });
 
+  it('clears a finished session so the next Live visit starts fresh, even when the backend resends it', async () => {
+    const { createLiveStore } = await import('./live.svelte');
+    const store = createLiveStore();
+    await store.subscribe();
+    const channel = channels[0];
+    channel.onmessage({ type: 'ready', seq: 0, snapshot: snapshot() });
+    channel.onmessage({ type: 'segment', seq: 1, segment: { startSec: 0, endSec: 1, text: 'cũ' } });
+    channel.onmessage({
+      type: 'final', seq: 2, sessionId: 'session-1', transcriptId: 'transcript-1', durationSec: 2,
+    });
+
+    store.clearFinishedSession();
+    expect(store.snapshot.sessionId).toBeNull();
+    expect(store.lines).toHaveLength(0);
+    expect(store.finalizedSessionId).toBeNull();
+
+    // The backend keeps the stopped snapshot and replays it on resubscribe.
+    channel.onmessage({
+      type: 'ready', seq: 3, snapshot: { ...snapshot(), recording: 'stopped' as const },
+    });
+    expect(store.snapshot.sessionId).toBeNull();
+
+    // A genuinely new session is accepted again.
+    channel.onmessage({ type: 'ready', seq: 4, snapshot: snapshot('session-2') });
+    expect(store.snapshot.sessionId).toBe('session-2');
+  });
+
+  it('does not clear a running session', async () => {
+    const { createLiveStore } = await import('./live.svelte');
+    const store = createLiveStore();
+    await store.subscribe();
+    channels[0].onmessage({ type: 'ready', seq: 0, snapshot: snapshot() });
+    store.clearFinishedSession();
+    expect(store.snapshot.sessionId).toBe('session-1');
+  });
+
   it('keeps permission denial scoped to the source that failed until the user rechecks it', async () => {
     const { createLiveStore } = await import('./live.svelte');
     const store = createLiveStore();

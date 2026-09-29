@@ -355,14 +355,90 @@ describe('Live failure handling', () => {
     expect(document.body.textContent).not.toContain('secret-key-and-url');
   });
 
-  it('shows a disconnected gap with both sample-clock endpoints inline', async () => {
+  it('opens the new-session setup when returning after the previous session ended', async () => {
+    backendSessionId = 'session-1';
+    const first = render(Live);
+    await waitFor(() => expect(channels).toHaveLength(1));
+    await act(() => {
+      channels[0].onmessage({
+        type: 'segment', seq: 1, segment: { startSec: 0, endSec: 1, text: 'phiên cũ' },
+      });
+      channels[0].onmessage({ type: 'recording', seq: 2, state: 'stopped' });
+    });
+    await waitFor(() => expect(screen.getByText('phiên cũ')).toBeTruthy());
+    first.unmount();
+
+    // The backend keeps the stopped snapshot and replays it on subscribe.
+    mocks.liveSubscribe.mockImplementation((channel: FakeChannel<LiveEvent>) => {
+      channels.push(channel);
+      channel.onmessage({ type: 'ready', seq: 3, snapshot: { ...snapshot(), recording: 'stopped' } });
+      return Promise.resolve({ status: 'ok', data: null });
+    });
+    render(Live);
+    await waitFor(() => expect(screen.getByRole('button', { name: /Start/i })).toBeTruthy());
+    expect(screen.queryByText('phiên cũ')).toBeNull();
+    expect(document.querySelector('.live-toolbar')).toBeNull();
+  });
+
+  it('shows a disconnected gap without any timestamps', async () => {
     backendSessionId = 'session-1';
     render(Live);
     await waitFor(() => expect(channels).toHaveLength(1));
     channels[0].onmessage({
       type: 'gap', seq: 1, startSec: 12, endSec: 18, reason: 'disconnected',
     });
-    await waitFor(() => expect(screen.getByText('Connection lost 00:12–00:18')).toBeTruthy());
-    expect(screen.getByText('Connection lost 00:12–00:18').closest('.gap-line')).toBeTruthy();
+    await waitFor(() => expect(screen.getByText('Connection lost')).toBeTruthy());
+    expect(screen.getByText('Connection lost').closest('.gap-line')).toBeTruthy();
+    expect(document.body.textContent).not.toContain('00:12');
+  });
+
+  it('renders transcript lines and the interim draft without a time label', async () => {
+    backendSessionId = 'session-1';
+    render(Live);
+    await waitFor(() => expect(channels).toHaveLength(1));
+    await act(() => {
+      channels[0].onmessage({
+        type: 'segment', seq: 1, segment: { startSec: 12, endSec: 15, text: 'xin chào' },
+      });
+    });
+    await waitFor(() => expect(screen.getByText('xin chào')).toBeTruthy());
+    expect(document.querySelector('.transcript-list time')).toBeNull();
+    expect(document.body.textContent).not.toContain('00:12');
+  });
+
+  it('keeps the source pickers and the stop button outside the scrolling transcript card', async () => {
+    backendSessionId = 'session-1';
+    render(Live);
+    await waitFor(() => expect(channels).toHaveLength(1));
+    const toolbar = document.querySelector('.live-toolbar');
+    expect(toolbar).not.toBeNull();
+    expect(toolbar!.querySelector('select')).not.toBeNull();
+    expect(document.querySelector('.transcript-card select')).toBeNull();
+    expect(document.querySelector('.transcript-card .button-danger-soft')).toBeNull();
+  });
+
+  it('auto-scrolls the transcript to the newest line and stops once the user scrolls up', async () => {
+    backendSessionId = 'session-1';
+    render(Live);
+    await waitFor(() => expect(channels).toHaveLength(1));
+    const list = document.querySelector('.transcript-list') as HTMLElement;
+    Object.defineProperty(list, 'scrollHeight', { configurable: true, get: () => 1000 });
+    await act(() => {
+      channels[0].onmessage({
+        type: 'segment', seq: 1, segment: { startSec: 0, endSec: 2, text: 'một' },
+      });
+    });
+    await waitFor(() => expect(list.scrollTop).toBe(1000));
+
+    list.scrollTop = 200;
+    await fireEvent.scroll(list);
+    Object.defineProperty(list, 'scrollHeight', { configurable: true, get: () => 2000 });
+    await act(() => {
+      channels[0].onmessage({
+        type: 'segment', seq: 2, segment: { startSec: 2, endSec: 4, text: 'hai' },
+      });
+    });
+    await waitFor(() => expect(screen.getByText('hai')).toBeTruthy());
+    expect(list.scrollTop).toBe(200);
   });
 });

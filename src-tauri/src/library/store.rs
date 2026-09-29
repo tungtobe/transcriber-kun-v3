@@ -1011,7 +1011,6 @@ pub struct SessionDetail {
     pub recording_available: bool,
     pub proxy_path: Option<String>,
     pub transcript: Option<TranscriptDetail>,
-    pub retranscribe: Option<TranscriptDetail>,
     /// Tag đang gắn với Phiên này (story 3.2) — tên tăng dần
     /// (`library::tags::list_for_session`). Không phụ thuộc
     /// tên/transcript: đổi tên hay Chạy lại không đụng tới danh sách này
@@ -1086,14 +1085,9 @@ pub fn get_detail(
                 }))
             })
         };
-    let (primary_id, retranscribe_id) = db.with_connection(|conn| {
-        Ok((
-            repo::transcripts::primary_for_session(conn, session_id)?,
-            repo::transcripts::retranscribe_for_session(conn, session_id)?,
-        ))
-    })?;
+    let primary_id =
+        db.with_connection(|conn| Ok(repo::transcripts::primary_for_session(conn, session_id)?))?;
     let transcript = load_transcript(primary_id)?;
-    let retranscribe = load_transcript(retranscribe_id)?;
 
     let tags = crate::library::tags::list_for_session(db, session_id)?;
     let has_memo =
@@ -1112,7 +1106,6 @@ pub fn get_detail(
         source_name: session.source_name,
         proxy_path,
         transcript,
-        retranscribe,
         tags,
         has_memo,
     }))
@@ -1351,8 +1344,8 @@ pub fn swap_transcript(
     Ok(swapped.then_some(new_id))
 }
 
-/// Publish a complete candidate only if the current retranscribe variant is
-/// still the one observed when the job began. The transaction also checks
+/// Ghi đè transcript của Phiên live bằng bản transcribe lại từ Recording,
+/// chỉ khi transcript hiện tại vẫn là bản đã thấy lúc Job bắt đầu. The transaction also checks
 /// that the live session still exists and is finalized.
 pub fn commit_retranscribe(
     db: &Db,
@@ -1370,21 +1363,14 @@ pub fn commit_retranscribe(
         if session.kind != "live" || session.status != "complete" {
             return Ok(false);
         }
-        let current = repo::transcripts::retranscribe_for_session(&tx, session_id)?;
+        let current = repo::transcripts::primary_for_session(&tx, session_id)?;
         if current != expected_id {
             return Ok(false);
         }
-        if let Some(old_id) = current {
-            tx.execute(
-                "DELETE FROM transcripts WHERE id = ?1",
-                [old_id.to_string()],
-            )?;
-        }
-        repo::transcripts::insert_with_segments(
+        repo::transcripts::replace_primary(
             &tx,
-            new_id,
             session_id,
-            repo::transcripts::Variant::Retranscribe,
+            new_id,
             &draft.model,
             draft.language.as_deref(),
             &draft.segments,

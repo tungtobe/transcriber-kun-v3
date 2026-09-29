@@ -28,3 +28,5 @@ export { default as EllipsisVerticalIcon } from '@lucide/svelte/icons/ellipsis-v
 export { default as SearchIcon } from '@lucide/svelte/icons/search';
 export { default as TagIcon } from '@lucide/svelte/icons/tag';
 export { default as Trash2Icon } from '@lucide/svelte/icons/trash-2';
+export { default as DownloadIcon } from '@lucide/svelte/icons/download';
+export { default as CopyIcon } from '@lucide/svelte/icons/copy';

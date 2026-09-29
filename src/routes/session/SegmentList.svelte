@@ -31,6 +31,7 @@
     activeMatchIndex = -1,
     rerunStarting,
     rerunAvailable = true,
+    showTime = true,
     disconnectedHint = false,
     onSeek,
     onTogglePlay,
@@ -45,6 +46,8 @@
     activeMatchIndex?: number;
     rerunStarting: boolean;
     rerunAvailable?: boolean;
+    /** `false` ẩn cột thời gian (transcript của phiên Live). */
+    showTime?: boolean;
     disconnectedHint?: boolean;
     onSeek: (startSec: number) => void;
     onTogglePlay: () => void;
@@ -191,13 +194,14 @@
       {#if segment.kind === 'gap'}
         <div
           class="segment-row segment-row-gap"
+          class:segment-row-no-time={!showTime}
           class:segment-row-gap-failed={segment.gapReason === 'chunk_failed'}
           class:segment-row-active={activeIndex === index}
           class:segment-row-search-active={hasCurrentSearchMatch(index)}
           aria-current={activeIndex === index ? 'true' : undefined}
           use:registerRow={index}
         >
-          <span class="segment-time">{displayTimestamp(sec(segment.startSec))}</span>
+          {#if showTime}<span class="segment-time">{displayTimestamp(sec(segment.startSec))}</span>{/if}
           <div class="segment-gap-body">
             <span class="segment-gap-label">
               {segment.gapReason === 'chunk_failed'
@@ -223,6 +227,7 @@
       {:else}
         <div
           class="segment-row"
+          class:segment-row-no-time={!showTime}
           class:segment-row-active={activeIndex === index}
           class:segment-row-search-active={hasCurrentSearchMatch(index)}
           role="button"
@@ -237,7 +242,7 @@
             }
           }}
         >
-          <span class="segment-time">{displayTimestamp(sec(segment.startSec))}</span>
+          {#if showTime}<span class="segment-time">{displayTimestamp(sec(segment.startSec))}</span>{/if}
           <p class="segment-text">
             {#each textParts(index, segment.text) as part}
               {#if part.matched}
@@ -266,14 +271,17 @@
 <style>
   .segment-list-wrap {
     position: relative;
+    display: flex;
     min-height: 0;
     flex: 1;
+    flex-direction: column;
   }
 
   .segment-list {
     display: flex;
+    min-height: 0;
+    flex: 1;
     flex-direction: column;
-    height: 100%;
     overflow-y: auto;
   }
 
@@ -283,6 +291,10 @@
     gap: var(--space-3);
     padding: var(--space-2) var(--space-4);
     cursor: pointer;
+  }
+
+  .segment-row-no-time {
+    grid-template-columns: 1fr;
   }
 
   .segment-row[role~='button']:focus-visible {

@@ -171,15 +171,17 @@ describe('AppShell', () => {
   });
 
   it.each([
-    ['en', 'Primary navigation sidebar', 'Home', 'quiet utility'],
-    ['ja', 'メインナビゲーションのサイドバー', 'ホーム', '静かなユーティリティ'],
-  ] as const)('renders shell copy and landmarks in %s', (locale, navLabel, heading, caption) => {
+    ['en', 'Primary navigation sidebar', 'Home'],
+    ['ja', 'メインナビゲーションのサイドバー', 'ホーム'],
+  ] as const)('renders shell copy and landmarks in %s', (locale, navLabel, heading) => {
     i18n.applyPreference(locale);
     render(AppShell);
 
     expect(screen.getByRole('complementary', { name: navLabel })).toBeTruthy();
     expect(screen.getByRole('heading', { name: heading })).toBeTruthy();
-    expect(screen.getByText(caption)).toBeTruthy();
+    expect(screen.getByText('Transcriber-kun', { selector: '.brand-name' })).toBeTruthy();
+    expect(document.querySelector('.brand-caption')).toBeNull();
+    expect(document.querySelector('img.brand-mark')).not.toBeNull();
   });
 
   describe('drag-and-drop intake (story 2.8)', () => {

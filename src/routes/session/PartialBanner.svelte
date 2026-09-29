@@ -95,8 +95,10 @@
     display: flex;
     flex-wrap: wrap;
     gap: var(--space-1) var(--space-3);
+    max-height: 4.5rem;
     margin: var(--space-1) 0 0;
     padding: 0;
+    overflow-y: auto;
     list-style: none;
     color: var(--color-text-secondary);
     font-family: var(--font-mono);

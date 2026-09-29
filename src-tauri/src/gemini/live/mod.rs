@@ -2619,12 +2619,21 @@ impl LiveSocketConnector for GeminiLiveSocketConnector {
             url.query_pairs_mut().append_pair("key", api_key.expose());
             match tokio_tungstenite::connect_async(url.as_str()).await {
                 Ok((socket, _)) => {
+                    tracing::debug!("Gemini Live WebSocket connected");
                     Ok(Box::new(TungsteniteLiveSocket { socket }) as Box<dyn LiveSocket>)
                 }
                 Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                    tracing::warn!(
+                        status = response.status().as_u16(),
+                        "Gemini Live WebSocket handshake rejected"
+                    );
                     Err(LiveConnectError::HttpStatus(response.status().as_u16()))
                 }
-                Err(_) => Err(LiveConnectError::Transport),
+                Err(err) => {
+                    // Display của lỗi tungstenite không chứa URL/khoá.
+                    tracing::warn!(error = %err, "Gemini Live WebSocket connect failed");
+                    Err(LiveConnectError::Transport)
+                }
             }
         })
     }
@@ -2639,9 +2648,15 @@ fn decode_frame(frame: Message) -> Result<LiveReceiveMessage, LiveTransportError
         Message::Binary(bytes) => String::from_utf8(bytes.to_vec())
             .map(LiveReceiveMessage::Text)
             .map_err(|_| LiveTransportError),
-        Message::Close(frame) => Ok(LiveReceiveMessage::Closed {
-            code: frame.map(|frame| u16::from(frame.code)),
-        }),
+        Message::Close(frame) => {
+            tracing::debug!(
+                code = frame.as_ref().map(|frame| u16::from(frame.code)),
+                "Gemini Live WebSocket close frame"
+            );
+            Ok(LiveReceiveMessage::Closed {
+                code: frame.map(|frame| u16::from(frame.code)),
+            })
+        }
         Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => Ok(LiveReceiveMessage::Activity),
     }
 }

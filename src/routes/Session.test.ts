@@ -182,10 +182,14 @@ function detail(overrides: Record<string, unknown> = {}) {
       language: null,
       segments: [textSegment(0, 0, 10, 'xin chào'), textSegment(1, 10, 20, 'các bạn')],
     },
-    retranscribe: null,
     tags: [],
     ...overrides,
   };
+}
+
+async function exportAs(label: string): Promise<void> {
+  await fireEvent.click(await screen.findByRole('button', { name: 'Tải xuống' }));
+  await fireEvent.click(await screen.findByRole('menuitem', { name: label }));
 }
 
 describe('Session route', () => {
@@ -206,7 +210,7 @@ describe('Session route', () => {
   // Story 3.5 spec Boundaries Always: "Panel là tab 'Ghi chú' trong aside 360
   // px ... tab còn lại giữ thông tin hiện có" + "Flush ... khi đổi tab
   // panel".
-  it('switches between the Thông tin and Ghi chú aside tabs, flushing notes when leaving Ghi chú', async () => {
+  it('opens on the Ghi chú tab with no Thông tin tab, and flushes notes when switching to Memo', async () => {
     mocks.librarySessionGet.mockResolvedValue({
       status: 'ok',
       data: { kind: 'session', sessionId: 's1', title: 'cuộc họp', durationSec: 120, status: 'complete', partial: false, transcriptId: 't1' },
@@ -216,14 +220,13 @@ describe('Session route', () => {
     render(Session, { routeParams: { id: 's1' } });
     await screen.findByRole('heading', { name: 'cuộc họp' });
 
-    // "Thông tin" hiện sẵn theo mặc định.
-    expect(screen.getByText('meeting.wav')).toBeTruthy();
+    expect(screen.queryByRole('tab', { name: 'Thông tin' })).toBeNull();
+    expect(screen.getByRole('tab', { name: 'Ghi chú' }).getAttribute('aria-selected')).toBe('true');
 
-    await fireEvent.click(screen.getByRole('tab', { name: 'Ghi chú' }));
     const textarea = await screen.findByPlaceholderText('Ghi chú riêng cho phiên này…');
     await fireEvent.input(textarea, { target: { value: 'ghi chú mới' } });
 
-    await fireEvent.click(screen.getByRole('tab', { name: 'Thông tin' }));
+    await fireEvent.click(screen.getByRole('tab', { name: 'Memo' }));
 
     await waitFor(() => expect(mocks.notesSave).toHaveBeenCalledWith('s1', 'ghi chú mới', 1));
   });
@@ -356,7 +359,7 @@ describe('Session route', () => {
     });
     render(Session, { routeParams: { id: 's1' } });
 
-    await fireEvent.click(await screen.findByRole('button', { name: 'Xuất TXT' }));
+    await exportAs('Xuất TXT');
     expect(mocks.libraryTranscriptExport).toHaveBeenCalledWith('s1', 't1', 'txt', 42, VI_GAP_LABELS);
     expect(screen.queryByText('Đã lưu transcript.')).toBeNull();
     expect(screen.queryByRole('alert')).toBeNull();
@@ -375,39 +378,74 @@ describe('Session route', () => {
       .mockResolvedValueOnce({ status: 'error', error: { category: 'storage', code: 'storage', detailRedacted: 'disk full' } });
     render(Session, { routeParams: { id: 's1' } });
 
-    await fireEvent.click(await screen.findByRole('button', { name: 'Xuất SRT' }));
+    await exportAs('Xuất SRT');
     expect(await screen.findByText('Đã lưu SRT. Các khoảng thiếu không được đưa vào phụ đề.')).toBeTruthy();
-    await fireEvent.click(screen.getByRole('button', { name: 'Xuất JSON' }));
+    await exportAs('Xuất JSON');
     expect((await screen.findByRole('alert')).textContent).toContain('Không thể xuất transcript.');
     expect(screen.queryByText('Đã lưu transcript.')).toBeNull();
   });
 
-  it('keeps the action source independent from the visible comparison pane', async () => {
-    const alternate = {
-      ...detail().transcript,
-      id: 't2',
-      variant: 'retranscribe',
-      segments: [textSegment(0, 7, 10, 'từ recording')],
-    };
+  it('shows a single transcript for a live session: no source picker or comparison view', async () => {
     mocks.librarySessionGet.mockResolvedValue({
       status: 'ok',
       data: { kind: 'session', sessionId: 's1', title: 'cuộc họp', durationSec: 120, status: 'complete', partial: false, transcriptId: 't1' },
     });
-    mocks.librarySessionDetail.mockResolvedValue({ status: 'ok', data: detail({ kind: 'live', retranscribe: alternate }) });
+    mocks.librarySessionDetail.mockResolvedValue({ status: 'ok', data: detail({ kind: 'live', recordingAvailable: true }) });
     render(Session, { routeParams: { id: 's1' } });
 
-    const sources = await screen.findAllByRole('combobox', { name: 'Nguồn cho thao tác' });
-    await fireEvent.change(sources[0], { target: { value: 'retranscribe' } });
-    await fireEvent.click(screen.getByRole('button', { name: 'So sánh cạnh nhau' }));
-    expect(screen.getByRole('region', { name: 'Bản live' })).toBeTruthy();
-    expect(screen.getByRole('region', { name: 'Bản từ Recording' })).toBeTruthy();
-    expect(screen.getByText('Offset thời gian: +0s')).toBeTruthy();
+    await screen.findByRole('heading', { name: 'cuộc họp' });
+    expect(screen.queryByRole('combobox', { name: 'Nguồn cho thao tác' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'So sánh cạnh nhau' })).toBeNull();
+    await exportAs('Xuất TXT');
+    expect(mocks.libraryTranscriptExport).toHaveBeenCalledWith('s1', 't1', 'txt', 0, VI_GAP_LABELS);
+  });
 
-    await fireEvent.click(screen.getByRole('button', { name: 'Xuất TXT' }));
-    expect(mocks.libraryTranscriptExport).toHaveBeenCalledWith('s1', 't2', 'txt', 0, VI_GAP_LABELS);
-    await fireEvent.click(screen.getByRole('button', { name: /từ recording/ }));
-    expect(screen.getByRole('slider', { name: 'Tua' }).getAttribute('aria-valuenow')).toBe('7');
-    expect((screen.getAllByRole('combobox', { name: 'Nguồn cho thao tác' })[0] as HTMLSelectElement).value).toBe('retranscribe');
+  it('lists the recording audio in the download menu only for a live session that has one', async () => {
+    mocks.librarySessionGet.mockResolvedValue({
+      status: 'ok',
+      data: { kind: 'session', sessionId: 's1', title: 'cuộc họp', durationSec: 120, status: 'complete', partial: false, transcriptId: 't1' },
+    });
+    mocks.librarySessionDetail.mockResolvedValue({ status: 'ok', data: detail({ kind: 'live', recordingAvailable: true }) });
+    const live = render(Session, { routeParams: { id: 's1' } });
+
+    await fireEvent.click(await screen.findByRole('button', { name: 'Tải xuống' }));
+    expect(await screen.findByRole('menuitem', { name: 'Tải file audio recording' })).toBeTruthy();
+    expect(screen.getAllByRole('menuitem').map((item) => item.textContent?.trim())).toEqual([
+      'Xuất TXT', 'Xuất SRT', 'Xuất JSON', 'Tải file audio recording',
+    ]);
+    live.unmount();
+
+    mocks.librarySessionDetail.mockResolvedValue({ status: 'ok', data: detail() });
+    render(Session, { routeParams: { id: 's1' } });
+    await fireEvent.click(await screen.findByRole('button', { name: 'Tải xuống' }));
+    expect(await screen.findByRole('menuitem', { name: 'Xuất TXT' })).toBeTruthy();
+    expect(screen.queryByRole('menuitem', { name: 'Tải file audio recording' })).toBeNull();
+  });
+
+  it('offers a full rerun on a successful file session and starts it with scope all', async () => {
+    mocks.librarySessionGet.mockResolvedValue({
+      status: 'ok',
+      data: { kind: 'session', sessionId: 's1', title: 'cuộc họp', durationSec: 120, status: 'complete', partial: false, transcriptId: 't1' },
+    });
+    mocks.librarySessionDetail.mockResolvedValue({ status: 'ok', data: detail() });
+    mocks.transcribeRerun.mockResolvedValue({ status: 'ok', data: { kind: 'started', jobId: 'job-all' } });
+    render(Session, { routeParams: { id: 's1' } });
+
+    await fireEvent.click(await screen.findByRole('button', { name: 'Transcribe lại toàn bộ' }));
+    expect(mocks.transcribeRerun).toHaveBeenCalledWith('s1', 't1', { kind: 'all' });
+  });
+
+  it('offers Recording retranscribe on a successful live session from the toolbar', async () => {
+    mocks.librarySessionGet.mockResolvedValue({
+      status: 'ok',
+      data: { kind: 'session', sessionId: 's1', title: 'cuộc họp', durationSec: 120, status: 'complete', partial: false, transcriptId: 't1' },
+    });
+    mocks.librarySessionDetail.mockResolvedValue({ status: 'ok', data: detail({ kind: 'live', recordingAvailable: true }) });
+    mocks.transcribeRecording.mockResolvedValue({ status: 'ok', data: { kind: 'started', jobId: 'job-recording' } });
+    render(Session, { routeParams: { id: 's1' } });
+
+    await fireEvent.click(await screen.findByRole('button', { name: 'Transcribe lại từ Recording' }));
+    expect(mocks.transcribeRecording).toHaveBeenCalledWith('s1');
   });
 
   it('starts a cancellable Recording retranscribe from the session menu', async () => {
@@ -451,25 +489,23 @@ describe('Session route', () => {
     expect(screen.queryByRole('button', { name: /Chạy lại khoảng này/ })).toBeNull();
   });
 
-  it('retries a failed retranscribe gap against its retranscribe ID', async () => {
-    const alternate = {
-      ...detail().transcript,
-      id: 't2',
-      variant: 'retranscribe',
-      status: 'partial',
-      segments: [gapSegment(4, 30, 40, 'chunk_failed')],
-    };
+  it('retries a failed chunk gap of a live session against its only transcript', async () => {
     mocks.librarySessionGet.mockResolvedValue({
       status: 'ok',
       data: { kind: 'session', sessionId: 's1', title: 'cuộc họp', durationSec: 120, status: 'complete', partial: false, transcriptId: 't1' },
     });
-    mocks.librarySessionDetail.mockResolvedValue({ status: 'ok', data: detail({ kind: 'live', retranscribe: alternate }) });
+    mocks.librarySessionDetail.mockResolvedValue({
+      status: 'ok',
+      data: detail({
+        kind: 'live',
+        transcript: { ...detail().transcript, status: 'partial', segments: [gapSegment(4, 30, 40, 'chunk_failed')] },
+      }),
+    });
     mocks.transcribeRerun.mockResolvedValue({ status: 'ok', data: { kind: 'started', jobId: 'job-gap' } });
     render(Session, { routeParams: { id: 's1' } });
 
-    await fireEvent.click((await screen.findAllByRole('button', { name: 'Bản từ Recording' }))[0]);
     await fireEvent.click(await screen.findByRole('button', { name: /Chạy lại khoảng này/ }));
-    expect(mocks.transcribeRerun).toHaveBeenCalledWith('s1', 't2', { kind: 'gap', gapId: 4 });
+    expect(mocks.transcribeRerun).toHaveBeenCalledWith('s1', 't1', { kind: 'gap', gapId: 4 });
   });
 
   it('shows a partial banner listing the chunk_failed ranges, with two rerun buttons', async () => {
@@ -723,12 +759,12 @@ describe('Session route', () => {
     mocks.libraryTranscriptExport.mockReturnValue(pendingExport);
 
     const { rerender } = render(Session, { routeParams: { id: 's1' } });
-    const exportButtonA = await screen.findByRole('button', { name: 'Xuất TXT' });
-    await fireEvent.click(exportButtonA);
+    const exportButtonA = await screen.findByRole('button', { name: 'Tải xuống' });
+    await exportAs('Xuất TXT');
     expect((exportButtonA as HTMLButtonElement).disabled).toBe(true);
 
     await rerender({ routeParams: { id: 's2' } });
-    const exportButtonB = await screen.findByRole('button', { name: 'Xuất TXT' });
+    const exportButtonB = await screen.findByRole('button', { name: 'Tải xuống' });
     expect((exportButtonB as HTMLButtonElement).disabled).toBe(false);
 
     resolveExport({ status: 'ok', data: { saved: true, hasGaps: false } });

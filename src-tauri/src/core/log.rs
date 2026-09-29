@@ -94,6 +94,18 @@ fn build_non_blocking_writer(log_dir: &Path) -> io::Result<(NonBlocking, WorkerG
     Ok(tracing_appender::non_blocking(writer))
 }
 
+/// Bộ lọc mặc định: code của app ghi từ mức DEBUG (chỉ metadata — trạng thái,
+/// mã lỗi, đếm; không transcript/audio/khoá, và mọi dòng vẫn qua [`redact`]),
+/// thư viện ngoài từ INFO, `symphonia` từ WARN vì rất ồn khi probe file.
+/// Đặt biến môi trường `RUST_LOG` (ví dụ `RUST_LOG=trace` hoặc
+/// `RUST_LOG=trans_kun_lib::gemini=trace,info`) để ghi đè khi cần debug sâu.
+const DEFAULT_LOG_FILTER: &str = "info,trans_kun_lib=debug,symphonia=warn";
+
+fn default_env_filter() -> tracing_subscriber::EnvFilter {
+    tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(DEFAULT_LOG_FILTER))
+}
+
 /// Khởi tạo `tracing` ghi ra file xoay vòng hằng ngày trong `log_dir`, giữ
 /// tối đa [`MAX_LOG_FILES`] file, qua lớp redaction, và cài làm subscriber
 /// toàn cục của app. Trả về `WorkerGuard`: người gọi phải giữ giá trị này
@@ -116,6 +128,7 @@ pub fn init_file_logging(log_dir: &Path) -> io::Result<WorkerGuard> {
     // hưởng việc guard mới ở đây có ghi được ra file riêng của nó
     // (`non_blocking` ghi trực tiếp, không qua subscriber toàn cục).
     let _ = tracing_subscriber::fmt()
+        .with_env_filter(default_env_filter())
         .with_writer(non_blocking)
         .with_ansi(false)
         .try_init();

@@ -8,10 +8,9 @@
   } from '../components/TagPicker.svelte';
   import { AlertTriangleIcon, RadioIcon, RefreshCwIcon, TagIcon } from '../components/icons';
   import { i18n } from '../i18n/index.svelte';
-  import { formatTimestamp } from '../lib/time';
   import { registerKeymap } from '../lib/keymap';
   import { commands, type PermissionState, type TranscribeLanguage } from '../lib/bindings';
-  import { liveStore, type LiveLine } from '../lib/stores/live.svelte';
+  import { liveStore } from '../lib/stores/live.svelte';
   import { keysStore } from '../lib/stores/keys.svelte';
   import { libraryStore } from '../lib/stores/library.svelte';
   import { settingsStore } from '../lib/stores/settings.svelte';
@@ -76,6 +75,8 @@
   );
 
   onMount(() => {
+    // Vào lại màn Live sau khi phiên trước đã kết thúc -> màn phiên mới.
+    if (!stopPending) liveStore.clearFinishedSession();
     void keysStore.load();
     void libraryStore.loadTags();
     void liveStore.loadSources(true);
@@ -98,12 +99,14 @@
     microphone = liveStore.sources?.defaultMicrophone ?? microphones[0].source;
   });
 
+  // Đọc `lines`/`draft` để effect chạy lại mỗi khi có nội dung mới; effect
+  // chạy sau khi DOM đã cập nhật nên `scrollHeight` đã gồm dòng mới.
   $effect(() => {
-    if (!isRunning) return;
-    if (!autoScroll) return;
-    if (transcriptEl && typeof transcriptEl.scrollTo === 'function') {
-      transcriptEl.scrollTo({ top: transcriptEl.scrollHeight, behavior: 'smooth' });
-    }
+    void liveStore.lines.length;
+    void liveStore.draft;
+    if (!isRunning || !autoScroll || !transcriptEl) return;
+    transcriptEl.scrollTop = transcriptEl.scrollHeight;
+    previousScrollTop = transcriptEl.scrollTop;
   });
 
   $effect(() => {
@@ -320,21 +323,12 @@
 
   function scrollToLatest(): void {
     autoScroll = true;
-    if (transcriptEl && typeof transcriptEl.scrollTo === 'function') {
-      transcriptEl.scrollTo({ top: transcriptEl.scrollHeight, behavior: 'smooth' });
-    }
+    if (transcriptEl) transcriptEl.scrollTop = transcriptEl.scrollHeight;
     previousScrollTop = transcriptEl?.scrollTop ?? previousScrollTop;
   }
 
-  function lineTime(line: LiveLine): string {
-    const sec = line.kind === 'segment' ? line.segment.startSec : line.startSec;
-    return sec === null ? '—' : formatTimestamp(sec);
-  }
-
-  function gapRange(line: Extract<LiveLine, { kind: 'gap' }>): string {
-    const start = line.startSec === null ? '—' : formatTimestamp(line.startSec);
-    const end = line.endSec === null ? '—' : formatTimestamp(line.endSec);
-    return i18n.t('live.transcript.gapRange', { start, end });
+  function gapLabel(): string {
+    return i18n.t('live.transcript.gapRange');
   }
 
   function formatElapsed(totalSeconds: number): string {
@@ -357,7 +351,7 @@
   <title>{i18n.t('live.header.title')} · trans-kun</title>
 </svelte:head>
 
-<section class="live-screen" aria-labelledby="live-title" aria-busy={stopPending} data-ad-slot-hidden="true">
+<section class="live-screen" class:live-active={hasSession} aria-labelledby="live-title" aria-busy={stopPending} data-ad-slot-hidden="true">
   <div class="live-heading">
     <div>
       <p class="route-kicker">{i18n.t('live.header.kicker')}</p>
@@ -585,39 +579,41 @@
       {/if}
     </div>
   {:else}
+    <div class="live-toolbar" aria-label={i18n.t('live.config.source')}>
+      <div class="live-toolbar-controls">
+        <label class="compact-source">
+          <span class="sr-only">{i18n.t('live.config.source')}</span>
+          <select value={sourceMode} onchange={changeSource} disabled={sourcePending}>
+            <option value="mixed">{i18n.t('live.source.mixed')}</option>
+            <option value="system">{i18n.t('live.source.system')}</option>
+            <option value="microphone">{i18n.t('live.source.microphone')}</option>
+          </select>
+        </label>
+        {#if sourceMode !== 'system'}
+          <label class="compact-source">
+            <span class="sr-only">{i18n.t('live.config.microphone')}</span>
+            <select value={microphone} onchange={changeMicrophone} disabled={sourcePending || microphones.length === 0}>
+              {#each microphones as mic (mic.source)}
+                <option value={mic.source}>{mic.name}</option>
+              {/each}
+            </select>
+          </label>
+        {/if}
+        {#if isRunning}
+          <button class="button button-danger-soft" type="button" disabled={stopPending} onclick={() => void stop()}>
+            {stopPending ? i18n.t('live.recording.stopping') : i18n.t('live.recording.stop')}
+          </button>
+        {:else}
+          <button class="button button-secondary" type="button" onclick={() => liveStore.reset()}>
+            {i18n.t('live.config.newSession')}
+          </button>
+        {/if}
+      </div>
+    </div>
     <div class="live-layout">
       <section class="transcript-card" aria-label={i18n.t('live.transcript.label')}>
         <header class="transcript-header">
           <h2>{i18n.t('live.transcript.title')}</h2>
-          <div class="transcript-controls">
-            <label class="compact-source">
-              <span class="sr-only">{i18n.t('live.config.source')}</span>
-              <select value={sourceMode} onchange={changeSource} disabled={sourcePending}>
-                <option value="mixed">{i18n.t('live.source.mixed')}</option>
-                <option value="system">{i18n.t('live.source.system')}</option>
-                <option value="microphone">{i18n.t('live.source.microphone')}</option>
-              </select>
-            </label>
-            {#if sourceMode !== 'system'}
-              <label class="compact-source">
-                <span class="sr-only">{i18n.t('live.config.microphone')}</span>
-                <select value={microphone} onchange={changeMicrophone} disabled={sourcePending || microphones.length === 0}>
-                  {#each microphones as mic (mic.source)}
-                    <option value={mic.source}>{mic.name}</option>
-                  {/each}
-                </select>
-              </label>
-            {/if}
-            {#if isRunning}
-              <button class="button button-danger-soft" type="button" disabled={stopPending} onclick={() => void stop()}>
-                {stopPending ? i18n.t('live.recording.stopping') : i18n.t('live.recording.stop')}
-              </button>
-            {:else}
-              <button class="button button-secondary" type="button" onclick={() => liveStore.reset()}>
-                {i18n.t('live.config.newSession')}
-              </button>
-            {/if}
-          </div>
         </header>
 
         <div
@@ -629,19 +625,17 @@
           aria-live="polite"
           aria-relevant="additions text"
         >
-          {#each liveStore.lines as line (line.seq)}
+          {#each liveStore.lines as line, index (index)}
             <article class:gap-line={line.kind === 'gap'} class="transcript-line">
               {#if line.kind === 'segment'}
-                <time class="mono">{lineTime(line)}</time>
                 <p>{line.segment.text}</p>
               {:else}
-                <p>{gapRange(line)}</p>
+                <p>{gapLabel()}</p>
               {/if}
             </article>
           {/each}
           {#if liveStore.draft}
             <article class="transcript-line interim-line">
-              <time class="mono">{i18n.t('live.transcript.now')}</time>
               <p>{liveStore.draft}<span class="live-caret" aria-hidden="true">▍</span></p>
             </article>
           {:else if liveStore.snapshot.transcription !== 'active' && liveStore.lines.length === 0}
@@ -679,6 +673,13 @@
 
 <style>
   .live-screen { max-width: 1120px; margin: 0 auto; padding: var(--space-8); }
+  /* Phiên đang chạy: màn cao đúng khung nhìn, thanh điều khiển cố định ở trên
+     và chỉ danh sách transcript cuộn (để auto-scroll có tác dụng). */
+  .live-screen.live-active { display:flex; height:100%; min-height:520px; box-sizing:border-box; flex-direction:column; }
+  .live-screen.live-active > * { flex:0 0 auto; }
+  .live-screen.live-active > .live-layout { flex:1 1 0; min-height:280px; }
+  .live-toolbar { display:flex; align-items:center; justify-content:flex-end; margin-bottom:var(--space-4); padding:var(--space-3) var(--space-4); border:1px solid var(--color-border); border-radius:var(--radius-xl); background:var(--color-surface); }
+  .live-toolbar-controls { display:flex; flex-wrap:wrap; align-items:center; justify-content:flex-end; gap:var(--space-2); }
   .save-overlay { position:fixed; inset:0; z-index:1000; display:grid; place-items:center; padding:var(--space-4); background:rgb(15 23 42 / 38%); }
   .save-overlay-card { display:flex; align-items:center; gap:var(--space-3); padding:var(--space-4) var(--space-5); border:1px solid var(--color-border); border-radius:var(--radius-lg); background:var(--color-surface); color:var(--color-text); box-shadow:0 10px 32px rgb(17 24 39 / 12%); font-weight:600; }
   .save-spinner { display:inline-flex; color:var(--color-accent); animation:save-spin 1s linear infinite; }
@@ -742,15 +743,13 @@
   .reconnect-banner { border-color:var(--color-warning); background:var(--color-warning-soft); }
   .recording-only-banner { border-color:var(--color-accent); background:var(--color-accent-soft); }
   .setup-rejected-banner { align-items:center; }
-  .live-layout { display:grid; grid-template-columns:minmax(0,1.7fr) minmax(260px,.8fr); align-items:stretch; gap:var(--space-4); min-height:540px; }
-  .transcript-card { position:relative; display:flex; min-height:500px; flex-direction:column; overflow:hidden; }
+  .live-layout { display:grid; grid-template-columns:minmax(0,1.7fr) minmax(260px,.8fr); align-items:stretch; gap:var(--space-4); min-height:240px; grid-template-rows:minmax(0,1fr); }
+  .transcript-card { position:relative; display:flex; min-height:0; flex-direction:column; overflow:hidden; }
   .transcript-header { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:var(--space-3); padding:var(--space-4) var(--space-5); border-bottom:1px solid var(--color-border); }
   .transcript-header h2 { margin:0; }
-  .transcript-controls { display:flex; flex-wrap:wrap; align-items:center; gap:var(--space-2); }
-  .compact-source select { min-height:34px; max-width:170px; padding-inline:var(--space-2); font-size:var(--text-help-size); }
-  .transcript-list { flex:1; min-height:0; overflow:auto; padding:var(--space-4) var(--space-5); scroll-behavior:smooth; }
-  .transcript-line { display:grid; grid-template-columns:64px minmax(0,1fr); gap:var(--space-3); padding:var(--space-3) 0; border-bottom:1px solid var(--color-border); }
-  .transcript-line time { padding-top:3px; color:var(--color-text-muted); font-size:var(--text-help-size); }
+    .compact-source select { min-height:34px; max-width:170px; padding-inline:var(--space-2); font-size:var(--text-help-size); }
+  .transcript-list { flex:1; min-height:0; overflow:auto; padding:var(--space-4) var(--space-5); }
+  .transcript-line { display:block; padding:var(--space-3) 0; border-bottom:1px solid var(--color-border); }
   .transcript-line p { margin:0; white-space:pre-wrap; line-height:1.65; }
   .gap-line { display:block; margin-block:var(--space-2); padding:var(--space-3); border-radius:var(--radius-md); background:var(--color-surface-sunken); color:var(--color-text-muted); font-style:italic; }
   .interim-line { color:var(--color-text-secondary); }
@@ -766,7 +765,7 @@
   @keyframes caret-blink { 50% { opacity:0; } }
   @keyframes save-spin { to { transform:rotate(360deg); } }
   @keyframes recording-pulse { 50% { opacity:.3; transform:scale(1.5); } }
-  @media (prefers-reduced-motion: reduce) { .live-caret, .status-recording .status-dot, .save-spinner { animation:none; } .transcript-list { scroll-behavior:auto; } }
+  @media (prefers-reduced-motion: reduce) { .live-caret, .status-recording .status-dot, .save-spinner { animation:none; } }
   @media (max-width: 900px) { .live-layout { grid-template-columns:1fr; } .notes-card { min-height:280px; } }
   @media (max-width: 650px) { .live-screen { padding:var(--space-4); } .setup-grid, .source-options { grid-template-columns:1fr; } .source-card { min-height:84px; } .live-heading { flex-direction:column; } .setup-actions { align-items:flex-start; flex-direction:column; } }
 </style>

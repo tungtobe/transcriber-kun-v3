@@ -600,6 +600,7 @@ impl JobRegistryActor {
         }
 
         let job_id = JobId::new();
+        tracing::info!(%job_id, "Transcribe job queued");
         let session_id = SessionId::new();
         let will_run_now = self.order.is_empty();
         let entry = JobEntry {
@@ -832,6 +833,13 @@ impl JobRegistryActor {
     }
 
     fn handle_finished(&mut self, job_id: JobId, outcome: JobOutcome) {
+        match &outcome {
+            JobOutcome::Committed(_) => tracing::info!(%job_id, "Transcribe job committed"),
+            JobOutcome::Cancelled => tracing::info!(%job_id, "Transcribe job cancelled"),
+            JobOutcome::Error(error) => {
+                tracing::warn!(%job_id, error = %error, "Transcribe job failed")
+            }
+        }
         self.order.retain(|id| *id != job_id);
         self.jobs.remove(&job_id);
 
@@ -2950,7 +2958,6 @@ mod tests {
         db: &Db,
         session_id: SessionId,
         primary_id: TranscriptId,
-        retranscribe_id: Option<TranscriptId>,
     ) -> PathBuf {
         let recording_path = paths::recording_path(root, session_id);
         std::fs::create_dir_all(recording_path.parent().unwrap()).unwrap();
@@ -2982,18 +2989,6 @@ mod tests {
                 &[rerun_text_draft(0.0, 1.0, "live source")],
                 0,
             )?;
-            if let Some(id) = retranscribe_id {
-                repo::transcripts::insert_with_segments(
-                    conn,
-                    id,
-                    session_id,
-                    Variant::Retranscribe,
-                    "old-model",
-                    None,
-                    &[rerun_text_draft(0.0, 1.0, "old recording transcript")],
-                    0,
-                )?;
-            }
             Ok(())
         })
         .unwrap();
@@ -3016,14 +3011,30 @@ mod tests {
         }
     }
 
+    fn primary_of(db: &Db, session_id: SessionId) -> Option<TranscriptId> {
+        db.with_connection(|conn| Ok(repo::transcripts::primary_for_session(conn, session_id)?))
+            .unwrap()
+    }
+
+    fn transcript_count(db: &Db, session_id: SessionId) -> i64 {
+        db.with_connection(|conn| {
+            Ok(conn.query_row(
+                "SELECT count(*) FROM transcripts WHERE session_id = ?1",
+                [session_id.to_string()],
+                |row| row.get(0),
+            )?)
+        })
+        .unwrap()
+    }
+
     #[tokio::test]
-    async fn recording_retranscribe_publishes_first_and_repeat_variants_without_touching_live() {
+    async fn recording_retranscribe_overwrites_the_single_live_transcript_each_time() {
         let root = tempdir().unwrap();
         let db = Arc::new(Db::open(root.path()).unwrap());
         seed_current_consent(&db);
         let session_id = SessionId::new();
         let primary_id = TranscriptId::new();
-        let source = seed_live_retranscribe_session(root.path(), &db, session_id, primary_id, None);
+        let source = seed_live_retranscribe_session(root.path(), &db, session_id, primary_id);
         let transcriber = FakeTranscriber::new(vec![
             Behavior::Success("first recording transcript".to_string()),
             Behavior::Success("replacement recording transcript".to_string()),
@@ -3033,20 +3044,19 @@ mod tests {
 
         assert!(matches!(
             handle
-                .start_retranscribe(retranscribe_params(session_id, None, source.clone()))
+                .start_retranscribe(retranscribe_params(
+                    session_id,
+                    Some(primary_id),
+                    source.clone()
+                ))
                 .await
                 .unwrap(),
             RerunOutcome::Started { .. }
         ));
         wait_until_empty(&handle, Duration::from_secs(5)).await;
-        let first_id = db
-            .with_connection(|conn| {
-                Ok(repo::transcripts::retranscribe_for_session(
-                    conn, session_id,
-                )?)
-            })
-            .unwrap()
-            .unwrap();
+        let first_id = primary_of(&db, session_id).unwrap();
+        assert_ne!(first_id, primary_id, "live transcript is replaced");
+        assert_eq!(transcript_count(&db, session_id), 1);
 
         assert!(matches!(
             handle
@@ -3056,30 +3066,9 @@ mod tests {
             RerunOutcome::Started { .. }
         ));
         wait_until_empty(&handle, Duration::from_secs(5)).await;
-        let current_id = db
-            .with_connection(|conn| {
-                Ok(repo::transcripts::retranscribe_for_session(
-                    conn, session_id,
-                )?)
-            })
-            .unwrap()
-            .unwrap();
+        let current_id = primary_of(&db, session_id).unwrap();
         assert_ne!(current_id, first_id);
-        let count: i64 = db
-            .with_connection(|conn| {
-                Ok(conn.query_row(
-            "SELECT count(*) FROM transcripts WHERE session_id = ?1 AND variant = 'retranscribe'",
-            [session_id.to_string()],
-            |row| row.get(0),
-        )?)
-            })
-            .unwrap();
-        assert_eq!(count, 1);
-        let primary = db
-            .with_connection(|conn| Ok(repo::transcripts::get(conn, primary_id)?))
-            .unwrap()
-            .unwrap();
-        assert_eq!(primary.variant, Variant::Primary);
+        assert_eq!(transcript_count(&db, session_id), 1);
         let text = db
             .with_connection(|conn| {
                 Ok(repo::segments::list_for_transcript(conn, current_id)?[0]
@@ -3091,20 +3080,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recording_retranscribe_partial_commits_gap_and_cancel_keeps_old_variant() {
+    async fn recording_retranscribe_partial_commits_gap_and_cancel_keeps_current_transcript() {
         let root = tempdir().unwrap();
         let db = Arc::new(Db::open(root.path()).unwrap());
         seed_current_consent(&db);
         let session_id = SessionId::new();
         let primary_id = TranscriptId::new();
-        let old_retranscribe_id = TranscriptId::new();
-        let source = seed_live_retranscribe_session(
-            root.path(),
-            &db,
-            session_id,
-            primary_id,
-            Some(old_retranscribe_id),
-        );
+        let source = seed_live_retranscribe_session(root.path(), &db, session_id, primary_id);
         let transcriber = FakeTranscriber::new(vec![
             Behavior::Fail {
                 code: Code::Network,
@@ -3119,7 +3101,7 @@ mod tests {
             handle
                 .start_retranscribe(retranscribe_params(
                     session_id,
-                    Some(old_retranscribe_id),
+                    Some(primary_id),
                     source.clone()
                 ))
                 .await
@@ -3127,15 +3109,8 @@ mod tests {
             RerunOutcome::Started { .. }
         ));
         wait_until_empty(&handle, Duration::from_secs(5)).await;
-        let partial_id = db
-            .with_connection(|conn| {
-                Ok(repo::transcripts::retranscribe_for_session(
-                    conn, session_id,
-                )?)
-            })
-            .unwrap()
-            .unwrap();
-        assert_ne!(partial_id, old_retranscribe_id);
+        let partial_id = primary_of(&db, session_id).unwrap();
+        assert_ne!(partial_id, primary_id);
         let partial = db
             .with_connection(|conn| Ok(repo::transcripts::get(conn, partial_id)?))
             .unwrap()
@@ -3163,21 +3138,11 @@ mod tests {
         handle.cancel(job_id).await.unwrap();
         wait_until_empty(&handle, Duration::from_secs(3)).await;
         assert_eq!(
-            db.with_connection(|conn| Ok(repo::transcripts::retranscribe_for_session(
-                conn, session_id
-            )?))
-            .unwrap(),
+            primary_of(&db, session_id),
             Some(partial_id),
-            "cancel leaves the published retranscribe variant intact"
+            "cancel leaves the current transcript intact"
         );
-        assert_eq!(
-            db.with_connection(|conn| Ok(repo::transcripts::primary_for_session(
-                conn, session_id
-            )?))
-            .unwrap(),
-            Some(primary_id),
-            "recording retranscribe never replaces live primary"
-        );
+        assert_eq!(transcript_count(&db, session_id), 1);
     }
 
     #[tokio::test]

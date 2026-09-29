@@ -136,8 +136,8 @@ export const commands = {
 	 */
 	transcribeRerun: (sessionId: string, transcriptId: string, scope: RerunScope) => typedError<TranscribeRerunOutcome, AppError>(__TAURI_INVOKE("transcribe_rerun", { sessionId, transcriptId, scope })),
 	/**
-	 *  Transcribe the persisted audio of a finalized live session into its
-	 *  independent retranscribe variant. The registry owns queueing and cancel.
+	 *  Transcribe the persisted audio of a finalized live session and overwrite
+	 *  its single transcript. The registry owns queueing and cancel.
 	 */
 	transcribeRecording: (sessionId: string) => typedError<TranscribeRerunOutcome, AppError>(__TAURI_INVOKE("transcribe_recording", { sessionId })),
 	/**
@@ -178,7 +178,6 @@ export const commands = {
 	recordingAvailable: boolean,
 	proxyPath: string | null,
 	transcript: TranscriptDetail | null,
-	retranscribe: TranscriptDetail | null,
 	/**
 	 *  Tag đang gắn với Phiên này (story 3.2) — tên tăng dần
 	 *  (`library::tags::list_for_session`). Không phụ thuộc
@@ -831,7 +830,6 @@ export type SessionDetail = {
 	recordingAvailable: boolean,
 	proxyPath: string | null,
 	transcript: TranscriptDetail | null,
-	retranscribe: TranscriptDetail | null,
 	/**
 	 *  Tag đang gắn với Phiên này (story 3.2) — tên tăng dần
 	 *  (`library::tags::list_for_session`). Không phụ thuộc

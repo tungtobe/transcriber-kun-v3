@@ -39,7 +39,7 @@ describe('i18n runtime', () => {
 
     expect(store.locale).toBe('vi');
     expect(store.t('settings.meta.title', { group: '<b>Chung</b>' }))
-      .toBe('<b>Chung</b> · Cài đặt · trans-kun');
+      .toBe('<b>Chung</b> · Cài đặt · Transcriber-kun');
     expect(document.documentElement.lang).toBe('vi');
     expect(localStorage.getItem('trans-kun.ui-language')).toBe('vi');
   });

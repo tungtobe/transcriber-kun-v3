@@ -19,6 +19,7 @@
   import { onDragDropEvent, type DragDropEvent } from '../lib/dragdrop';
   import { i18n } from '../i18n/index.svelte';
   import type { Theme } from '../lib/bindings';
+  import appIcon from '../assets/app-icon.png';
   import CloseConfirm from './CloseConfirm.svelte';
   import DropOverlay from './DropOverlay.svelte';
   import JobCard from './JobCard.svelte';
@@ -107,10 +108,9 @@
 <div class="app-shell">
   <aside class="sidebar" aria-label={i18n.t('app.shell.primaryNavLabel')}>
     <div class="brand-lockup">
-      <span class="brand-mark" aria-hidden="true">tk</span>
+      <img class="brand-mark" src={appIcon} alt="" aria-hidden="true" />
       <div>
-        <p class="brand-name">trans-kun</p>
-        <p class="brand-caption">{i18n.t('app.shell.brandCaption')}</p>
+        <p class="brand-name">Transcriber-kun</p>
       </div>
     </div>
 
@@ -174,7 +174,7 @@
   <div class="shell-content">
     <header class="app-header">
       <div>
-        <p class="header-kicker">trans-kun</p>
+        <p class="header-kicker">Transcriber-kun</p>
         <h1>{pageTitle}</h1>
       </div>
 
@@ -262,21 +262,15 @@
   }
 
   .brand-mark {
-    display: grid;
+    display: block;
     width: 32px;
     height: 32px;
-    place-items: center;
+    flex: 0 0 auto;
     border-radius: var(--radius-md);
-    background: var(--color-primary-action);
-    color: var(--color-on-primary);
-    font-family: var(--font-mono);
-    font-size: var(--text-help-size);
-    font-weight: 600;
-    letter-spacing: -0.05em;
+    object-fit: cover;
   }
 
   .brand-name,
-  .brand-caption,
   .header-kicker,
   .version-label,
   .version-value {
@@ -288,7 +282,6 @@
     font-weight: 600;
   }
 
-  .brand-caption,
   .header-kicker,
   .version-label {
     color: var(--color-text-muted);
