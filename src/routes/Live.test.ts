@@ -18,6 +18,7 @@ const mocks = vi.hoisted(() => ({
   liveContinueRecordingOnly: vi.fn(),
   liveSetSource: vi.fn(),
   liveSetTarget: vi.fn(),
+  liveRedetect: vi.fn(),
   liveOpenPermissionSettings: vi.fn(),
   keysLoad: vi.fn(),
   tagsLoad: vi.fn(),
@@ -44,6 +45,7 @@ vi.mock('../lib/bindings', () => ({
     liveContinueRecordingOnly: (...args: unknown[]) => mocks.liveContinueRecordingOnly(...args),
     liveSetSource: (...args: unknown[]) => mocks.liveSetSource(...args),
     liveSetTarget: (...args: unknown[]) => mocks.liveSetTarget(...args),
+    liveRedetect: (...args: unknown[]) => mocks.liveRedetect(...args),
     liveOpenPermissionSettings: (...args: unknown[]) => mocks.liveOpenPermissionSettings(...args),
   },
 }));
@@ -128,6 +130,7 @@ beforeEach(() => {
   mocks.liveContinueRecordingOnly.mockReset().mockResolvedValue({ status: 'ok', data: null });
   mocks.liveSetSource.mockReset().mockResolvedValue({ status: 'ok', data: null });
   mocks.liveSetTarget.mockReset().mockResolvedValue({ status: 'ok', data: null });
+  mocks.liveRedetect.mockReset().mockResolvedValue({ status: 'ok', data: null });
   mocks.liveOpenPermissionSettings.mockReset().mockResolvedValue({ status: 'ok', data: null });
   mocks.keysLoad.mockReset().mockResolvedValue(undefined);
   mocks.tagsLoad.mockReset().mockResolvedValue(undefined);
@@ -544,5 +547,29 @@ describe('Live translation', () => {
     expect(select.value).toBe('vi');
     // A model-side failure also raises the in-place banner with the Settings link.
     expect(screen.getByText('The selected Live model is unavailable.')).toBeTruthy();
+  });
+  it('re-detects the language when auto and shows a light banner when it fails', async () => {
+    backendSessionId = 'session-1';
+    mocks.liveRedetect.mockResolvedValueOnce({
+      status: 'error',
+      error: { category: 'network', code: 'network', detailRedacted: 'raw' },
+    });
+    render(Live);
+    await screen.findByRole('button', { name: 'Stop recording' });
+    await fireEvent.click(screen.getByRole('button', { name: 'Re-detect language' }));
+    await waitFor(() => expect(screen.getByText(/Could not re-detect the language/)).toBeTruthy());
+    expect(screen.queryByText('raw')).toBeNull();
+    await fireEvent.click(screen.getByRole('button', { name: 'Re-detect language' }));
+    await waitFor(() => expect(mocks.liveRedetect).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.queryByText(/Could not re-detect the language/)).toBeNull());
+  });
+
+  it('hides Re-detect when the session language is fixed', async () => {
+    render(Live);
+    await waitFor(() => expect((screen.getByRole('button', { name: 'Start recording' }) as HTMLButtonElement).disabled).toBe(false));
+    await fireEvent.change(screen.getByLabelText('Transcript language'), { target: { value: 'ja' } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Start recording' }));
+    await screen.findByRole('button', { name: 'Stop recording' });
+    expect(screen.queryByRole('button', { name: 'Re-detect language' })).toBeNull();
   });
 });

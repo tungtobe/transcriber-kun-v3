@@ -36,6 +36,12 @@ export const commands = {
 	 */
 	liveSetTarget: (target: LiveTarget) => typedError<null, AppError>(__TAURI_INVOKE("live_set_target", { target })),
 	/**
+	 *  Re-detects the spoken language (only while the session language is
+	 *  `auto`): opens a fresh generation with an empty context. A failure keeps
+	 *  the current connection.
+	 */
+	liveRedetect: () => typedError<null, AppError>(__TAURI_INVOKE("live_redetect")),
+	/**
 	 *  Starts the one process-wide Live session. Consent and model preferences
 	 *  are captured from the durable Rust settings snapshot before capture opens.
 	 */

@@ -239,6 +239,20 @@ async fn live_set_target(
     track_ipc_error(&state.db, result).await
 }
 
+/// Re-detects the spoken language (only while the session language is
+/// `auto`): opens a fresh generation with an empty context. A failure keeps
+/// the current connection.
+#[tauri::command]
+#[specta::specta]
+async fn live_redetect(state: tauri::State<'_, AppState>) -> Result<(), AppError> {
+    let result = async {
+        let live = state.live.clone()?;
+        live.redetect().await
+    }
+    .await;
+    track_ipc_error(&state.db, result).await
+}
+
 /// Starts the one process-wide Live session. Consent and model preferences
 /// are captured from the durable Rust settings snapshot before capture opens.
 #[tauri::command]
@@ -2847,6 +2861,7 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             live_open_permission_settings,
             live_set_source,
             live_set_target,
+            live_redetect,
             live_start,
             live_stop,
             live_continue_recording_only,
