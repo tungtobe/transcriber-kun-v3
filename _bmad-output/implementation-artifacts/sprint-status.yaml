@@ -73,19 +73,19 @@ development_status:
   3-7-sinh-cache-và-sinh-lại-memo: review
   epic-3-retrospective: optional
 
-  epic-4: in-progress
-  4-1-nền-capture-audio-nguồn-mic-trộn-và-gate-mềm: review
-  4-2-capture-âm-thanh-hệ-thống-trên-macos-core-audio-tap-spike-s4: review
-  4-3-capture-âm-thanh-hệ-thống-trên-windows-wasapi-loopback-kép: review
-  4-4-gemini-live-transport-websocket-resumption-và-reconnect-spik: review
-  4-5-recording-bền-và-tạo-phiên-live-khi-mở-capture: review
-  4-6-livesession-transcript-realtime-và-trạng-thái: review
-  4-7-màn-live-bắt-đầu-và-đang-ghi: review
-  4-8-live-mất-kết-nối-lỗi-setup-và-trạng-thái-lỗi-trên-giao-diện: review
-  4-9-dừng-live-và-lưu-phiên: review
-  4-10-boot-và-đóng-cửa-sổ-phục-hồi-phiên-mồ-côi-chặn-thoát: review
-  4-11-transcribe-lại-từ-recording-và-xem-cạnh-bản-live: review
-  4-12-tải-recording-wav-hoặc-flac: review
+  epic-4: done
+  4-1-nền-capture-audio-nguồn-mic-trộn-và-gate-mềm: done
+  4-2-capture-âm-thanh-hệ-thống-trên-macos-core-audio-tap-spike-s4: done
+  4-3-capture-âm-thanh-hệ-thống-trên-windows-wasapi-loopback-kép: done
+  4-4-gemini-live-transport-websocket-resumption-và-reconnect-spik: done
+  4-5-recording-bền-và-tạo-phiên-live-khi-mở-capture: done
+  4-6-livesession-transcript-realtime-và-trạng-thái: done
+  4-7-màn-live-bắt-đầu-và-đang-ghi: done
+  4-8-live-mất-kết-nối-lỗi-setup-và-trạng-thái-lỗi-trên-giao-diện: done
+  4-9-dừng-live-và-lưu-phiên: done
+  4-10-boot-và-đóng-cửa-sổ-phục-hồi-phiên-mồ-côi-chặn-thoát: done
+  4-11-transcribe-lại-từ-recording-và-xem-cạnh-bản-live: done
+  4-12-tải-recording-wav-hoặc-flac: done
   epic-4-retrospective: optional
 
   epic-5: backlog

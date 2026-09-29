@@ -37,3 +37,10 @@ Split follows the epic 2 precedent: P0 = data loss, hang, privacy, cannot-quit. 
 ## Verification gaps (add with the fixes they cover)
 
 `TurnComplete` arm; `finish_current` with unterminated buffer; `split_complete_sentences` edge cases; 20-tag cap; `repair_live_proxy` stale candidate; `memo view_for_source` and `capture_inputs` ownership guard; `library_recording_export` reservation/release; migration 8 unique index; close pipeline closures (`app_close_confirm`, `release`); `boot()` claim/release (current ipc test only exercises a local HashSet).
+
+## Status (2026-09-29)
+
+- P0 items 1–12: fixed, merged (`spec-epic-4-p0-review-fixes.md`).
+- P1 items and verification gaps: fixed, merged (`spec-epic-4-p1-review-fixes.md`).
+- Rerun/recording `Busy` guard while Live runs: not needed. `transcribe_recording` requires `status = 'complete'` and rerun rejects the live primary transcript, so the running session is already refused.
+- Not verified on hardware: Windows WASAPI code paths (only pure mixer logic is unit-tested).
