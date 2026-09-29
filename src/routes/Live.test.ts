@@ -18,6 +18,7 @@ const mocks = vi.hoisted(() => ({
   liveContinueRecordingOnly: vi.fn(),
   liveSetSource: vi.fn(),
   liveSetTarget: vi.fn(),
+  liveSetTts: vi.fn(),
   liveRedetect: vi.fn(),
   liveOpenPermissionSettings: vi.fn(),
   keysLoad: vi.fn(),
@@ -45,6 +46,7 @@ vi.mock('../lib/bindings', () => ({
     liveContinueRecordingOnly: (...args: unknown[]) => mocks.liveContinueRecordingOnly(...args),
     liveSetSource: (...args: unknown[]) => mocks.liveSetSource(...args),
     liveSetTarget: (...args: unknown[]) => mocks.liveSetTarget(...args),
+    liveSetTts: (...args: unknown[]) => mocks.liveSetTts(...args),
     liveRedetect: (...args: unknown[]) => mocks.liveRedetect(...args),
     liveOpenPermissionSettings: (...args: unknown[]) => mocks.liveOpenPermissionSettings(...args),
   },
@@ -89,6 +91,8 @@ function snapshot(sessionId: string | null = backendSessionId, durationSec = 0):
     errorCategory: null,
     durationSec,
     target: backendTarget,
+    tts: false,
+    speaking: false,
   };
 }
 
@@ -130,6 +134,7 @@ beforeEach(() => {
   mocks.liveContinueRecordingOnly.mockReset().mockResolvedValue({ status: 'ok', data: null });
   mocks.liveSetSource.mockReset().mockResolvedValue({ status: 'ok', data: null });
   mocks.liveSetTarget.mockReset().mockResolvedValue({ status: 'ok', data: null });
+  mocks.liveSetTts.mockReset().mockResolvedValue({ status: 'ok', data: null });
   mocks.liveRedetect.mockReset().mockResolvedValue({ status: 'ok', data: null });
   mocks.liveOpenPermissionSettings.mockReset().mockResolvedValue({ status: 'ok', data: null });
   mocks.keysLoad.mockReset().mockResolvedValue(undefined);
@@ -510,6 +515,33 @@ describe('Live translation', () => {
 
     await fireEvent.click(screen.getByRole('button', { name: 'Both' }));
     expect(view.container.querySelector('.two-columns')).toBeTruthy();
+  });
+
+  it('speaker toggle drives live_set_tts and the Reading aloud pill follows the speaking event', async () => {
+    backendSessionId = 'session-1';
+    backendTarget = 'vi';
+    render(Live);
+    await screen.findByRole('button', { name: 'Stop recording' });
+    await waitFor(() => expect(channels).toHaveLength(1));
+
+    const tts = screen.getByRole('button', { name: 'Read translation aloud' }) as HTMLButtonElement;
+    expect(tts.disabled).toBe(false);
+    expect(tts.getAttribute('aria-pressed')).toBe('false');
+    expect(tts.title).toContain('does not reduce translation tokens');
+    expect(screen.queryByText('Reading aloud')).toBeNull();
+
+    await fireEvent.click(tts);
+    await waitFor(() => expect(mocks.liveSetTts).toHaveBeenCalledWith(true));
+    channels[0].onmessage({ type: 'tts', seq: 1, enabled: true });
+    await waitFor(() => expect(tts.getAttribute('aria-pressed')).toBe('true'));
+
+    channels[0].onmessage({ type: 'speaking', seq: 2, speaking: true });
+    await waitFor(() => expect(screen.getByText('Reading aloud')).toBeTruthy());
+    channels[0].onmessage({ type: 'speaking', seq: 3, speaking: false });
+    await waitFor(() => expect(screen.queryByText('Reading aloud')).toBeNull());
+
+    await fireEvent.click(tts);
+    await waitFor(() => expect(mocks.liveSetTts).toHaveBeenLastCalledWith(false));
   });
 
   it('switches the Target mid-session and follows the value the backend confirms', async () => {

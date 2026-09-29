@@ -24,6 +24,7 @@ mod cpal_backend;
 mod macos_tap;
 #[cfg(any(target_os = "windows", test))]
 mod windows_loopback;
+pub mod playback;
 
 pub const OUTPUT_SAMPLE_RATE: u32 = 16_000;
 pub const OUTPUT_CHANNELS: u16 = 1;

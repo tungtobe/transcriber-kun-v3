@@ -15,6 +15,7 @@ use tauri::ipc::Channel;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
+use crate::audio::playback::{PlaybackBackend, PlaybackHandle};
 use crate::audio::{CaptureController, PcmChunk, OUTPUT_SAMPLE_RATE};
 use crate::core::error::{AppError, Category, Code};
 use crate::core::id::{SessionId, TagId, TranscriptId};
@@ -97,6 +98,10 @@ pub struct LiveSnapshot {
     pub duration_sec: f64,
     /// Translation Target actually in effect (`none` = no translation).
     pub target: LiveTarget,
+    /// The speaker toggle (spoken translation) is on.
+    pub tts: bool,
+    /// The translation is being read out right now.
+    pub speaking: bool,
 }
 
 /// Typed Live stream. The ready variant carries the snapshot and cursor sent
@@ -138,6 +143,19 @@ pub enum LiveEvent {
         #[specta(type = specta_typescript::Number)]
         seq: u64,
         segment: LiveSegment,
+    },
+    /// Speaker toggle changed.
+    Tts {
+        #[specta(type = specta_typescript::Number)]
+        seq: u64,
+        enabled: bool,
+    },
+    /// The translation started or stopped being read out. Audio itself never
+    /// crosses IPC.
+    Speaking {
+        #[specta(type = specta_typescript::Number)]
+        seq: u64,
+        speaking: bool,
     },
     /// The Target actually in effect changed (after a successful swap).
     Target {
@@ -281,6 +299,17 @@ impl LiveSessionHandle {
         response.await.map_err(|_| actor_error())?
     }
 
+    /// Turns the spoken translation on or off. Off keeps receiving the
+    /// model's audio but drops it (no token saving).
+    pub async fn set_tts(&self, enabled: bool) -> Result<(), AppError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::SetTts { enabled, reply })
+            .await
+            .map_err(|_| actor_error())?;
+        response.await.map_err(|_| actor_error())?
+    }
+
     pub async fn continue_recording_only(&self) -> Result<(), AppError> {
         let (reply, response) = oneshot::channel();
         self.commands
@@ -334,6 +363,10 @@ enum Command {
     Redetect {
         reply: oneshot::Sender<Result<(), AppError>>,
     },
+    SetTts {
+        enabled: bool,
+        reply: oneshot::Sender<Result<(), AppError>>,
+    },
     ContinueRecordingOnly {
         reply: oneshot::Sender<Result<(), AppError>>,
     },
@@ -348,6 +381,7 @@ enum Command {
 }
 
 enum Internal {
+    Speaking(bool),
     GatewayEvent {
         generation: u64,
         event: GatewayEvent,
@@ -435,6 +469,10 @@ pub struct LiveSessionActor {
     key_pool: KeyPoolHandle,
     gateway: LiveGateway,
     next_generation: u64,
+    /// In-process TTS playback (None = no output support wired, e.g. tests).
+    playback: Option<PlaybackHandle>,
+    tts_enabled: bool,
+    speaking: bool,
     seq: u64,
     subscribers: Vec<Channel<LiveEvent>>,
     snapshot: LiveSnapshot,
@@ -468,6 +506,9 @@ pub fn channel(
             key_pool,
             gateway,
             next_generation: 1,
+            playback: None,
+            tts_enabled: false,
+            speaking: false,
             seq: 0,
             subscribers: Vec::new(),
             snapshot: LiveSnapshot {
@@ -479,6 +520,8 @@ pub fn channel(
                 error_category: None,
                 duration_sec: 0.0,
                 target: LiveTarget::None,
+                tts: false,
+                speaking: false,
             },
             running: None,
             pending_close_finalize: None,
@@ -493,6 +536,23 @@ impl LiveSessionActor {
     /// delete/rerun guards.
     pub fn with_recovering(mut self, recovering: Arc<Mutex<HashSet<SessionId>>>) -> Self {
         self.recovering = recovering;
+        self
+    }
+
+    /// Wires in-process playback over `factory`'s backend (built on the
+    /// playback thread). The speaking flag flows back as an internal message.
+    pub fn with_playback<B, F>(mut self, factory: F) -> Self
+    where
+        B: PlaybackBackend,
+        F: FnOnce() -> B + Send + 'static,
+    {
+        let sender = self.internal_sender.clone();
+        self.playback = Some(PlaybackHandle::spawn(
+            factory,
+            Arc::new(move |speaking| {
+                let _ = sender.try_send(Internal::Speaking(speaking));
+            }),
+        ));
         self
     }
 
@@ -527,6 +587,10 @@ impl LiveSessionActor {
                     Some(Command::Redetect { reply }) => {
                         self.redetect(reply);
                     }
+                    Some(Command::SetTts { enabled, reply }) => {
+                        self.set_tts(enabled);
+                        let _ = reply.send(Ok(()));
+                    }
                     Some(Command::ContinueRecordingOnly { reply }) => {
                         let result = self.continue_recording_only().await;
                         let _ = reply.send(result);
@@ -554,6 +618,49 @@ impl LiveSessionActor {
                 }
             }
         }
+    }
+
+    /// Playback is enabled only while a session translates (`target != none`)
+    /// and the speaker toggle is on; otherwise it is disabled, which drops
+    /// queued audio and refuses new audio.
+    fn sync_playback(&mut self) {
+        let on = self.tts_enabled
+            && self
+                .running
+                .as_ref()
+                .is_some_and(|running| running.target != LiveTarget::None);
+        if let Some(playback) = &self.playback {
+            playback.set_enabled(on);
+        }
+        if !on {
+            self.set_speaking(false);
+        }
+    }
+
+    fn set_speaking(&mut self, speaking: bool) {
+        if self.speaking == speaking {
+            return;
+        }
+        self.speaking = speaking;
+        self.snapshot.speaking = speaking;
+        self.emit(LiveEvent::Speaking { seq: 0, speaking });
+    }
+
+    fn set_tts(&mut self, enabled: bool) {
+        if self.tts_enabled == enabled {
+            return;
+        }
+        self.tts_enabled = enabled;
+        self.snapshot.tts = enabled;
+        self.sync_playback();
+        self.emit(LiveEvent::Tts { seq: 0, enabled });
+    }
+
+    fn clear_playback(&mut self) {
+        if let Some(playback) = &self.playback {
+            playback.clear();
+        }
+        self.set_speaking(false);
     }
 
     async fn start(&mut self, params: LiveStartParams) -> Result<SessionId, AppError> {
@@ -709,6 +816,7 @@ impl LiveSessionActor {
             recording_state: RecordingState::Active,
             storage_error_reported: false,
         });
+        self.sync_playback();
         self.snapshot = self.snapshot_for_running();
         self.emit(LiveEvent::Recording {
             seq: 0,
@@ -919,6 +1027,9 @@ impl LiveSessionActor {
             }
         });
         let target = candidate.target;
+        // Audio of the previous generation never plays after a swap.
+        self.clear_playback();
+        self.sync_playback();
         self.snapshot = self.snapshot_for_running();
         if let Some(segment) = tail {
             self.emit(LiveEvent::SegmentTranslated { seq: 0, segment });
@@ -960,6 +1071,16 @@ impl LiveSessionActor {
     /// events: a storage failure there is handled by the final flush itself.
     async fn apply_internal(&mut self, internal: Internal, allow_finish: bool) {
         match internal {
+            Internal::Speaking(speaking) => {
+                // Stale `true` after playback was disabled must not stick.
+                let allowed = speaking
+                    && self.tts_enabled
+                    && self
+                        .running
+                        .as_ref()
+                        .is_some_and(|running| running.target != LiveTarget::None);
+                self.set_speaking(allowed);
+            }
             Internal::GatewayEvent { generation, event } => {
                 let is_candidate = self
                     .running
@@ -1038,6 +1159,21 @@ impl LiveSessionActor {
                             self.emit(LiveEvent::SegmentTranslated { seq: 0, segment });
                         }
                     }
+                    GatewayEvent::OutputAudio { pcm } => {
+                        // Straight to the in-process player. The buffer
+                        // itself refuses audio while TTS is off / no
+                        // translation, so nothing is queued in that case.
+                        let translating = self
+                            .running
+                            .as_ref()
+                            .is_some_and(|running| running.target != LiveTarget::None);
+                        if translating {
+                            if let Some(playback) = &self.playback {
+                                playback.push(pcm.expose());
+                            }
+                        }
+                    }
+                    GatewayEvent::Interrupted => self.clear_playback(),
                     GatewayEvent::TurnComplete {
                         sample_start,
                         sample_end,
@@ -1390,6 +1526,8 @@ impl LiveSessionActor {
                         error_category: None,
                         duration_sec,
                         target: self.snapshot.target,
+                        tts: self.tts_enabled,
+                        speaking: false,
                     };
                     self.emit(LiveEvent::Recording {
                         seq: 0,
@@ -1469,6 +1607,7 @@ impl LiveSessionActor {
         }
         let mut running = self.running.take().expect("running session checked above");
         let running_target = running.target;
+        self.sync_playback();
         running.gateway_cancel.cancel();
         self.snapshot.connection = ConnectionState::Stopped;
         self.emit(LiveEvent::Connection {
@@ -1581,6 +1720,8 @@ impl LiveSessionActor {
                 error_category: Some(error.category),
                 duration_sec,
                 target: running_target,
+                tts: self.tts_enabled,
+                speaking: false,
             };
             self.emit(LiveEvent::Recording {
                 seq: 0,
@@ -1610,6 +1751,8 @@ impl LiveSessionActor {
                 error_category: Some(error.category),
                 duration_sec,
                 target: running_target,
+                tts: self.tts_enabled,
+                speaking: false,
             };
             self.emit(LiveEvent::Recording {
                 seq: 0,
@@ -1654,6 +1797,8 @@ impl LiveSessionActor {
                     error_category: Some(error.category),
                     duration_sec,
                     target: running_target,
+                    tts: self.tts_enabled,
+                    speaking: false,
                 };
                 self.emit(LiveEvent::Recording {
                     seq: 0,
@@ -1685,6 +1830,8 @@ impl LiveSessionActor {
                 .or(running.error_category),
             duration_sec,
             target: running_target,
+            tts: self.tts_enabled,
+            speaking: false,
         };
         self.emit(LiveEvent::Recording {
             seq: 0,
@@ -1740,6 +1887,8 @@ impl LiveSessionActor {
                     running.baseline_sample,
                 ),
                 target: running.target,
+                tts: self.tts_enabled,
+                speaking: self.speaking,
             },
         )
     }
@@ -1778,6 +1927,8 @@ fn with_seq(event: LiveEvent, seq: u64) -> LiveEvent {
             LiveEvent::SegmentTranslated { seq, segment }
         }
         LiveEvent::Target { target, .. } => LiveEvent::Target { seq, target },
+        LiveEvent::Tts { enabled, .. } => LiveEvent::Tts { seq, enabled },
+        LiveEvent::Speaking { speaking, .. } => LiveEvent::Speaking { seq, speaking },
         LiveEvent::Gap {
             start_sec,
             end_sec,
@@ -4093,6 +4244,174 @@ mod tests {
             )),
             0
         );
+        fx.actor.finish_current(None, false).await.unwrap();
+    }
+
+    fn attach_fake_playback(
+        actor: &mut LiveSessionActor,
+    ) -> crate::audio::playback::fake::FakeBackend {
+        let backend = crate::audio::playback::fake::FakeBackend::with_device("speakers");
+        let sender = actor.internal_sender.clone();
+        let thread_backend = backend.clone();
+        actor.playback = Some(PlaybackHandle::spawn(
+            move || thread_backend,
+            Arc::new(move |speaking| {
+                let _ = sender.try_send(Internal::Speaking(speaking));
+            }),
+        ));
+        backend
+    }
+
+    fn audio_frame(samples: usize) -> String {
+        use base64::Engine;
+        let bytes: Vec<u8> = (0..samples)
+            .flat_map(|_| 1_000i16.to_le_bytes())
+            .collect();
+        format!(
+            r#"{{"serverContent":{{"modelTurn":{{"parts":[{{"inlineData":{{"data":"{}"}}}}]}}}}}}"#,
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        )
+    }
+
+    fn speaking_events(events: &Arc<Mutex<Vec<LiveEvent>>>) -> Vec<bool> {
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                LiveEvent::Speaking { speaking, .. } => Some(*speaking),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn tts_plays_model_audio_in_process_and_speaking_follows_playback() {
+        let (mut fx, conn) = scripted_fixture(&[]).await;
+        let backend = attach_fake_playback(&mut fx.actor);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        fx.actor.register_subscriber(collect_channel(events.clone()));
+        fx.actor.set_tts(true);
+        fx.actor
+            .start(target_params(LiveTarget::Vi))
+            .await
+            .unwrap();
+        pump_until(&mut fx.actor, |a| {
+            a.running.as_ref().unwrap().connection == ConnectionState::Connected
+        })
+        .await;
+        feed(&conn, 0, &audio_frame(2_400));
+        pump_until(&mut fx.actor, |a| a.speaking).await;
+        assert!(fx.actor.snapshot_for_running().speaking);
+        assert!(fx.actor.snapshot_for_running().tts);
+        backend.pump(10_000);
+        pump_until(&mut fx.actor, |a| !a.speaking).await;
+        assert_eq!(speaking_events(&events), vec![true, false]);
+        fx.actor.finish_current(None, false).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tts_off_receives_but_drops_audio_without_buffering() {
+        let (mut fx, conn) = scripted_fixture(&[]).await;
+        let _backend = attach_fake_playback(&mut fx.actor);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        fx.actor.register_subscriber(collect_channel(events.clone()));
+        fx.actor
+            .start(target_params(LiveTarget::Vi))
+            .await
+            .unwrap();
+        pump_until(&mut fx.actor, |a| {
+            a.running.as_ref().unwrap().connection == ConnectionState::Connected
+        })
+        .await;
+        feed(&conn, 0, &audio_frame(2_400));
+        feed(&conn, 0, r#"{"serverContent":{"turnComplete":{}}}"#);
+        pump_until(&mut fx.actor, |_| {
+            count_events(&events, |e| matches!(e, LiveEvent::Turn { .. })) == 1
+        })
+        .await;
+        assert_eq!(fx.actor.playback.as_ref().unwrap().queued_samples(), 0);
+        assert!(speaking_events(&events).is_empty());
+        fx.actor.finish_current(None, false).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn no_translation_disables_playback_even_with_tts_on() {
+        let (mut fx, conn) = scripted_fixture(&[]).await;
+        let _backend = attach_fake_playback(&mut fx.actor);
+        fx.actor.set_tts(true);
+        fx.actor
+            .start(target_params(LiveTarget::None))
+            .await
+            .unwrap();
+        pump_until(&mut fx.actor, |a| {
+            a.running.as_ref().unwrap().connection == ConnectionState::Connected
+        })
+        .await;
+        assert!(!fx.actor.playback.as_ref().unwrap().is_enabled());
+        feed(&conn, 0, &audio_frame(2_400));
+        pump_for(&mut fx.actor, Duration::from_millis(300)).await;
+        assert_eq!(fx.actor.playback.as_ref().unwrap().queued_samples(), 0);
+        assert!(!fx.actor.speaking);
+        fx.actor.finish_current(None, false).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn interrupted_stops_playback_and_clears_the_buffer_at_once() {
+        let (mut fx, conn) = scripted_fixture(&[]).await;
+        let _backend = attach_fake_playback(&mut fx.actor);
+        fx.actor.set_tts(true);
+        fx.actor
+            .start(target_params(LiveTarget::Vi))
+            .await
+            .unwrap();
+        pump_until(&mut fx.actor, |a| {
+            a.running.as_ref().unwrap().connection == ConnectionState::Connected
+        })
+        .await;
+        feed(&conn, 0, &audio_frame(24_000));
+        pump_until(&mut fx.actor, |a| a.speaking).await;
+        feed(&conn, 0, r#"{"serverContent":{"interrupted":true}}"#);
+        pump_until(&mut fx.actor, |a| !a.speaking).await;
+        assert_eq!(fx.actor.playback.as_ref().unwrap().queued_samples(), 0);
+        fx.actor.finish_current(None, false).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn toggling_tts_off_mid_speech_and_swapping_generation_clear_queued_audio() {
+        let (mut fx, conn) = scripted_fixture(&[Plan::Ok, Plan::Ok]).await;
+        let _backend = attach_fake_playback(&mut fx.actor);
+        fx.actor.set_tts(true);
+        fx.actor
+            .start(target_params(LiveTarget::Vi))
+            .await
+            .unwrap();
+        pump_until(&mut fx.actor, |a| {
+            a.running.as_ref().unwrap().connection == ConnectionState::Connected
+        })
+        .await;
+        feed(&conn, 0, &audio_frame(24_000));
+        pump_until(&mut fx.actor, |a| a.speaking).await;
+
+        // Swap: audio of the old generation must not survive the promotion.
+        let (tx, _rx) = oneshot::channel();
+        fx.actor.set_target(LiveTarget::En, tx);
+        pump_until(&mut fx.actor, |a| {
+            a.running.as_ref().unwrap().generation == 2
+        })
+        .await;
+        assert_eq!(fx.actor.playback.as_ref().unwrap().queued_samples(), 0);
+        pump_until(&mut fx.actor, |a| !a.speaking).await;
+        // Late audio from the retired generation is ignored.
+        feed(&conn, 0, &audio_frame(2_400));
+        pump_for(&mut fx.actor, Duration::from_millis(300)).await;
+        assert_eq!(fx.actor.playback.as_ref().unwrap().queued_samples(), 0);
+
+        feed(&conn, 1, &audio_frame(24_000));
+        pump_until(&mut fx.actor, |a| a.speaking).await;
+        fx.actor.set_tts(false);
+        assert!(!fx.actor.speaking);
+        assert_eq!(fx.actor.playback.as_ref().unwrap().queued_samples(), 0);
         fx.actor.finish_current(None, false).await.unwrap();
     }
 

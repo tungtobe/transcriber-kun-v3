@@ -239,6 +239,20 @@ async fn live_set_target(
     track_ipc_error(&state.db, result).await
 }
 
+/// Turns the spoken translation (TTS, in-process playback of the model's own
+/// audio) on or off. Off only stops playback: the model still produces audio
+/// and tokens are still spent.
+#[tauri::command]
+#[specta::specta]
+async fn live_set_tts(enabled: bool, state: tauri::State<'_, AppState>) -> Result<(), AppError> {
+    let result = async {
+        let live = state.live.clone()?;
+        live.set_tts(enabled).await
+    }
+    .await;
+    track_ipc_error(&state.db, result).await
+}
+
 /// Re-detects the spoken language (only while the session language is
 /// `auto`): opens a fresh generation with an empty context. A failure keeps
 /// the current connection.
@@ -2862,6 +2876,7 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             live_set_source,
             live_set_target,
             live_redetect,
+            live_set_tts,
             live_start,
             live_stop,
             live_continue_recording_only,

@@ -603,5 +603,6 @@
   "live.translation.empty": "モデルが翻訳するとここに表示されます。",
   "live.tts.label": "翻訳を読み上げ",
   "live.tts.noTarget": "翻訳先を選ぶと使えます。",
-  "live.tts.comingSoon": "翻訳の読み上げはまだ利用できません。"
+  "live.tts.tooltip": "翻訳を音声で再生します。オフにしても再生が止まるだけで、翻訳のトークン消費は減りません。",
+  "live.tts.speaking": "読み上げ中"
 }
