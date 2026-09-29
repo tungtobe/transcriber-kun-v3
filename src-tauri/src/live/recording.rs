@@ -350,6 +350,9 @@ fn run_consumer(
     let mut uncheckpointed_bytes = 0_u64;
     let mut last_checkpoint = Instant::now();
     let mut stop_mode = None;
+    // Sources that reported an error. Recording only fails once every input
+    // that was active has errored (Mixed keeps going on the surviving one).
+    let mut errored_sources: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     loop {
         if stop_mode.is_none() {
@@ -391,14 +394,28 @@ fn run_consumer(
         match receiver.try_recv() {
             Ok(chunk) => {
                 if let Some(source_error) = chunk.source_errors.first() {
-                    return fail_recording(
-                        writer,
-                        &sync_file,
-                        capture.as_ref(),
-                        &terminal_tx,
-                        source_error.error.clone(),
-                        true,
-                        &wav_finalized,
+                    for reported in &chunk.source_errors {
+                        errored_sources.insert(reported.source.clone());
+                    }
+                    let active_inputs = capture
+                        .as_ref()
+                        .and_then(|controller| controller.active_source())
+                        .map_or(1, |source| if source.starts_with("mixed:") { 2 } else { 1 });
+                    if errored_sources.len() >= active_inputs {
+                        return fail_recording(
+                            writer,
+                            &sync_file,
+                            capture.as_ref(),
+                            &terminal_tx,
+                            source_error.error.clone(),
+                            true,
+                            &wav_finalized,
+                        );
+                    }
+                    tracing::warn!(
+                        failed = errored_sources.len(),
+                        active = active_inputs,
+                        "a Live audio input failed; recording continues on the remaining input"
                     );
                 }
                 if chunk.sample_rate != OUTPUT_SAMPLE_RATE
@@ -479,17 +496,30 @@ fn run_consumer(
                 }
             }
             Err(broadcast::error::TryRecvError::Lagged(count)) => {
-                return fail_recording(
-                    writer,
-                    &sync_file,
-                    capture.as_ref(),
-                    &terminal_tx,
-                    AppError::new(
-                        Code::Storage,
-                        format!("Live Recording consumer lagged and lost {count} PCM chunks"),
-                    ),
-                    true,
-                    &wav_finalized,
+                // Keep the timeline intact: the missed chunks become silence.
+                tracing::warn!(
+                    chunks = count,
+                    "Live Recording consumer lagged; filling silence"
+                );
+                let silence_samples =
+                    count.saturating_mul(crate::audio::OUTPUT_CHUNK_SAMPLES as u64);
+                for _ in 0..silence_samples {
+                    if let Err(err) = writer.write_sample(0) {
+                        return fail_recording(
+                            writer,
+                            &sync_file,
+                            capture.as_ref(),
+                            &terminal_tx,
+                            AppError::new(Code::Storage, err.to_string()),
+                            true,
+                            &wav_finalized,
+                        );
+                    }
+                }
+                written_samples.fetch_add(silence_samples, Ordering::Release);
+                expected_sample = expected_sample.map(|expected| expected + silence_samples);
+                uncheckpointed_bytes = uncheckpointed_bytes.saturating_add(
+                    silence_samples.saturating_mul(std::mem::size_of::<i16>() as u64),
                 );
             }
             Err(broadcast::error::TryRecvError::Closed) => break,
@@ -816,6 +846,7 @@ mod tests {
                 sample_rate: OUTPUT_SAMPLE_RATE,
                 channels: OUTPUT_CHANNELS,
                 samples: vec![index as i16; crate::audio::OUTPUT_CHUNK_SAMPLES],
+                gated_samples: vec![index as i16; crate::audio::OUTPUT_CHUNK_SAMPLES],
                 source_errors: Vec::new(),
             })
             .unwrap();
@@ -895,43 +926,83 @@ mod tests {
     }
 
     #[test]
-    fn consumer_lag_is_a_storage_error_and_releases_capture() {
+    fn consumer_lag_fills_silence_and_keeps_recording() {
         let root = tempdir().unwrap();
-        let capture = Arc::new(CaptureController::new(Arc::new(TestBackend::default())));
-        capture.set_source("mic:Built-in").unwrap();
         let (tx, rx) = broadcast::channel(1);
         tx.send(test_chunk(0, 0.3)).unwrap();
         tx.send(test_chunk(1_600, 0.3)).unwrap();
+        tx.send(test_chunk(3_200, 0.3)).unwrap();
+        drop(tx);
         let (_stop_tx, stop_rx) = mpsc::channel();
         let (terminal_tx, terminal_rx) = watch::channel(None);
-        let (writer, sync_file) = new_test_writer(&root.path().join("lag.wav"));
-        let handle = thread::spawn({
-            let capture = capture.clone();
-            move || {
-                run_consumer(
-                    rx,
-                    stop_rx,
-                    writer,
-                    sync_file,
-                    Some(capture),
-                    terminal_tx,
-                    None,
-                    Arc::new(AtomicU64::new(0)),
-                    Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                )
-            }
-        });
-        let result = handle.join().unwrap();
-        assert_eq!(
-            result.unwrap_err().category,
-            crate::core::error::Category::Storage
+        let path = root.path().join("lag.wav");
+        let (writer, sync_file) = new_test_writer(&path);
+        let written = Arc::new(AtomicU64::new(0));
+        run_consumer(
+            rx,
+            stop_rx,
+            writer,
+            sync_file,
+            None,
+            terminal_tx,
+            None,
+            written.clone(),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .unwrap();
+        assert!(terminal_rx.borrow().is_none());
+        let samples = hound::WavReader::open(&path)
+            .unwrap()
+            .samples::<i16>()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
+        assert_eq!(samples.len(), 4_800);
+        assert_eq!(written.load(Ordering::Acquire), 4_800);
+        assert!(samples[..3_200].iter().all(|sample| *sample == 0));
+        assert!(samples[3_200..].iter().all(|sample| *sample != 0));
+    }
+
+    #[test]
+    fn one_failed_mixed_input_keeps_recording_but_losing_every_input_fails() {
+        let root = tempdir().unwrap();
+        let capture = Arc::new(CaptureController::new(Arc::new(TestBackend::default())));
+        capture.set_source("mixed:Built-in").unwrap();
+        let (tx, rx) = broadcast::channel(8);
+        let failure = |source: &str| crate::audio::AudioSourceError {
+            source: source.to_owned(),
+            error: AppError::new(Code::Permission, "device disconnected"),
+        };
+        tx.send(PcmChunk {
+            source_errors: vec![failure("mic:Built-in")],
+            ..test_chunk(0, 0.3)
+        })
+        .unwrap();
+        tx.send(test_chunk(1_600, 0.3)).unwrap();
+        tx.send(PcmChunk {
+            source_errors: vec![failure("system")],
+            ..test_chunk(3_200, 0.3)
+        })
+        .unwrap();
+        tx.send(test_chunk(4_800, 0.3)).unwrap();
+        let (_stop_tx, stop_rx) = mpsc::channel();
+        let (terminal_tx, _terminal_rx) = watch::channel(None);
+        let path = root.path().join("mixed.wav");
+        let (writer, sync_file) = new_test_writer(&path);
+        let result = run_consumer(
+            rx,
+            stop_rx,
+            writer,
+            sync_file,
+            Some(capture),
+            terminal_tx,
+            None,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         );
-        assert_eq!(
-            terminal_rx.borrow().as_ref().unwrap().category,
-            crate::core::error::Category::Storage
-        );
-        assert!(capture.active_source().is_none());
-        drop(tx);
+        assert!(result.is_err());
+        // The first two chunks were kept; the all-inputs-failed chunk is not.
+        let wav = hound::WavReader::open(&path).unwrap();
+        assert_eq!(wav.duration(), 3_200);
     }
 
     #[test]
@@ -1241,6 +1312,10 @@ mod tests {
             sample_rate: OUTPUT_SAMPLE_RATE,
             channels: OUTPUT_CHANNELS,
             samples: vec![(value * i16::MAX as f32) as i16; crate::audio::OUTPUT_CHUNK_SAMPLES],
+            gated_samples: vec![
+                (value * i16::MAX as f32) as i16;
+                crate::audio::OUTPUT_CHUNK_SAMPLES
+            ],
             source_errors: Vec::new(),
         }
     }

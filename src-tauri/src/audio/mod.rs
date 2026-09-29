@@ -29,7 +29,8 @@ pub const OUTPUT_SAMPLE_RATE: u32 = 16_000;
 pub const OUTPUT_CHANNELS: u16 = 1;
 pub const OUTPUT_CHUNK_SAMPLES: usize = 1_600;
 const OUTPUT_CHUNK_PERIOD: Duration = Duration::from_millis(100);
-const OUTPUT_BROADCAST_CAPACITY: usize = 32;
+// ~60 s of 100 ms chunks: a stalled fsync must not overflow the consumer.
+const OUTPUT_BROADCAST_CAPACITY: usize = 600;
 const GATE_FLOOR: f32 = 0.004;
 const GATE_CEILING: f32 = 0.016;
 const GATE_ATTACK_ALPHA: f32 = 0.008;
@@ -77,7 +78,10 @@ pub struct PcmChunk {
     pub start_sample: u64,
     pub sample_rate: u32,
     pub channels: u16,
+    /// Raw (ungated) mix: what the recorder and export archive.
     pub samples: Vec<i16>,
+    /// Noise-gated mix: used only for the Gemini feed.
+    pub gated_samples: Vec<i16>,
     pub source_errors: Vec<AudioSourceError>,
 }
 
@@ -637,7 +641,8 @@ struct AudioPipeline {
     source: Option<CaptureSource>,
     inputs: Vec<InputState>,
     active_inputs: HashSet<(u64, InputSide)>,
-    pending_output: VecDeque<f32>,
+    /// `(raw, gated)` pairs.
+    pending_output: VecDeque<(f32, f32)>,
     clock_samples: u64,
     pending_errors: Vec<AudioSourceError>,
 }
@@ -701,8 +706,8 @@ impl AudioPipeline {
                     self.active_inputs
                         .contains(&(input.generation, input.format.side))
                 })
-                .map(|input| input.samples.pop_front().unwrap_or(0.0))
-                .sum::<f32>();
+                .map(|input| input.samples.pop_front().unwrap_or((0.0, 0.0)))
+                .fold((0.0, 0.0), |(raw, gated), (r, g)| (raw + r, gated + g));
             self.pending_output.push_back(mixed);
         }
     }
@@ -741,9 +746,10 @@ impl AudioPipeline {
             .chunks_exact(channel_count)
             .map(|frame| frame.iter().copied().sum::<f32>() / channel_count as f32);
         for sample in input.resampler.push(mono) {
+            let raw = if sample.is_finite() { sample } else { 0.0 };
             let gated = input.gate.apply(sample);
             if active {
-                input.samples.push_back(gated);
+                input.samples.push_back((raw, gated));
             }
         }
     }
@@ -771,8 +777,9 @@ impl AudioPipeline {
         self.source.as_ref()?;
         let start_sample = self.clock_samples;
         let mut output = vec![0_i16; OUTPUT_CHUNK_SAMPLES];
+        let mut gated_output = vec![0_i16; OUTPUT_CHUNK_SAMPLES];
         for output_index in 0..OUTPUT_CHUNK_SAMPLES {
-            let mixed = if let Some(pending) = self.pending_output.pop_front() {
+            let (mixed, gated_mixed) = if let Some(pending) = self.pending_output.pop_front() {
                 pending
             } else {
                 self.inputs
@@ -781,10 +788,11 @@ impl AudioPipeline {
                         self.active_inputs
                             .contains(&(input.generation, input.format.side))
                     })
-                    .map(|input| input.samples.pop_front().unwrap_or(0.0))
-                    .sum::<f32>()
+                    .map(|input| input.samples.pop_front().unwrap_or((0.0, 0.0)))
+                    .fold((0.0, 0.0), |(raw, gated), (r, g)| (raw + r, gated + g))
             };
             output[output_index] = float_to_pcm16(mixed);
+            gated_output[output_index] = float_to_pcm16(gated_mixed);
         }
         self.clock_samples = self
             .clock_samples
@@ -794,6 +802,7 @@ impl AudioPipeline {
             sample_rate: OUTPUT_SAMPLE_RATE,
             channels: OUTPUT_CHANNELS,
             samples: output,
+            gated_samples: gated_output,
             source_errors: std::mem::take(&mut self.pending_errors),
         })
     }
@@ -804,7 +813,8 @@ struct InputState {
     format: InputFormat,
     resampler: LinearResampler,
     gate: SoftGate,
-    samples: VecDeque<f32>,
+    /// `(raw, gated)` pairs.
+    samples: VecDeque<(f32, f32)>,
 }
 
 impl InputState {
@@ -1230,7 +1240,9 @@ mod tests {
             1_600,
         ));
         let chunk = pipeline.tick().unwrap();
-        assert!(chunk.samples.iter().all(|sample| *sample == 0));
+        assert!(chunk.gated_samples.iter().all(|sample| *sample == 0));
+        // The archive keeps the quiet audio the gate removes from the Gemini feed.
+        assert!(chunk.samples.iter().any(|sample| *sample != 0));
         assert!(chunk.source_errors.is_empty());
         assert_eq!(chunk.start_sample, 0);
     }

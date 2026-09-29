@@ -28,6 +28,11 @@ const MAX_UNCONFIRMED_CHUNKS: usize = 600;
 const SLIDING_WINDOW_TARGET_TOKENS: &str = "16384";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const SETUP_COMPLETE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Ping cadence and the receive silence after which a half-open socket is
+/// declared dead. Any inbound frame (including pong) resets the silence timer.
+const PING_INTERVAL: Duration = Duration::from_secs(15);
+const IDLE_TIMEOUT: Duration = Duration::from_secs(45);
+const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub type ConnectFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Box<dyn LiveSocket>, LiveConnectError>> + Send + 'a>>;
@@ -41,7 +46,11 @@ pub type CloseFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LiveReceiveMessage {
     Text(String),
-    Closed { code: Option<u16> },
+    Closed {
+        code: Option<u16>,
+    },
+    /// A non-data frame (ping/pong): proves the peer is alive.
+    Activity,
     Eof,
 }
 
@@ -56,6 +65,8 @@ pub trait LiveSocketConnector: Send + Sync + 'static {
 pub trait LiveSocket: Send {
     fn send_text<'a>(&'a mut self, text: String) -> SendFuture<'a>;
     fn receive_text<'a>(&'a mut self) -> ReceiveFuture<'a>;
+    /// Sends a WebSocket ping used for liveness detection.
+    fn ping<'a>(&'a mut self) -> SendFuture<'a>;
     fn close<'a>(&'a mut self) -> CloseFuture<'a>;
 }
 
@@ -169,6 +180,8 @@ pub struct LiveGateway {
     key_pool: KeyPoolHandle,
     clock: Arc<dyn LiveClock>,
     setup_timeout: Duration,
+    idle_timeout: Duration,
+    ping_interval: Duration,
 }
 
 impl LiveGateway {
@@ -178,6 +191,8 @@ impl LiveGateway {
             key_pool,
             clock: Arc::new(SystemLiveClock),
             setup_timeout: SETUP_COMPLETE_TIMEOUT,
+            idle_timeout: IDLE_TIMEOUT,
+            ping_interval: PING_INTERVAL,
         }
     }
 
@@ -232,6 +247,7 @@ mod tests {
             sample_rate: OUTPUT_SAMPLE_RATE,
             channels: OUTPUT_CHANNELS,
             samples: vec![sample; OUTPUT_CHUNK_SAMPLES],
+            gated_samples: vec![sample; OUTPUT_CHUNK_SAMPLES],
             source_errors: Vec::new(),
         }
     }
@@ -304,7 +320,7 @@ mod tests {
         assert_eq!(&decoded[..2], &[0x34, 0x12]);
 
         let mut invalid = chunk(0, 1);
-        invalid.samples.pop();
+        invalid.gated_samples.pop();
         assert!(matches!(
             build_audio_message(&invalid),
             Err(LiveFailure::Gateway(AppError {
@@ -644,6 +660,16 @@ mod tests {
                     self.incoming
                         .pop_front()
                         .unwrap_or(Ok(LiveReceiveMessage::Eof))
+                }
+            })
+        }
+
+        fn ping<'a>(&'a mut self) -> SendFuture<'a> {
+            Box::pin(async move {
+                if self.pending_send {
+                    std::future::pending().await
+                } else {
+                    Ok(())
                 }
             })
         }
@@ -1339,6 +1365,137 @@ mod tests {
         assert_eq!(connector.keys.lock().unwrap().len(), 5);
         assert_eq!(clock.delays.lock().unwrap().len(), 4);
     }
+
+    #[test]
+    fn binary_frames_decode_as_text_and_invalid_utf8_is_a_transport_error() {
+        assert_eq!(
+            decode_frame(Message::Binary(br#"{"setupComplete":{}}"#.to_vec().into())),
+            Ok(LiveReceiveMessage::Text(
+                r#"{"setupComplete":{}}"#.to_owned()
+            ))
+        );
+        assert_eq!(
+            decode_frame(Message::Binary(vec![0xff, 0xfe, 0x00].into())),
+            Err(LiveTransportError)
+        );
+        assert_eq!(
+            decode_frame(Message::Pong(Vec::new().into())),
+            Ok(LiveReceiveMessage::Activity)
+        );
+    }
+
+    #[test]
+    fn in_band_error_code_tolerates_string_and_oversized_numbers() {
+        let status = |raw: &str| parse_server_message(raw).unwrap().error_status;
+        assert_eq!(status(r#"{"error":{"code":503}}"#), Some(503));
+        assert_eq!(status(r#"{"error":{"code":"503"}}"#), Some(503));
+        assert_eq!(status(r#"{"error":{"code":99999999999}}"#), Some(0));
+        assert_eq!(status(r#"{"error":{"code":"UNAVAILABLE"}}"#), Some(0));
+        assert_eq!(status(r#"{"error":{}}"#), Some(0));
+        assert_eq!(status(r#"{"setupComplete":{}}"#), None);
+    }
+
+    async fn run_until_transcript(
+        gateway: LiveGateway,
+    ) -> (Option<LiveEvent>, Result<(), LiveFailure>) {
+        let (_audio_tx, audio_rx) = broadcast::channel(1);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let cancellation = CancellationToken::new();
+        let running = tokio::spawn({
+            let cancellation = cancellation.clone();
+            async move {
+                gateway
+                    .run(
+                        run_config(),
+                        ConsentSnapshot::new(1, false),
+                        audio_rx,
+                        event_tx,
+                        cancellation,
+                    )
+                    .await
+            }
+        });
+        let event = tokio::time::timeout(
+            Duration::from_secs(2),
+            receive_input_transcription(&mut event_rx),
+        )
+        .await
+        .ok()
+        .flatten();
+        cancellation.cancel();
+        (event, running.await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn silent_established_socket_times_out_and_reconnects() {
+        let (mut silent, _sent, _received) = FakeSocket::new([r#"{"setupComplete":{}}"#]);
+        silent.pending_receive = true;
+        let (mut ready, _sent, _received) = FakeSocket::new([
+            r#"{"setupComplete":{}}"#,
+            r#"{"serverContent":{"inputTranscription":{"text":"ready"}}}"#,
+        ]);
+        ready.pending_receive = true;
+        let connector =
+            FakeConnector::new([ConnectStep::Socket(silent), ConnectStep::Socket(ready)]);
+        let pool = test_pool(vec![key("one", "secret-one")]).await;
+        let mut gateway =
+            LiveGateway::with_clock(connector.clone(), pool, FakeClock::new(0, false));
+        gateway.idle_timeout = Duration::from_millis(30);
+        gateway.ping_interval = Duration::from_millis(10);
+
+        let (event, outcome) = run_until_transcript(gateway).await;
+        assert!(matches!(
+            event,
+            Some(LiveEvent::InputTranscription { ref text, .. }) if text.expose() == "ready"
+        ));
+        assert_eq!(outcome, Err(LiveFailure::Cancelled));
+        assert_eq!(connector.keys.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn in_band_error_after_setup_reconnects() {
+        let (mut failing, _sent, _received) = FakeSocket::new([
+            r#"{"setupComplete":{}}"#,
+            r#"{"error":{"code":"500","message":"boom"}}"#,
+        ]);
+        failing.pending_receive = true;
+        let (mut ready, _sent, _received) = FakeSocket::new([
+            r#"{"setupComplete":{}}"#,
+            r#"{"serverContent":{"inputTranscription":{"text":"ready"}}}"#,
+        ]);
+        ready.pending_receive = true;
+        let connector =
+            FakeConnector::new([ConnectStep::Socket(failing), ConnectStep::Socket(ready)]);
+        let pool = test_pool(vec![key("one", "secret-one")]).await;
+        let gateway = LiveGateway::with_clock(connector.clone(), pool, FakeClock::new(0, false));
+
+        let (event, _) = run_until_transcript(gateway).await;
+        assert!(matches!(
+            event,
+            Some(LiveEvent::InputTranscription { ref text, .. }) if text.expose() == "ready"
+        ));
+        assert_eq!(connector.keys.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn key_status_retry_waits_for_backoff_before_the_next_key() {
+        let (mut ready, _sent, _received) = FakeSocket::new([
+            r#"{"setupComplete":{}}"#,
+            r#"{"serverContent":{"inputTranscription":{"text":"ready"}}}"#,
+        ]);
+        ready.pending_receive = true;
+        let connector = FakeConnector::new([
+            ConnectStep::Error(LiveConnectError::HttpStatus(401)),
+            ConnectStep::Socket(ready),
+        ]);
+        let pool = test_pool(vec![key("one", "secret-one"), key("two", "secret-two")]).await;
+        let clock = FakeClock::new(0, false);
+        let gateway = LiveGateway::with_clock(connector.clone(), pool, clock.clone());
+
+        let (event, _) = run_until_transcript(gateway).await;
+        assert!(event.is_some());
+        assert_eq!(clock.delays.lock().unwrap().len(), 1);
+    }
 }
 impl LiveGateway {
     #[cfg(test)]
@@ -1352,6 +1509,8 @@ impl LiveGateway {
             key_pool,
             clock,
             setup_timeout: SETUP_COMPLETE_TIMEOUT,
+            idle_timeout: IDLE_TIMEOUT,
+            ping_interval: PING_INTERVAL,
         }
     }
 
@@ -1462,6 +1621,10 @@ impl LiveGateway {
                             {
                                 return Err(LiveFailure::Cancelled);
                             }
+                            if self.wait_before_retry(backoff_attempt, &cancellation).await {
+                                return Err(LiveFailure::Cancelled);
+                            }
+                            backoff_attempt = backoff_attempt.saturating_add(1);
                             continue;
                         }
                         Ok(ReportAction::Complete) => {
@@ -1474,6 +1637,10 @@ impl LiveGateway {
                             {
                                 return Err(LiveFailure::Cancelled);
                             }
+                            if self.wait_before_retry(backoff_attempt, &cancellation).await {
+                                return Err(LiveFailure::Cancelled);
+                            }
+                            backoff_attempt = backoff_attempt.saturating_add(1);
                             continue;
                         }
                         Err(error) => return Err(error.into()),
@@ -1529,6 +1696,10 @@ impl LiveGateway {
                         SocketEnd::Cancelled => return Err(LiveFailure::Cancelled),
                         SocketEnd::KeyRetry(next) => {
                             next_lease = Some(next);
+                            if self.wait_before_retry(backoff_attempt, &cancellation).await {
+                                return Err(LiveFailure::Cancelled);
+                            }
+                            backoff_attempt = backoff_attempt.saturating_add(1);
                             continue;
                         }
                         SocketEnd::Rejected(handle) => {
@@ -1600,6 +1771,12 @@ impl LiveGateway {
         let mut last_sent_sample_end = None;
         let setup_timeout = tokio::time::sleep(self.setup_timeout);
         tokio::pin!(setup_timeout);
+        let mut last_rx = tokio::time::Instant::now();
+        let mut ping_timer = tokio::time::interval_at(
+            tokio::time::Instant::now() + self.ping_interval,
+            self.ping_interval,
+        );
+        ping_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             let (invalid, gap, next_audio) = {
                 let mut ring = ring.lock().expect("audio ring poisoned");
@@ -1644,7 +1821,9 @@ impl LiveGateway {
             if let Some((sequence, chunk)) = next_audio {
                 let message = build_audio_message(&chunk)?;
                 let send_failed = tokio::select! {
-                    result = socket.send_text(message) => result.is_err(),
+                    result = tokio::time::timeout(SEND_TIMEOUT, socket.send_text(message)) => {
+                        !matches!(result, Ok(Ok(())))
+                    },
                     _ = cancellation.cancelled() => {
                         if let Some(lease) = lease.take() {
                             let _ = self.key_pool.cancel(lease.request_id).await;
@@ -1693,6 +1872,32 @@ impl LiveGateway {
                         established: false,
                     });
                 }
+                _ = tokio::time::sleep_until(last_rx + self.idle_timeout) => {
+                    // Half-open socket: nothing (not even a pong) arrived.
+                    if let Some(lease) = lease.take() {
+                        let _ = self.key_pool.cancel(lease.request_id).await;
+                    }
+                    let _ = socket.close().await;
+                    return Ok(SocketEnd::Reconnect {
+                        handle,
+                        established,
+                    });
+                }
+                _ = ping_timer.tick() => {
+                    if !matches!(
+                        tokio::time::timeout(SEND_TIMEOUT, socket.ping()).await,
+                        Ok(Ok(()))
+                    ) {
+                        if let Some(lease) = lease.take() {
+                            let _ = self.key_pool.cancel(lease.request_id).await;
+                        }
+                        return Ok(SocketEnd::Reconnect {
+                            handle,
+                            established,
+                        });
+                    }
+                    None
+                }
                 result = socket.receive_text() => Some(result),
                 _ = ring_changed.notified(), if !sent_audio => continue,
                 // When the ring is continuously full, poll the socket once
@@ -1704,7 +1909,9 @@ impl LiveGateway {
             let Some(incoming) = incoming else {
                 continue;
             };
+            last_rx = tokio::time::Instant::now();
             let message = match incoming {
+                Ok(LiveReceiveMessage::Activity) => continue,
                 Ok(LiveReceiveMessage::Text(message)) => message,
                 Ok(LiveReceiveMessage::Closed { code }) => {
                     if !established && matches!(code, Some(1007 | 1008)) {
@@ -1838,6 +2045,14 @@ impl LiveGateway {
                     established: false,
                 });
             }
+            if established && parsed.error_status.is_some() {
+                // An in-band error after setup ends the session server-side.
+                let _ = socket.close().await;
+                return Ok(SocketEnd::Reconnect {
+                    handle,
+                    established: true,
+                });
+            }
             if parsed.go_away {
                 if let Some(active_lease) = lease.take() {
                     let _ = self.key_pool.cancel(active_lease.request_id).await;
@@ -1900,7 +2115,11 @@ fn parse_server_message(raw: &str) -> Option<ParsedServerMessage> {
         .server_content
         .and_then(|content| content.input_transcription)
         .and_then(|transcription| transcription.text);
-    parsed.error_status = value.error.and_then(|error| error.code);
+    // Presence of `error` is what matters; an unparsable code maps to 0 so it
+    // is still treated as a (non-key, non-request) error.
+    parsed.error_status = value
+        .error
+        .map(|error| error.code.and_then(WireErrorCode::status).unwrap_or(0));
     Some(parsed)
 }
 
@@ -1948,7 +2167,27 @@ struct WireTranscription {
 #[derive(Deserialize)]
 struct WireServerError {
     #[serde(default)]
-    code: Option<u16>,
+    code: Option<WireErrorCode>,
+}
+
+/// The server has sent numeric and string codes; both (and out-of-range
+/// numbers) must parse without failing the whole message.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum WireErrorCode {
+    Number(serde_json::Number),
+    Text(String),
+    Other(serde::de::IgnoredAny),
+}
+
+impl WireErrorCode {
+    fn status(self) -> Option<u16> {
+        match self {
+            Self::Number(number) => number.as_u64().and_then(|value| u16::try_from(value).ok()),
+            Self::Text(text) => text.trim().parse::<u16>().ok(),
+            Self::Other(_) => None,
+        }
+    }
 }
 
 fn validate_config(config: &LiveRunConfig) -> Result<(), LiveFailure> {
@@ -2048,12 +2287,13 @@ fn build_setup_message(
 fn build_audio_message(chunk: &PcmChunk) -> Result<String, LiveFailure> {
     if chunk.sample_rate != OUTPUT_SAMPLE_RATE
         || chunk.channels != OUTPUT_CHANNELS
-        || chunk.samples.len() != OUTPUT_CHUNK_SAMPLES
+        || chunk.gated_samples.len() != OUTPUT_CHUNK_SAMPLES
     {
         return Err(AppError::new(Code::Format, "Invalid Gemini Live PCM chunk").into());
     }
-    let mut pcm = Vec::with_capacity(chunk.samples.len() * 2);
-    for sample in &chunk.samples {
+    // Only the noise-gated mix goes to Gemini; the archive keeps the raw one.
+    let mut pcm = Vec::with_capacity(chunk.gated_samples.len() * 2);
+    for sample in &chunk.gated_samples {
         pcm.extend_from_slice(&sample.to_le_bytes());
     }
     let payload = serde_json::json!({
@@ -2257,6 +2497,22 @@ impl LiveSocketConnector for GeminiLiveSocketConnector {
     }
 }
 
+/// Maps one WebSocket frame to a receive result. Gemini can deliver its JSON
+/// as binary frames, so those are decoded as UTF-8 text; invalid UTF-8 is a
+/// transport error (the caller reconnects).
+fn decode_frame(frame: Message) -> Result<LiveReceiveMessage, LiveTransportError> {
+    match frame {
+        Message::Text(text) => Ok(LiveReceiveMessage::Text(text.to_string())),
+        Message::Binary(bytes) => String::from_utf8(bytes.to_vec())
+            .map(LiveReceiveMessage::Text)
+            .map_err(|_| LiveTransportError),
+        Message::Close(frame) => Ok(LiveReceiveMessage::Closed {
+            code: frame.map(|frame| u16::from(frame.code)),
+        }),
+        Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => Ok(LiveReceiveMessage::Activity),
+    }
+}
+
 struct TungsteniteLiveSocket {
     socket: tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
@@ -2275,21 +2531,20 @@ impl LiveSocket for TungsteniteLiveSocket {
 
     fn receive_text<'a>(&'a mut self) -> ReceiveFuture<'a> {
         Box::pin(async move {
-            loop {
-                match self.socket.next().await {
-                    Some(Ok(Message::Text(text))) => {
-                        return Ok(LiveReceiveMessage::Text(text.to_string()));
-                    }
-                    Some(Ok(Message::Close(frame))) => {
-                        let code = frame.map(|frame| u16::from(frame.code));
-                        return Ok(LiveReceiveMessage::Closed { code });
-                    }
-                    None => return Ok(LiveReceiveMessage::Eof),
-                    Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => continue,
-                    Some(Ok(Message::Binary(_))) => continue,
-                    Some(Err(_)) => return Err(LiveTransportError),
-                }
+            match self.socket.next().await {
+                Some(Ok(frame)) => decode_frame(frame),
+                None => Ok(LiveReceiveMessage::Eof),
+                Some(Err(_)) => Err(LiveTransportError),
             }
+        })
+    }
+
+    fn ping<'a>(&'a mut self) -> SendFuture<'a> {
+        Box::pin(async move {
+            self.socket
+                .send(Message::Ping(Vec::new().into()))
+                .await
+                .map_err(|_| LiveTransportError)
         })
     }
 
