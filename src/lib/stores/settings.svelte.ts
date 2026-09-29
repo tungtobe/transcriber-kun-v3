@@ -8,6 +8,7 @@ import {
   type ConsentPolicy,
   type ConsentStatus,
   type ModelKind,
+  type LiveTarget,
   type Settings,
   type Theme,
   type TranscribeLanguage,
@@ -40,6 +41,7 @@ const DEFAULT_CHUNK_MINUTES = 5;
 const MAX_CHUNK_MINUTES = 60;
 const DEFAULT_TIMESTAMP_OFFSET_SEC = 0;
 const DEFAULT_TRANSCRIBE_LANGUAGE: TranscribeLanguage = 'auto';
+const DEFAULT_LIVE_TARGET: LiveTarget = 'none';
 const DEFAULT_SETTINGS: Settings = {
   theme: 'system',
   uiLanguage: 'system',
@@ -52,6 +54,7 @@ const DEFAULT_SETTINGS: Settings = {
   chunkMinutes: DEFAULT_CHUNK_MINUTES,
   timestampOffsetSec: DEFAULT_TIMESTAMP_OFFSET_SEC,
   transcribeLanguage: DEFAULT_TRANSCRIBE_LANGUAGE,
+  liveTarget: DEFAULT_LIVE_TARGET,
 };
 
 function isTheme(value: unknown): value is Theme {
@@ -60,6 +63,10 @@ function isTheme(value: unknown): value is Theme {
 
 function isTranscribeLanguage(value: unknown): value is TranscribeLanguage {
   return value === 'auto' || value === 'ja' || value === 'vi' || value === 'en';
+}
+
+function isLiveTarget(value: unknown): value is LiveTarget {
+  return value === 'none' || value === 'ja' || value === 'vi' || value === 'en';
 }
 
 /** A non-negative integer, e.g. a hand-edited/legacy row's `0.5` or `-1`. */
@@ -139,6 +146,7 @@ function normalizeSettings(value: Partial<Settings> | null | undefined): Setting
     transcribeLanguage: isTranscribeLanguage(value?.transcribeLanguage)
       ? value.transcribeLanguage
       : DEFAULT_TRANSCRIBE_LANGUAGE,
+    liveTarget: isLiveTarget(value?.liveTarget) ? value.liveTarget : DEFAULT_LIVE_TARGET,
   };
 }
 
@@ -175,6 +183,7 @@ export function createSettingsStore() {
   let chunkMinutes = $state(DEFAULT_CHUNK_MINUTES);
   let timestampOffsetSec = $state(DEFAULT_TIMESTAMP_OFFSET_SEC);
   let transcribeLanguage = $state<TranscribeLanguage>(DEFAULT_TRANSCRIBE_LANGUAGE);
+  let liveTarget = $state<LiveTarget>(DEFAULT_LIVE_TARGET);
   let consentPolicy = $state<ConsentPolicy | null>(null);
   let status = $state<SettingsStatus>('idle');
   let error = $state<AppError | null>(null);
@@ -210,6 +219,7 @@ export function createSettingsStore() {
       chunkMinutes,
       timestampOffsetSec,
       transcribeLanguage,
+      liveTarget,
     } as Settings;
     // Keep compatibility with pre-consent test doubles/older WebViews while
     // the real Rust snapshot always includes these fields after load.
@@ -232,6 +242,7 @@ export function createSettingsStore() {
     chunkMinutes = next.chunkMinutes;
     timestampOffsetSec = next.timestampOffsetSec;
     transcribeLanguage = next.transcribeLanguage;
+    liveTarget = next.liveTarget;
     cacheTheme(theme);
     resolvedTheme = applyTheme(theme);
     i18n.applyPreference(uiLanguage);
@@ -300,6 +311,7 @@ export function createSettingsStore() {
       chunkMinutes: DEFAULT_CHUNK_MINUTES,
       timestampOffsetSec: DEFAULT_TIMESTAMP_OFFSET_SEC,
       transcribeLanguage: DEFAULT_TRANSCRIBE_LANGUAGE,
+      liveTarget: DEFAULT_LIVE_TARGET,
     };
     persistedSettings = cached;
     applySettings(cached);
@@ -492,6 +504,16 @@ export function createSettingsStore() {
     return persist({ ...snapshot(), transcribeLanguage: next });
   }
 
+  async function setLiveTarget(next: LiveTarget): Promise<void> {
+    if (!isLiveTarget(next)) return;
+    const waiting = ensureReady();
+    applySettings({ ...snapshot(), liveTarget: next });
+    error = null;
+    status = 'ready';
+    if (waiting) await waiting;
+    return persist({ ...snapshot(), liveTarget: next });
+  }
+
   async function setOnboardingCompleted(next: boolean): Promise<void> {
     const waiting = ensureReady();
     applySettings({ ...snapshot(), onboardingCompleted: next });
@@ -543,6 +565,7 @@ export function createSettingsStore() {
     get chunkMinutes() { return chunkMinutes; },
     get timestampOffsetSec() { return timestampOffsetSec; },
     get transcribeLanguage() { return transcribeLanguage; },
+    get liveTarget() { return liveTarget; },
     get consentPolicy() { return consentPolicy; },
     get consentStatus(): ConsentStatus { return consentPolicy?.status ?? 'pending'; },
     get status() { return status; },
@@ -558,6 +581,7 @@ export function createSettingsStore() {
     setChunkMinutes,
     setTimestampOffsetSec,
     setTranscribeLanguage,
+    setLiveTarget,
     setOnboardingCompleted,
     acceptConsent,
     declineConsent,

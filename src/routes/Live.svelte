@@ -7,19 +7,34 @@
     type TagPickerCreateResult,
   } from '../components/TagPicker.svelte';
   import { AlertTriangleIcon, RadioIcon, RefreshCwIcon, TagIcon } from '../components/icons';
-  import { i18n } from '../i18n/index.svelte';
+  import { i18n, type TranslationKey } from '../i18n/index.svelte';
   import { registerKeymap } from '../lib/keymap';
-  import { commands, type PermissionState, type TranscribeLanguage } from '../lib/bindings';
+  import {
+    commands,
+    type LiveTarget,
+    type PermissionState,
+    type TranscribeLanguage,
+  } from '../lib/bindings';
   import { liveStore } from '../lib/stores/live.svelte';
   import { keysStore } from '../lib/stores/keys.svelte';
   import { libraryStore } from '../lib/stores/library.svelte';
   import { settingsStore } from '../lib/stores/settings.svelte';
 
   type SourceMode = 'mixed' | 'system' | 'microphone';
+  type ViewMode = 'source' | 'translated' | 'both';
+  const viewModes: Array<{ mode: ViewMode; labelKey: TranslationKey }> = [
+    { mode: 'source', labelKey: 'live.view.source' },
+    { mode: 'translated', labelKey: 'live.view.translated' },
+    { mode: 'both', labelKey: 'live.view.both' },
+  ];
 
   let sourceMode = $state<SourceMode>('mixed');
   let microphone = $state('');
   let language = $state<TranscribeLanguage>(settingsStore.transcribeLanguage);
+  let target = $state<LiveTarget>(settingsStore.liveTarget);
+  let viewMode = $state<ViewMode>('both');
+  let targetPending = $state(0);
+  let targetError = $state(false);
   let selectedTagIds = $state<string[]>([]);
   let tagPickerOpen = $state(false);
   let tagButton = $state<HTMLButtonElement | null>(null);
@@ -46,6 +61,12 @@
   const hasKey = $derived(keysStore.status === 'ready' && keysStore.hasUsableKey);
   const sourceReady = $derived(liveStore.sourceStatus === 'ready' && liveStore.sources !== null);
   const microphones = $derived(liveStore.sources?.microphones ?? []);
+  // The Target actually in effect: the session's while one exists.
+  const activeTarget = $derived<LiveTarget>(hasSession ? liveStore.snapshot.target : target);
+  const translating = $derived(activeTarget !== 'none');
+  const showSourceColumn = $derived(!translating || viewMode !== 'translated');
+  const showTranslatedColumn = $derived(translating && viewMode !== 'source');
+  const twoColumns = $derived(showSourceColumn && showTranslatedColumn);
 
   const sourceValue = $derived.by(() => {
     if (sourceMode === 'system') return 'system';
@@ -104,6 +125,8 @@
   $effect(() => {
     void liveStore.lines.length;
     void liveStore.draft;
+    void liveStore.translatedLines.length;
+    void liveStore.translatedDraft;
     if (!isRunning || !autoScroll || !transcriptEl) return;
     transcriptEl.scrollTop = transcriptEl.scrollHeight;
     previousScrollTop = transcriptEl.scrollTop;
@@ -130,6 +153,14 @@
     update();
     const timer = window.setInterval(update, 250);
     return () => window.clearInterval(timer);
+  });
+
+  // Follow the Target the backend confirms (swap done, or a remount) unless
+  // the user has a change in flight.
+  $effect(() => {
+    const actual = liveStore.snapshot.target;
+    if (!hasSession || targetPending > 0) return;
+    target = actual;
   });
 
   function startOrStop(): void {
@@ -161,7 +192,7 @@
     if (!canStart) return;
     startPending = true;
     autoScroll = true;
-    const error = await liveStore.start(sourceValue, language, i18n.locale, selectedTagIds);
+    const error = await liveStore.start(sourceValue, language, target, i18n.locale, selectedTagIds);
     startPending = false;
     if (!error) notesFlushError = false;
     if (error?.category === 'permission') {
@@ -255,6 +286,23 @@
     if (error) {
       sourceMode = previous;
       if (error.category === 'permission') await liveStore.loadSources(true);
+    }
+  }
+
+  async function changeTarget(event: Event): Promise<void> {
+    const value = (event.currentTarget as HTMLSelectElement).value as LiveTarget;
+    target = value;
+    if (!isRunning) return;
+    targetError = false;
+    targetPending += 1;
+    const error = await liveStore.setTarget(value);
+    targetPending -= 1;
+    if (error) {
+      targetError = true;
+      // Show what is really in effect, not the rejected choice.
+      target = liveStore.snapshot.target;
+    } else if (targetPending === 0) {
+      target = liveStore.snapshot.target;
     }
   }
 
@@ -516,6 +564,16 @@
           </select>
         </label>
 
+        <label class="field">
+          <span>{i18n.t('live.config.target')}</span>
+          <select value={target} onchange={changeTarget}>
+            <option value="none">{i18n.t('live.target.none')}</option>
+            <option value="ja">{i18n.t('live.target.ja')}</option>
+            <option value="vi">{i18n.t('live.target.vi')}</option>
+            <option value="en">{i18n.t('live.target.en')}</option>
+          </select>
+        </label>
+
         <div class="field tag-field">
           <span>{i18n.t('live.config.tags')}</span>
           <div class="tag-picker-anchor">
@@ -599,6 +657,15 @@
             </select>
           </label>
         {/if}
+        <label class="compact-source">
+          <span class="sr-only">{i18n.t('live.target.label')}</span>
+          <select value={target} onchange={changeTarget} disabled={!isRunning || liveStore.snapshot.transcription !== 'active'} aria-label={i18n.t('live.target.label')}>
+            <option value="none">{i18n.t('live.target.none')}</option>
+            <option value="ja">{i18n.t('live.target.ja')}</option>
+            <option value="vi">{i18n.t('live.target.vi')}</option>
+            <option value="en">{i18n.t('live.target.en')}</option>
+          </select>
+        </label>
         {#if isRunning}
           <button class="button button-danger-soft" type="button" disabled={stopPending} onclick={() => void stop()}>
             {stopPending ? i18n.t('live.recording.stopping') : i18n.t('live.recording.stop')}
@@ -610,10 +677,38 @@
         {/if}
       </div>
     </div>
+    {#if targetError}
+      <p class="live-error target-error" role="alert">
+        <AlertTriangleIcon size={18} strokeWidth={1.75} aria-hidden="true" />
+        <span>{i18n.t('live.target.error')}</span>
+      </p>
+    {/if}
     <div class="live-layout">
       <section class="transcript-card" aria-label={i18n.t('live.transcript.label')}>
         <header class="transcript-header">
           <h2>{i18n.t('live.transcript.title')}</h2>
+          <div class="transcript-tools">
+            {#if translating}
+              <div class="view-toggle" role="group" aria-label={i18n.t('live.view.label')}>
+                {#each viewModes as item (item.mode)}
+                  <button
+                    type="button"
+                    class:view-active={viewMode === item.mode}
+                    aria-pressed={viewMode === item.mode}
+                    onclick={() => (viewMode = item.mode)}
+                  >{i18n.t(item.labelKey)}</button>
+                {/each}
+              </div>
+            {/if}
+            <button
+              type="button"
+              class="tts-toggle"
+              aria-pressed="false"
+              disabled
+              title={translating ? i18n.t('live.tts.comingSoon') : i18n.t('live.tts.noTarget')}
+              aria-label={i18n.t('live.tts.label')}
+            >{i18n.t('live.tts.label')}</button>
+          </div>
         </header>
 
         <div
@@ -625,27 +720,53 @@
           aria-live="polite"
           aria-relevant="additions text"
         >
-          {#each liveStore.lines as line, index (index)}
-            <article class:gap-line={line.kind === 'gap'} class="transcript-line">
-              {#if line.kind === 'segment'}
-                <p>{line.segment.text}</p>
-              {:else}
-                <p>{gapLabel()}</p>
-              {/if}
-            </article>
-          {/each}
-          {#if liveStore.draft}
-            <article class="transcript-line interim-line">
-              <p>{liveStore.draft}<span class="live-caret" aria-hidden="true">▍</span></p>
-            </article>
-          {:else if liveStore.snapshot.transcription !== 'active' && liveStore.lines.length === 0}
-            <p class="listening-empty">{i18n.t('live.transcript.stopped')}</p>
-          {:else if isRunning && liveStore.lines.length === 0}
-            <p class="listening-empty">{i18n.t('live.transcript.listening')}<span class="live-caret" aria-hidden="true">▍</span></p>
-          {/if}
-          {#if !isRunning && liveStore.lines.length === 0 && !liveStore.draft}
-            <p class="listening-empty">{i18n.t('live.transcript.empty')}</p>
-          {/if}
+          <div class="transcript-columns" class:two-columns={twoColumns}>
+            {#if showSourceColumn}
+              <div class="transcript-column" data-column="source">
+                {#if translating}
+                  <h3 class="column-title">{i18n.t('live.column.source', { language })}</h3>
+                {/if}
+                {#each liveStore.lines as line, index (index)}
+                  <article class:gap-line={line.kind === 'gap'} class="transcript-line">
+                    {#if line.kind === 'segment'}
+                      <p>{line.segment.text}</p>
+                    {:else}
+                      <p>{gapLabel()}</p>
+                    {/if}
+                  </article>
+                {/each}
+                {#if liveStore.draft}
+                  <article class="transcript-line interim-line">
+                    <p>{liveStore.draft}<span class="live-caret" aria-hidden="true">▍</span></p>
+                  </article>
+                {:else if liveStore.snapshot.transcription !== 'active' && liveStore.lines.length === 0}
+                  <p class="listening-empty">{i18n.t('live.transcript.stopped')}</p>
+                {:else if isRunning && liveStore.lines.length === 0}
+                  <p class="listening-empty">{i18n.t('live.transcript.listening')}<span class="live-caret" aria-hidden="true">▍</span></p>
+                {/if}
+                {#if !isRunning && liveStore.lines.length === 0 && !liveStore.draft}
+                  <p class="listening-empty">{i18n.t('live.transcript.empty')}</p>
+                {/if}
+              </div>
+            {/if}
+            {#if showTranslatedColumn}
+              <div class="transcript-column" data-column="translated">
+                <h3 class="column-title">{i18n.t('live.column.translated', { target: activeTarget })}</h3>
+                {#each liveStore.translatedLines as line (line.seq)}
+                  <article class="transcript-line">
+                    <p>{line.segment.text}</p>
+                  </article>
+                {/each}
+                {#if liveStore.translatedDraft}
+                  <article class="transcript-line interim-line">
+                    <p>{liveStore.translatedDraft}<span class="live-caret" aria-hidden="true">▍</span></p>
+                  </article>
+                {:else if liveStore.translatedLines.length === 0}
+                  <p class="listening-empty">{i18n.t('live.translation.empty')}</p>
+                {/if}
+              </div>
+            {/if}
+          </div>
         </div>
         {#if !autoScroll && isRunning}
           <button type="button" class="scroll-latest" onclick={scrollToLatest}>{i18n.t('live.transcript.scrollLatest')}</button>
@@ -750,6 +871,19 @@
     .compact-source select { min-height:34px; max-width:170px; padding-inline:var(--space-2); font-size:var(--text-help-size); }
   .transcript-list { flex:1; min-height:0; overflow:auto; padding:var(--space-4) var(--space-5); }
   .transcript-line { display:block; padding:var(--space-3) 0; border-bottom:1px solid var(--color-border); }
+  .transcript-tools { display:flex; flex-wrap:wrap; align-items:center; gap:var(--space-2); }
+  .view-toggle { display:inline-flex; overflow:hidden; border:1px solid var(--color-border-strong); border-radius:var(--radius-md); }
+  .view-toggle button { min-height:30px; padding:0 var(--space-3); border:0; background:var(--color-bg); color:var(--color-text-secondary); font:inherit; font-size:var(--text-help-size); cursor:pointer; }
+  .view-toggle button + button { border-left:1px solid var(--color-border-strong); }
+  .view-toggle button.view-active { background:var(--color-accent-soft); color:var(--color-accent); font-weight:600; }
+  .tts-toggle { min-height:30px; padding:0 var(--space-3); border:1px solid var(--color-border-strong); border-radius:var(--radius-md); background:var(--color-bg); color:var(--color-text-muted); font:inherit; font-size:var(--text-help-size); }
+  .tts-toggle:disabled { cursor:not-allowed; opacity:.7; }
+  .transcript-columns { display:grid; grid-template-columns:minmax(0,1fr); gap:var(--space-5); }
+  .transcript-columns.two-columns { grid-template-columns:repeat(2,minmax(0,1fr)); }
+  .transcript-column { min-width:0; }
+  .column-title { margin:0 0 var(--space-2); color:var(--color-text-muted); font-size:var(--text-help-size); font-weight:600; }
+  .target-error { align-items:center; }
+  .target-error span { flex:1; }
   .transcript-line p { margin:0; white-space:pre-wrap; line-height:1.65; }
   .gap-line { display:block; margin-block:var(--space-2); padding:var(--space-3); border-radius:var(--radius-md); background:var(--color-surface-sunken); color:var(--color-text-muted); font-style:italic; }
   .interim-line { color:var(--color-text-secondary); }

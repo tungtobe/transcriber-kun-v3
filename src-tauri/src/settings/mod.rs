@@ -62,6 +62,30 @@ impl TranscribeLanguage {
     }
 }
 
+/// Ngôn ngữ đích dịch realtime của Live (story 5.1): `None` = "Không dịch".
+/// Độc lập với ngôn ngữ UI và ngôn ngữ transcribe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, Type)]
+#[serde(rename_all = "lowercase")]
+pub enum LiveTarget {
+    #[default]
+    None,
+    Ja,
+    Vi,
+    En,
+}
+
+impl LiveTarget {
+    /// Mã `targetLanguageCode` gửi cho Gemini; `None` khi không dịch.
+    pub fn as_code(self) -> Option<&'static str> {
+        match self {
+            LiveTarget::None => None,
+            LiveTarget::Ja => Some("ja"),
+            LiveTarget::Vi => Some("vi"),
+            LiveTarget::En => Some("en"),
+        }
+    }
+}
+
 /// `chunkMinutes` mặc định (spec Approach: "mặc định 5") -- cũng là giá trị
 /// `load` fallback về khi khoá thiếu hoặc hỏng.
 const DEFAULT_CHUNK_MINUTES: u32 = 5;
@@ -105,6 +129,8 @@ pub struct Settings {
     /// Ngôn ngữ transcribe file/Live (không phải ngôn ngữ UI). Job chụp cùng
     /// lúc với `chunk_minutes`/`model`.
     pub transcribe_language: TranscribeLanguage,
+    /// Target dịch realtime mặc định của Live (nhóm Settings "Live").
+    pub live_target: LiveTarget,
 }
 
 /// Derived manually (not `#[derive(Default)]`) so the three model fields
@@ -127,6 +153,7 @@ impl Default for Settings {
             chunk_minutes: DEFAULT_CHUNK_MINUTES,
             timestamp_offset_sec: 0,
             transcribe_language: TranscribeLanguage::default(),
+            live_target: LiveTarget::default(),
         }
     }
 }
@@ -147,6 +174,7 @@ const KEY_MEMO_MODEL: &str = "memoModel";
 const KEY_CHUNK_MINUTES: &str = "chunkMinutes";
 const KEY_TIMESTAMP_OFFSET_SEC: &str = "timestampOffsetSec";
 const KEY_TRANSCRIBE_LANGUAGE: &str = "transcribeLanguage";
+const KEY_LIVE_TARGET: &str = "liveTarget";
 
 /// Shared by `load`'s three model branches: missing key, corrupt JSON, and a
 /// parsed-but-blank string (e.g. a hand-edited DB row) all fall back to
@@ -289,6 +317,17 @@ pub fn load(db: &Db) -> Settings {
         }),
     };
 
+    let live_target = match raw.get(KEY_LIVE_TARGET) {
+        None => LiveTarget::default(),
+        Some(value) => serde_json::from_str::<LiveTarget>(value).unwrap_or_else(|_| {
+            tracing::warn!(
+                key = KEY_LIVE_TARGET,
+                "giá trị settings không parse được, dùng mặc định"
+            );
+            LiveTarget::default()
+        }),
+    };
+
     Settings {
         theme,
         ui_language,
@@ -301,6 +340,7 @@ pub fn load(db: &Db) -> Settings {
         chunk_minutes,
         timestamp_offset_sec,
         transcribe_language,
+        live_target,
     }
 }
 
@@ -373,6 +413,9 @@ pub fn save(db: &Db, settings: &Settings) -> Result<(), AppError> {
     let transcribe_language_json = serde_json::to_string(&settings.transcribe_language)
         .map_err(|err| AppError::new(Code::Format, err.to_string()))?;
 
+    let live_target_json = serde_json::to_string(&settings.live_target)
+        .map_err(|err| AppError::new(Code::Format, err.to_string()))?;
+
     db.with_connection(|conn| {
         Ok(repo::settings::upsert_many(
             conn,
@@ -388,6 +431,7 @@ pub fn save(db: &Db, settings: &Settings) -> Result<(), AppError> {
                 (KEY_CHUNK_MINUTES, chunk_minutes_json),
                 (KEY_TIMESTAMP_OFFSET_SEC, timestamp_offset_sec_json),
                 (KEY_TRANSCRIBE_LANGUAGE, transcribe_language_json),
+                (KEY_LIVE_TARGET, live_target_json),
             ],
         )?)
     })
@@ -1158,6 +1202,58 @@ mod tests {
                 ..Default::default()
             }
         );
+    }
+
+    // Story 5.1: `liveTarget`.
+    #[test]
+    fn live_target_defaults_to_none_and_round_trips() {
+        let db = open_db();
+        assert_eq!(load(&db).live_target, LiveTarget::None);
+        for target in [LiveTarget::Vi, LiveTarget::En, LiveTarget::Ja, LiveTarget::None] {
+            save(
+                &db,
+                &Settings {
+                    live_target: target,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(load(&db).live_target, target);
+        }
+    }
+
+    #[test]
+    fn live_target_serializes_lowercase_and_maps_to_codes() {
+        assert_eq!(serde_json::to_string(&LiveTarget::None).unwrap(), "\"none\"");
+        assert_eq!(serde_json::to_string(&LiveTarget::Vi).unwrap(), "\"vi\"");
+        assert_eq!(LiveTarget::None.as_code(), None);
+        assert_eq!(LiveTarget::Ja.as_code(), Some("ja"));
+        assert_eq!(LiveTarget::En.as_code(), Some("en"));
+    }
+
+    #[test]
+    fn corrupt_live_target_falls_back_without_losing_other_fields() {
+        let db = open_db();
+        save(
+            &db,
+            &Settings {
+                live_target: LiveTarget::Vi,
+                transcribe_language: TranscribeLanguage::Ja,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.with_connection(|conn| {
+            conn.execute(
+                "UPDATE settings SET value = '\"auto\"' WHERE key = 'liveTarget'",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let loaded = load(&db);
+        assert_eq!(loaded.live_target, LiveTarget::None);
+        assert_eq!(loaded.transcribe_language, TranscribeLanguage::Ja);
     }
 
     #[test]

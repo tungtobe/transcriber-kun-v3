@@ -28,7 +28,7 @@ use crate::library;
 use crate::live::{LiveEvent, LiveStartParams};
 use crate::memo;
 use crate::secrets::{KeyId, KeyMetadata};
-use crate::settings::{self, Settings, SettingsChanged, TranscribeLanguage};
+use crate::settings::{self, LiveTarget, Settings, SettingsChanged, TranscribeLanguage};
 use crate::transcribe::job::{CancelOutcome, JobEvent};
 use crate::transcribe::registry::{self, RerunOutcome, RerunParams, RetranscribeParams};
 use crate::transcribe::rerun::{self, RerunScope};
@@ -222,6 +222,23 @@ async fn live_set_source(
     track_ipc_error(&state.db, result).await
 }
 
+/// Changes the translation Target of the running Live session (`none` turns
+/// translation off). The actor swaps in a new generation without interrupting
+/// the source transcript; a failure keeps the current Target.
+#[tauri::command]
+#[specta::specta]
+async fn live_set_target(
+    target: LiveTarget,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), AppError> {
+    let result = async {
+        let live = state.live.clone()?;
+        live.set_target(target).await
+    }
+    .await;
+    track_ipc_error(&state.db, result).await
+}
+
 /// Starts the one process-wide Live session. Consent and model preferences
 /// are captured from the durable Rust settings snapshot before capture opens.
 #[tauri::command]
@@ -229,6 +246,7 @@ async fn live_set_source(
 async fn live_start(
     source: String,
     language: TranscribeLanguage,
+    target: LiveTarget,
     locale: String,
     tag_ids: Vec<TagId>,
     state: tauri::State<'_, AppState>,
@@ -243,6 +261,7 @@ async fn live_start(
         live.start(LiveStartParams {
             source,
             language,
+            target,
             tag_ids,
             locale: Some(locale),
             ui_language: settings.ui_language,
@@ -2827,6 +2846,7 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             live_sources,
             live_open_permission_settings,
             live_set_source,
+            live_set_target,
             live_start,
             live_stop,
             live_continue_recording_only,

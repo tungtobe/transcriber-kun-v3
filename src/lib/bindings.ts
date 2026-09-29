@@ -30,10 +30,16 @@ export const commands = {
 	 */
 	liveSetSource: (source: string) => typedError<null, AppError>(__TAURI_INVOKE("live_set_source", { source })),
 	/**
+	 *  Changes the translation Target of the running Live session (`none` turns
+	 *  translation off). The actor swaps in a new generation without interrupting
+	 *  the source transcript; a failure keeps the current Target.
+	 */
+	liveSetTarget: (target: LiveTarget) => typedError<null, AppError>(__TAURI_INVOKE("live_set_target", { target })),
+	/**
 	 *  Starts the one process-wide Live session. Consent and model preferences
 	 *  are captured from the durable Rust settings snapshot before capture opens.
 	 */
-	liveStart: (source: string, language: TranscribeLanguage, locale: string, tagIds: string[]) => typedError<string, AppError>(__TAURI_INVOKE("live_start", { source, language, locale, tagIds })),
+	liveStart: (source: string, language: TranscribeLanguage, target: LiveTarget, locale: string, tagIds: string[]) => typedError<string, AppError>(__TAURI_INVOKE("live_start", { source, language, target, locale, tagIds })),
 	/**
 	 *  Stop capture, flush the final transcript and WAV, then commit the Live
 	 *  session as complete before returning its ID.
@@ -592,7 +598,13 @@ export type KeyTestResult = {
  *  Typed Live stream. The ready variant carries the snapshot and cursor sent
  *  by the actor in the same command that registers the Channel.
  */
-export type LiveEvent = { type: "ready"; seq: number; snapshot: LiveSnapshot } | { type: "delta"; seq: number; text: string } | { type: "turn"; seq: number } | { type: "segment"; seq: number; segment: LiveSegment } | { type: "gap"; seq: number; startSec: number | null; endSec: number | null; reason: string } | { type: "recording"; seq: number; state: RecordingState } | { type: "connection"; seq: number; state: ConnectionState } | { type: "transcription"; seq: number; state: TranscriptionState } | { type: "log"; seq: number; message: string } | { type: "error"; seq: number; error: AppError } | { type: "done"; seq: number } | { type: "final"; seq: number; sessionId: string; transcriptId: string; durationSec: number | null };
+export type LiveEvent = { type: "ready"; seq: number; snapshot: LiveSnapshot } | { type: "delta"; seq: number; text: string } | { type: "turn"; seq: number } | { type: "segment"; seq: number; segment: LiveSegment } | 
+/**  Translated text in progress. UI only: never persisted. */
+{ type: "deltaTranslated"; seq: number; text: string } | 
+/**  A completed translated sentence. UI only: never persisted. */
+{ type: "segmentTranslated"; seq: number; segment: LiveSegment } | 
+/**  The Target actually in effect changed (after a successful swap). */
+{ type: "target"; seq: number; target: LiveTarget } | { type: "gap"; seq: number; startSec: number | null; endSec: number | null; reason: string } | { type: "recording"; seq: number; state: RecordingState } | { type: "connection"; seq: number; state: ConnectionState } | { type: "transcription"; seq: number; state: TranscriptionState } | { type: "log"; seq: number; message: string } | { type: "error"; seq: number; error: AppError } | { type: "done"; seq: number } | { type: "final"; seq: number; sessionId: string; transcriptId: string; durationSec: number | null };
 
 /**
  *  A microphone visible to the frontend. `source` is the opaque value passed
@@ -622,6 +634,8 @@ export type LiveSnapshot = {
 	transcription: TranscriptionState,
 	errorCategory: Category | null,
 	durationSec: number | null,
+	/**  Translation Target actually in effect (`none` = no translation). */
+	target: LiveTarget,
 };
 
 /**
@@ -635,6 +649,12 @@ export type LiveSources = {
 	microphonePermission: PermissionState,
 	systemPermission: PermissionState,
 };
+
+/**
+ *  Ngôn ngữ đích dịch realtime của Live (story 5.1): `None` = "Không dịch".
+ *  Độc lập với ngôn ngữ UI và ngôn ngữ transcribe.
+ */
+export type LiveTarget = "none" | "ja" | "vi" | "en";
 
 /**
  *  Kết quả `memo_generate` (story 3.7, spec Boundaries Always: "Kết quả
@@ -924,6 +944,8 @@ export type Settings = {
 	 *  lúc với `chunk_minutes`/`model`.
 	 */
 	transcribeLanguage: TranscribeLanguage,
+	/**  Target dịch realtime mặc định của Live (nhóm Settings "Live"). */
+	liveTarget: LiveTarget,
 };
 
 /**

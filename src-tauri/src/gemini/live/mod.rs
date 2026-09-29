@@ -6,6 +6,7 @@
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -21,7 +22,7 @@ use crate::core::sensitive::Sensitive;
 use crate::gemini::keys::{KeyLease, KeyPoolHandle, Priority, ReportAction, RequestOutcome};
 use crate::gemini::params::GEMINI_LIVE_WS_ENDPOINT;
 use crate::gemini::{CancellationToken, ConsentSnapshot};
-use crate::settings::{Settings, TranscribeLanguage};
+use crate::settings::{LiveTarget, Settings, TranscribeLanguage};
 
 const AUDIO_MIME: &str = "audio/pcm;rate=16000";
 const MAX_UNCONFIRMED_CHUNKS: usize = 600;
@@ -79,11 +80,18 @@ pub enum LiveConnectError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LiveTransportError;
 
-/// Events the Story 4.6 actor needs. Output audio and output transcription are
-/// deliberately absent from this type.
+/// Events the LiveSession actor needs. Output audio is deliberately absent
+/// from this type (TTS belongs to Story 5.3); output transcription is only
+/// emitted while a translation Target is configured.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LiveEvent {
     InputTranscription {
+        text: Sensitive<String>,
+        sample_start: u64,
+        sample_end: u64,
+    },
+    /// Translated text (UI only, never persisted).
+    OutputTranscription {
         text: Sensitive<String>,
         sample_start: u64,
         sample_end: u64,
@@ -126,6 +134,13 @@ impl From<AppError> for LiveFailure {
 pub struct LiveRunConfig {
     pub model: String,
     pub language: TranscribeLanguage,
+    /// Translation Target. `LiveTarget::None` disables translation output.
+    pub target: LiveTarget,
+    /// Sample-clock position where this generation's audio starts. A swapped-in
+    /// generation raises its transcript cursor to it so timestamps do not
+    /// jump back after a generation swap. Shared so it can be set after the
+    /// run has started (the candidate's audio gate opens at the swap).
+    pub start_sample: Arc<AtomicU64>,
 }
 
 impl LiveRunConfig {
@@ -133,6 +148,8 @@ impl LiveRunConfig {
         Self {
             model: settings.live_model.clone(),
             language: settings.transcribe_language,
+            target: settings.live_target,
+            start_sample: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -207,7 +224,7 @@ mod tests {
     use crate::gemini::keys::{KeyProvider, SystemClock};
     use crate::secrets::{KeyId, KeyMaterial};
     use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use tokio::sync::Notify;
 
     struct StaticProvider(Vec<KeyMaterial>);
@@ -253,7 +270,7 @@ mod tests {
     }
 
     #[test]
-    fn setup_json_matches_live_api_contract_for_each_source_language() {
+    fn setup_json_matches_live_api_contract_for_each_source_language_without_translation() {
         for (language, expected) in [
             (TranscribeLanguage::Auto, "ja"),
             (TranscribeLanguage::Ja, "ja"),
@@ -264,6 +281,8 @@ mod tests {
                 &LiveRunConfig {
                     model: "gemini-live-test".to_owned(),
                     language,
+                    target: LiveTarget::None,
+                    start_sample: Arc::new(AtomicU64::new(0)),
                 },
                 None,
             )
@@ -294,6 +313,8 @@ mod tests {
             &LiveRunConfig {
                 model: "models/gemini-live-test".to_owned(),
                 language: TranscribeLanguage::Ja,
+                target: LiveTarget::None,
+                start_sample: Arc::new(AtomicU64::new(0)),
             },
             Some(&Sensitive::new("latest-resumption-handle".to_owned())),
         )
@@ -303,6 +324,57 @@ mod tests {
             resumed["setup"]["sessionResumption"]["handle"],
             "latest-resumption-handle"
         );
+    }
+
+    #[test]
+    fn setup_json_with_a_target_enables_output_transcription_and_echo() {
+        for (target, code) in [
+            (LiveTarget::Vi, "vi"),
+            (LiveTarget::En, "en"),
+            (LiveTarget::Ja, "ja"),
+        ] {
+            let setup = build_setup_message(
+                &LiveRunConfig {
+                    model: "gemini-live-test".to_owned(),
+                    // The source language does not influence the Target.
+                    language: TranscribeLanguage::Auto,
+                    target,
+                    start_sample: Arc::new(AtomicU64::new(0)),
+                },
+                None,
+            )
+            .unwrap();
+            let actual: serde_json::Value = serde_json::from_str(&setup).unwrap();
+            let expected = serde_json::json!({
+                "setup": {
+                    "model": "models/gemini-live-test",
+                    "generationConfig": {
+                        "responseModalities": ["AUDIO"],
+                        "translationConfig": {
+                            "targetLanguageCode": code,
+                            "echoTargetLanguage": true,
+                        },
+                    },
+                    "sessionResumption": {},
+                    "contextWindowCompression": {
+                        "slidingWindow": { "targetTokens": SLIDING_WINDOW_TARGET_TOKENS },
+                    },
+                    "inputAudioTranscription": {},
+                    "outputAudioTranscription": {},
+                }
+            });
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn parser_reads_output_transcription_text() {
+        let parsed = parse_server_message(
+            r#"{"serverContent":{"outputTranscription":{"text":"xin chao"},"modelTurn":{"parts":[{"inlineData":{"data":"AAAA"}}]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.output_transcription.as_deref(), Some("xin chao"));
+        assert!(parsed.input_transcription.is_none());
     }
 
     #[test]
@@ -761,6 +833,8 @@ mod tests {
         LiveRunConfig {
             model: "gemini-live-test".to_owned(),
             language: TranscribeLanguage::En,
+            target: LiveTarget::None,
+            start_sample: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -1767,6 +1841,8 @@ impl LiveGateway {
                             cancellation.clone(),
                             last_handle.take(),
                             &mut transcript_sample_cursor,
+                            config.target != LiveTarget::None,
+                            config.start_sample.clone(),
                         )
                         .await?;
 
@@ -1823,6 +1899,8 @@ impl LiveGateway {
         cancellation: CancellationToken,
         mut handle: Option<Sensitive<String>>,
         transcript_sample_cursor: &mut u64,
+        translate: bool,
+        start_floor: Arc<AtomicU64>,
     ) -> Result<SocketEnd, LiveFailure> {
         let mut lease = Some(lease);
         if tokio::select! {
@@ -2048,6 +2126,10 @@ impl LiveGateway {
                     return Ok(SocketEnd::Cancelled);
                 }
             }
+            let floor = start_floor.load(AtomicOrdering::Acquire);
+            if *transcript_sample_cursor < floor {
+                *transcript_sample_cursor = floor;
+            }
             if let Some(text) = parsed.input_transcription {
                 let sample_end = {
                     let ring = ring.lock().expect("audio ring poisoned");
@@ -2061,6 +2143,33 @@ impl LiveGateway {
                 if !emit_event(
                     events,
                     LiveEvent::InputTranscription {
+                        text: Sensitive::new(text),
+                        sample_start: *transcript_sample_cursor,
+                        sample_end,
+                    },
+                    &cancellation,
+                )
+                .await
+                {
+                    if let Some(lease) = lease.take() {
+                        let _ = self.key_pool.cancel(lease.request_id).await;
+                    }
+                    return Ok(SocketEnd::Cancelled);
+                }
+            }
+            if let Some(text) = parsed.output_transcription.filter(|_| translate) {
+                let sample_end = {
+                    let ring = ring.lock().expect("audio ring poisoned");
+                    transcript_sample_end(
+                        last_sent_sample_end,
+                        ring.replay_cursor(),
+                        ring.observed_end,
+                        *transcript_sample_cursor,
+                    )
+                };
+                if !emit_event(
+                    events,
+                    LiveEvent::OutputTranscription {
                         text: Sensitive::new(text),
                         sample_start: *transcript_sample_cursor,
                         sample_end,
@@ -2177,6 +2286,7 @@ struct ParsedServerMessage {
     go_away: bool,
     error_status: Option<u16>,
     input_transcription: Option<String>,
+    output_transcription: Option<String>,
     /// Outer option means an update was present; inner option clears the saved
     /// handle when the server says the session is no longer resumable.
     resumption_handle: Option<Option<String>>,
@@ -2199,10 +2309,14 @@ fn parse_server_message(raw: &str) -> Option<ParsedServerMessage> {
             Some(None)
         };
     }
-    parsed.input_transcription = value
-        .server_content
-        .and_then(|content| content.input_transcription)
-        .and_then(|transcription| transcription.text);
+    if let Some(content) = value.server_content {
+        parsed.input_transcription = content
+            .input_transcription
+            .and_then(|transcription| transcription.text);
+        parsed.output_transcription = content
+            .output_transcription
+            .and_then(|transcription| transcription.text);
+    }
     // Presence of `error` is what matters; an unparsable code maps to 0 so it
     // is still treated as a (non-key, non-request) error.
     parsed.error_status = value
@@ -2242,6 +2356,8 @@ struct WireResumptionUpdate {
 struct WireServerContent {
     #[serde(default)]
     input_transcription: Option<WireTranscription>,
+    #[serde(default)]
+    output_transcription: Option<WireTranscription>,
     #[serde(default)]
     turn_complete: Option<serde::de::IgnoredAny>,
 }
@@ -2298,6 +2414,9 @@ struct LiveSetup {
     session_resumption: SessionResumption,
     context_window_compression: ContextWindowCompression,
     input_audio_transcription: EmptyObject,
+    /// Present only in translation mode: the model's translated text stream.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_audio_transcription: Option<EmptyObject>,
 }
 
 #[derive(Serialize)]
@@ -2311,6 +2430,8 @@ struct GenerationConfig {
 #[serde(rename_all = "camelCase")]
 struct TranslationConfig {
     target_language_code: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    echo_target_language: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -2344,11 +2465,16 @@ fn build_setup_message(
     } else {
         format!("models/{}", config.model)
     };
-    let target_language_code = match config.language {
-        TranscribeLanguage::Auto => "ja",
-        TranscribeLanguage::Ja => "ja",
-        TranscribeLanguage::Vi => "vi",
-        TranscribeLanguage::En => "en",
+    // "No translation" targets the source language (`ja` for auto) and asks
+    // for neither output transcription nor the echo of the target language.
+    let translating = config.target != LiveTarget::None;
+    let target_language_code = match config.target.as_code() {
+        Some(code) => code,
+        None => match config.language {
+            TranscribeLanguage::Auto | TranscribeLanguage::Ja => "ja",
+            TranscribeLanguage::Vi => "vi",
+            TranscribeLanguage::En => "en",
+        },
     };
     let handle = handle.map(|value| value.expose().clone());
     serde_json::to_string(&SetupEnvelope {
@@ -2358,6 +2484,7 @@ fn build_setup_message(
                 response_modalities: ["AUDIO"],
                 translation_config: TranslationConfig {
                     target_language_code,
+                    echo_target_language: translating.then_some(true),
                 },
             },
             session_resumption: SessionResumption { handle },
@@ -2367,6 +2494,7 @@ fn build_setup_message(
                 },
             },
             input_audio_transcription: EmptyObject {},
+            output_audio_transcription: translating.then_some(EmptyObject {}),
         },
     })
     .map_err(|_| AppError::new(Code::Shape, "Gemini Live setup could not be encoded").into())

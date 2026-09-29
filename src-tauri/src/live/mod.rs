@@ -5,16 +5,17 @@ pub mod recording;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use specta::Type;
 use tauri::ipc::Channel;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
-use crate::audio::{CaptureController, OUTPUT_SAMPLE_RATE};
+use crate::audio::{CaptureController, PcmChunk, OUTPUT_SAMPLE_RATE};
 use crate::core::error::{AppError, Category, Code};
 use crate::core::id::{SessionId, TagId, TranscriptId};
 use crate::db::repo::segments::{GapReason, SegmentDraft, SegmentKind};
@@ -26,7 +27,7 @@ use crate::gemini::live::{
 };
 use crate::gemini::{CancellationToken, ConsentSnapshot};
 use crate::library::store;
-use crate::settings::{TranscribeLanguage, UiLanguage};
+use crate::settings::{LiveTarget, TranscribeLanguage, UiLanguage};
 
 const COMMAND_CAPACITY: usize = 64;
 const INTERNAL_CAPACITY: usize = 256;
@@ -35,6 +36,9 @@ const INTERNAL_CAPACITY: usize = 256;
 const FLUSH_SAMPLES: u64 = OUTPUT_SAMPLE_RATE as u64 * 23 / 5;
 const FLUSH_CHECK_PERIOD: Duration = Duration::from_millis(250);
 const OLD_GENERATION_DRAIN: Duration = Duration::from_secs(1);
+/// A Target swap that has not seen `setupComplete` by then is abandoned and
+/// the current generation/Target stay in place.
+const TARGET_SWAP_DEADLINE: Duration = Duration::from_secs(15);
 
 fn actor_error() -> AppError {
     AppError::new(Code::Storage, "LiveSession actor unavailable")
@@ -91,6 +95,8 @@ pub struct LiveSnapshot {
     pub transcription: TranscriptionState,
     pub error_category: Option<Category>,
     pub duration_sec: f64,
+    /// Translation Target actually in effect (`none` = no translation).
+    pub target: LiveTarget,
 }
 
 /// Typed Live stream. The ready variant carries the snapshot and cursor sent
@@ -120,6 +126,24 @@ pub enum LiveEvent {
         #[specta(type = specta_typescript::Number)]
         seq: u64,
         segment: LiveSegment,
+    },
+    /// Translated text in progress. UI only: never persisted.
+    DeltaTranslated {
+        #[specta(type = specta_typescript::Number)]
+        seq: u64,
+        text: String,
+    },
+    /// A completed translated sentence. UI only: never persisted.
+    SegmentTranslated {
+        #[specta(type = specta_typescript::Number)]
+        seq: u64,
+        segment: LiveSegment,
+    },
+    /// The Target actually in effect changed (after a successful swap).
+    Target {
+        #[specta(type = specta_typescript::Number)]
+        seq: u64,
+        target: LiveTarget,
     },
     Gap {
         #[specta(type = specta_typescript::Number)]
@@ -170,6 +194,7 @@ pub enum LiveEvent {
 pub struct LiveStartParams {
     pub source: String,
     pub language: TranscribeLanguage,
+    pub target: LiveTarget,
     pub tag_ids: Vec<TagId>,
     pub locale: Option<String>,
     pub ui_language: UiLanguage,
@@ -232,6 +257,18 @@ impl LiveSessionHandle {
         response.await.map_err(|_| actor_error())?
     }
 
+    /// Changes the translation Target of the running session. The actor swaps
+    /// in a new generation without interrupting the source transcript; the
+    /// reply arrives once the swap succeeded, failed or was superseded.
+    pub async fn set_target(&self, target: LiveTarget) -> Result<(), AppError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::SetTarget { target, reply })
+            .await
+            .map_err(|_| actor_error())?;
+        response.await.map_err(|_| actor_error())?
+    }
+
     pub async fn continue_recording_only(&self) -> Result<(), AppError> {
         let (reply, response) = oneshot::channel();
         self.commands
@@ -278,6 +315,10 @@ enum Command {
         source: String,
         reply: oneshot::Sender<Result<(), AppError>>,
     },
+    SetTarget {
+        target: LiveTarget,
+        reply: oneshot::Sender<Result<(), AppError>>,
+    },
     ContinueRecordingOnly {
         reply: oneshot::Sender<Result<(), AppError>>,
     },
@@ -302,8 +343,51 @@ enum Internal {
     },
 }
 
+/// Inputs needed to open another generation of the same session.
+struct SwapContext {
+    model: String,
+    language: TranscribeLanguage,
+    consent: ConsentSnapshot,
+}
+
+impl Default for SwapContext {
+    fn default() -> Self {
+        Self {
+            model: String::new(),
+            language: TranscribeLanguage::Auto,
+            consent: ConsentSnapshot::new(0, false),
+        }
+    }
+}
+
+/// Translated text of the open sentence. Lives only in memory and UI events.
+#[derive(Default)]
+struct TranslationBuffer {
+    text: String,
+    start: Option<u64>,
+    end: u64,
+}
+
+/// A generation being set up for a Target swap. It is invisible to the UI
+/// until `setupComplete`; only then does it replace the running generation.
+struct Candidate {
+    generation: u64,
+    target: LiveTarget,
+    cancel: CancellationToken,
+    task: JoinHandle<()>,
+    /// Audio reaches the candidate only after the swap, so its transcript
+    /// cannot repeat audio the old generation already transcribed.
+    gate: Arc<AtomicBool>,
+    deadline: tokio::time::Instant,
+    reply: oneshot::Sender<Result<(), AppError>>,
+}
+
 struct RunningSession {
     generation: u64,
+    target: LiveTarget,
+    swap: SwapContext,
+    translation: TranslationBuffer,
+    candidate: Option<Candidate>,
     session_id: SessionId,
     transcript_id: TranscriptId,
     baseline_sample: u64,
@@ -377,6 +461,7 @@ pub fn channel(
                 transcription: TranscriptionState::Stopped,
                 error_category: None,
                 duration_sec: 0.0,
+                target: LiveTarget::None,
             },
             running: None,
             pending_close_finalize: None,
@@ -418,6 +503,9 @@ impl LiveSessionActor {
                     Some(Command::SetSource { source, reply }) => {
                         let result = self.set_source(source).await;
                         let _ = reply.send(result);
+                    }
+                    Some(Command::SetTarget { target, reply }) => {
+                        self.set_target(target, reply);
                     }
                     Some(Command::ContinueRecordingOnly { reply }) => {
                         let result = self.continue_recording_only().await;
@@ -562,60 +650,26 @@ impl LiveSessionActor {
 
         let generation = self.next_generation;
         self.next_generation = self.next_generation.saturating_add(1);
-        let cancellation = CancellationToken::new();
-        let (gateway_events, mut gateway_event_rx) = mpsc::channel(64);
-        let sender = self.internal_sender.clone();
-        let gateway = self.gateway.clone();
-        let task_cancellation = cancellation.clone();
+        let swap = SwapContext {
+            model: params.model.clone(),
+            language: params.language,
+            consent: params.consent,
+        };
         let config = LiveRunConfig {
             model: params.model,
             language: params.language,
+            target: params.target,
+            start_sample: Arc::new(AtomicU64::new(0)),
         };
-        let consent = params.consent;
-        // This task owns one gateway run; its reconnect loop replaces sockets
-        // sequentially and does not mint actor generations. A future source,
-        // target, or redetect swap within a session should bump the generation
-        // before its replacement task can publish events.
-        let gateway_task = tokio::spawn(async move {
-            let run = gateway.run(
-                config,
-                consent,
-                gateway_audio,
-                gateway_events,
-                task_cancellation,
-            );
-            tokio::pin!(run);
-            let mut events_open = true;
-            let result = loop {
-                tokio::select! {
-                    result = &mut run => break result,
-                    event = gateway_event_rx.recv(), if events_open => {
-                        if let Some(event) = event {
-                            if sender.send(Internal::GatewayEvent { generation, event }).await.is_err() {
-                                return;
-                            }
-                        } else {
-                            events_open = false;
-                        }
-                    }
-                }
-            };
-            while let Some(event) = gateway_event_rx.recv().await {
-                if sender
-                    .send(Internal::GatewayEvent { generation, event })
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-            }
-            let _ = sender
-                .send(Internal::GatewayEnded { generation, result })
-                .await;
-        });
+        let (cancellation, gateway_task) =
+            self.spawn_gateway_task(generation, config, params.consent, gateway_audio);
         let terminal_errors = recording.terminal_errors();
         self.running = Some(RunningSession {
             generation,
+            target: params.target,
+            swap,
+            translation: TranslationBuffer::default(),
+            candidate: None,
             session_id,
             transcript_id,
             baseline_sample,
@@ -651,6 +705,193 @@ impl LiveSessionActor {
         Ok(session_id)
     }
 
+    /// Spawns one gateway run. Its reconnect loop replaces sockets
+    /// sequentially and does not mint actor generations; every event it
+    /// publishes carries `generation` so the actor can drop stale ones.
+    fn spawn_gateway_task(
+        &self,
+        generation: u64,
+        config: LiveRunConfig,
+        consent: ConsentSnapshot,
+        audio: broadcast::Receiver<PcmChunk>,
+    ) -> (CancellationToken, JoinHandle<()>) {
+        let cancellation = CancellationToken::new();
+        let (gateway_events, mut gateway_event_rx) = mpsc::channel(64);
+        let sender = self.internal_sender.clone();
+        let gateway = self.gateway.clone();
+        let task_cancellation = cancellation.clone();
+        let task = tokio::spawn(async move {
+            let run = gateway.run(config, consent, audio, gateway_events, task_cancellation);
+            tokio::pin!(run);
+            let mut events_open = true;
+            let result = loop {
+                tokio::select! {
+                    result = &mut run => break result,
+                    event = gateway_event_rx.recv(), if events_open => {
+                        if let Some(event) = event {
+                            if sender.send(Internal::GatewayEvent { generation, event }).await.is_err() {
+                                return;
+                            }
+                        } else {
+                            events_open = false;
+                        }
+                    }
+                }
+            };
+            while let Some(event) = gateway_event_rx.recv().await {
+                if sender
+                    .send(Internal::GatewayEvent { generation, event })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            let _ = sender
+                .send(Internal::GatewayEnded { generation, result })
+                .await;
+        });
+        (cancellation, task)
+    }
+
+    /// Starts a Target swap. Replies when the swap succeeded, failed, or was
+    /// superseded by a newer choice (superseded requests reply `Ok`: the
+    /// latest request owns the outcome).
+    fn set_target(&mut self, target: LiveTarget, reply: oneshot::Sender<Result<(), AppError>>) {
+        let Some(running) = self.running.as_mut() else {
+            let _ = reply.send(Err(AppError::new(
+                Code::Request,
+                "Translation target can only be changed while a Live session is running",
+            )));
+            return;
+        };
+        if running.transcription != TranscriptionState::Active {
+            let _ = reply.send(Err(AppError::new(
+                Code::Request,
+                "Translation target cannot change while transcription is not active",
+            )));
+            return;
+        }
+        if let Some(previous) = running.candidate.take() {
+            cancel_candidate(previous, Ok(()));
+        }
+        if running.target == target {
+            let _ = reply.send(Ok(()));
+            return;
+        }
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.saturating_add(1);
+        let (model, language, consent) = {
+            let running = self.running.as_ref().expect("running checked above");
+            (
+                running.swap.model.clone(),
+                running.swap.language,
+                running.swap.consent,
+            )
+        };
+        let start_sample = Arc::new(AtomicU64::new(0));
+        let config = LiveRunConfig {
+            model,
+            language,
+            target,
+            start_sample: start_sample.clone(),
+        };
+        // The candidate hears audio only from the swap onwards: a gate in
+        // front of it keeps everything the old generation already handled.
+        let (audio_tx, audio_rx) = broadcast::channel(256);
+        let (cancel, task) = self.spawn_gateway_task(generation, config, consent, audio_rx);
+        let gate = Arc::new(AtomicBool::new(false));
+        spawn_gated_forwarder(
+            self.capture.subscribe(),
+            audio_tx,
+            gate.clone(),
+            start_sample,
+            cancel.clone(),
+        );
+        if let Some(running) = self.running.as_mut() {
+            running.candidate = Some(Candidate {
+                generation,
+                target,
+                cancel,
+                task,
+                gate,
+                deadline: tokio::time::Instant::now() + TARGET_SWAP_DEADLINE,
+                reply,
+            });
+        }
+    }
+
+    fn fail_candidate(&mut self, error: AppError) {
+        if let Some(candidate) = self
+            .running
+            .as_mut()
+            .and_then(|running| running.candidate.take())
+        {
+            tracing::warn!(error = %error, "Live Target swap failed; keeping the current generation");
+            cancel_candidate(candidate, Err(error));
+        }
+    }
+
+    /// `setupComplete` arrived for the candidate: swap it in and drain the
+    /// old generation without blocking the actor.
+    fn promote_candidate(&mut self) {
+        let Some(running) = self.running.as_mut() else {
+            return;
+        };
+        let Some(candidate) = running.candidate.take() else {
+            return;
+        };
+        let tail = take_translation_tail(running);
+        let old_cancel = std::mem::replace(&mut running.gateway_cancel, candidate.cancel);
+        let old_task = std::mem::replace(&mut running.gateway_task, candidate.task);
+        running.generation = candidate.generation;
+        running.target = candidate.target;
+        running.translation = TranslationBuffer::default();
+        let connection_changed = running.connection != ConnectionState::Connected;
+        running.connection = ConnectionState::Connected;
+        candidate.gate.store(true, Ordering::Release);
+        tokio::spawn(async move {
+            old_cancel.cancel();
+            let mut old_task = old_task;
+            if tokio::time::timeout(OLD_GENERATION_DRAIN, &mut old_task)
+                .await
+                .is_err()
+            {
+                old_task.abort();
+            }
+        });
+        let target = candidate.target;
+        self.snapshot = self.snapshot_for_running();
+        if let Some(segment) = tail {
+            self.emit(LiveEvent::SegmentTranslated { seq: 0, segment });
+        }
+        if connection_changed {
+            self.emit(LiveEvent::Connection {
+                seq: 0,
+                state: ConnectionState::Connected,
+            });
+        }
+        self.emit(LiveEvent::Target { seq: 0, target });
+        let _ = candidate.reply.send(Ok(()));
+    }
+
+    fn apply_candidate_event(&mut self, event: GatewayEvent) {
+        match event {
+            GatewayEvent::ConnectionChanged {
+                state: GatewayConnectionState::Connected,
+            } => self.promote_candidate(),
+            // The first failed attempt already means the swap cannot be
+            // completed quickly: keep the current generation.
+            GatewayEvent::ConnectionChanged {
+                state: GatewayConnectionState::Reconnecting | GatewayConnectionState::Stopped,
+            } => self.fail_candidate(AppError::new(
+                Code::Network,
+                "The new translation connection could not be established",
+            )),
+            _ => {}
+        }
+    }
+
     async fn handle_internal(&mut self, internal: Internal) {
         self.apply_internal(internal, true).await;
     }
@@ -660,6 +901,15 @@ impl LiveSessionActor {
     async fn apply_internal(&mut self, internal: Internal, allow_finish: bool) {
         match internal {
             Internal::GatewayEvent { generation, event } => {
+                let is_candidate = self
+                    .running
+                    .as_ref()
+                    .and_then(|running| running.candidate.as_ref())
+                    .is_some_and(|candidate| candidate.generation == generation);
+                if is_candidate {
+                    self.apply_candidate_event(event);
+                    return;
+                }
                 let current = self
                     .running
                     .as_ref()
@@ -705,10 +955,40 @@ impl LiveSessionActor {
                             self.emit(LiveEvent::Segment { seq: 0, segment });
                         }
                     }
+                    GatewayEvent::OutputTranscription {
+                        text,
+                        sample_start,
+                        sample_end,
+                    } => {
+                        let text = text.expose().clone();
+                        let completed = match self.running.as_mut() {
+                            // Output is dropped in "no translation" mode.
+                            Some(running) if running.target != LiveTarget::None => {
+                                if running.translation.text.is_empty() {
+                                    running.translation.start = Some(sample_start);
+                                }
+                                running.translation.text.push_str(&text);
+                                running.translation.end = sample_end.max(sample_start);
+                                split_translated_sentences(running)
+                            }
+                            _ => return,
+                        };
+                        self.emit(LiveEvent::DeltaTranslated { seq: 0, text });
+                        for segment in completed {
+                            self.emit(LiveEvent::SegmentTranslated { seq: 0, segment });
+                        }
+                    }
                     GatewayEvent::TurnComplete {
                         sample_start,
                         sample_end,
                     } => {
+                        let translated_tail = self
+                            .running
+                            .as_mut()
+                            .and_then(take_translation_tail);
+                        if let Some(segment) = translated_tail {
+                            self.emit(LiveEvent::SegmentTranslated { seq: 0, segment });
+                        }
                         let completed = if let Some(running) = self.running.as_mut() {
                             if !running.sentence_buffer.trim().is_empty() {
                                 let start = running.sentence_start.unwrap_or(sample_start);
@@ -776,6 +1056,22 @@ impl LiveSessionActor {
                 }
             }
             Internal::GatewayEnded { generation, result } => {
+                let candidate_ended = self
+                    .running
+                    .as_ref()
+                    .and_then(|running| running.candidate.as_ref())
+                    .is_some_and(|candidate| candidate.generation == generation);
+                if candidate_ended {
+                    let error = match result {
+                        Err(crate::gemini::live::LiveFailure::Gateway(error)) => error,
+                        _ => AppError::new(
+                            Code::Model,
+                            "The new translation connection was rejected",
+                        ),
+                    };
+                    self.fail_candidate(error);
+                    return;
+                }
                 let current = self
                     .running
                     .as_ref()
@@ -885,6 +1181,15 @@ impl LiveSessionActor {
         // closes the race with a still-unwinding gateway task and makes the
         // session-scoped recording-only choice explicit to the actor.
         running.gateway_cancel.cancel();
+        if let Some(candidate) = running.candidate.take() {
+            cancel_candidate(
+                candidate,
+                Err(AppError::new(
+                    Code::Request,
+                    "Live transcription switched to recording only",
+                )),
+            );
+        }
         running.transcription = TranscriptionState::RecordingOnly;
         self.snapshot = self.snapshot_for_running();
         self.emit(LiveEvent::Transcription {
@@ -902,6 +1207,17 @@ impl LiveSessionActor {
         if let Some(error) = writer_error {
             let _ = self.finish_current(Some(error), false).await;
             return;
+        }
+        let swap_expired = self
+            .running
+            .as_ref()
+            .and_then(|running| running.candidate.as_ref())
+            .is_some_and(|candidate| tokio::time::Instant::now() >= candidate.deadline);
+        if swap_expired {
+            self.fail_candidate(AppError::new(
+                Code::Timeout,
+                "The new translation connection timed out",
+            ));
         }
         let due = self.running.as_ref().is_some_and(|running| {
             self.capture
@@ -1013,6 +1329,7 @@ impl LiveSessionActor {
                         transcription: TranscriptionState::Stopped,
                         error_category: None,
                         duration_sec,
+                        target: self.snapshot.target,
                     };
                     self.emit(LiveEvent::Recording {
                         seq: 0,
@@ -1038,6 +1355,18 @@ impl LiveSessionActor {
                 Code::Request,
                 "There is no Live session to stop",
             ));
+        }
+        // Stop cancels any Target swap in flight before events are drained, so
+        // a candidate can never be promoted into a stopping session.
+        if let Some(candidate) = self
+            .running
+            .as_mut()
+            .and_then(|running| running.candidate.take())
+        {
+            cancel_candidate(
+                candidate,
+                Err(AppError::new(Code::Request, "The Live session was stopped")),
+            );
         }
         // Deltas already queued by the gateway must be applied before the
         // final flush, otherwise Stop would silently drop the last sentences.
@@ -1074,7 +1403,12 @@ impl LiveSessionActor {
         if let Some(segment) = final_segment {
             self.emit(LiveEvent::Segment { seq: 0, segment });
         }
+        let translated_tail = self.running.as_mut().and_then(take_translation_tail);
+        if let Some(segment) = translated_tail {
+            self.emit(LiveEvent::SegmentTranslated { seq: 0, segment });
+        }
         let mut running = self.running.take().expect("running session checked above");
+        let running_target = running.target;
         running.gateway_cancel.cancel();
         self.snapshot.connection = ConnectionState::Stopped;
         self.emit(LiveEvent::Connection {
@@ -1186,6 +1520,7 @@ impl LiveSessionActor {
                 transcription: TranscriptionState::Stopped,
                 error_category: Some(error.category),
                 duration_sec,
+                target: running_target,
             };
             self.emit(LiveEvent::Recording {
                 seq: 0,
@@ -1214,6 +1549,7 @@ impl LiveSessionActor {
                 transcription: TranscriptionState::Stopped,
                 error_category: Some(error.category),
                 duration_sec,
+                target: running_target,
             };
             self.emit(LiveEvent::Recording {
                 seq: 0,
@@ -1257,6 +1593,7 @@ impl LiveSessionActor {
                     transcription: TranscriptionState::Stopped,
                     error_category: Some(error.category),
                     duration_sec,
+                    target: running_target,
                 };
                 self.emit(LiveEvent::Recording {
                     seq: 0,
@@ -1287,6 +1624,7 @@ impl LiveSessionActor {
                 .or_else(|| outcome.proxy_error.as_ref().map(|error| error.category))
                 .or(running.error_category),
             duration_sec,
+            target: running_target,
         };
         self.emit(LiveEvent::Recording {
             seq: 0,
@@ -1341,6 +1679,7 @@ impl LiveSessionActor {
                     self.capture.sample_clock(),
                     running.baseline_sample,
                 ),
+                target: running.target,
             },
         )
     }
@@ -1374,6 +1713,11 @@ fn with_seq(event: LiveEvent, seq: u64) -> LiveEvent {
         LiveEvent::Delta { text, .. } => LiveEvent::Delta { seq, text },
         LiveEvent::Turn { .. } => LiveEvent::Turn { seq },
         LiveEvent::Segment { segment, .. } => LiveEvent::Segment { seq, segment },
+        LiveEvent::DeltaTranslated { text, .. } => LiveEvent::DeltaTranslated { seq, text },
+        LiveEvent::SegmentTranslated { segment, .. } => {
+            LiveEvent::SegmentTranslated { seq, segment }
+        }
+        LiveEvent::Target { target, .. } => LiveEvent::Target { seq, target },
         LiveEvent::Gap {
             start_sec,
             end_sec,
@@ -1485,6 +1829,109 @@ fn tail_gap_draft(
         text: String::new(),
         speaker: None,
     })
+}
+
+/// Ends a candidate: cancels its gateway and forwarder and answers the
+/// waiting caller. The task is aborted in the background so the actor never
+/// waits for a half-open socket.
+fn cancel_candidate(candidate: Candidate, outcome: Result<(), AppError>) {
+    candidate.cancel.cancel();
+    let task = candidate.task;
+    tokio::spawn(async move {
+        let mut task = task;
+        if tokio::time::timeout(OLD_GENERATION_DRAIN, &mut task)
+            .await
+            .is_err()
+        {
+            task.abort();
+        }
+    });
+    let _ = candidate.reply.send(outcome);
+}
+
+/// Forwards capture audio to a candidate generation once its gate opens, and
+/// records the first forwarded sample so the candidate's transcript cursor
+/// starts exactly where the old generation stops.
+fn spawn_gated_forwarder(
+    mut capture_audio: broadcast::Receiver<PcmChunk>,
+    candidate_audio: broadcast::Sender<PcmChunk>,
+    gate: Arc<AtomicBool>,
+    start_sample: Arc<AtomicU64>,
+    cancel: CancellationToken,
+) {
+    tokio::spawn(async move {
+        let mut first = true;
+        loop {
+            let received = tokio::select! {
+                _ = cancel.cancelled() => break,
+                result = capture_audio.recv() => result,
+            };
+            match received {
+                Ok(chunk) => {
+                    if !gate.load(Ordering::Acquire) {
+                        continue;
+                    }
+                    if first {
+                        first = false;
+                        start_sample.store(chunk.start_sample, Ordering::Release);
+                    }
+                    let _ = candidate_audio.send(chunk);
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+}
+
+fn translated_segment(running: &RunningSession, text: &str) -> Option<LiveSegment> {
+    let text = text.trim();
+    if !has_content(text) {
+        return None;
+    }
+    let start = running.translation.start.unwrap_or(running.translation.end);
+    let end = running.translation.end.max(start);
+    Some(LiveSegment {
+        start_sec: relative_seconds(start, running.baseline_sample),
+        end_sec: relative_seconds(end, running.baseline_sample),
+        text: text.to_owned(),
+    })
+}
+
+/// Completed translated sentences (UI only: nothing is added to `pending`).
+fn split_translated_sentences(running: &mut RunningSession) -> Vec<LiveSegment> {
+    let buffer = std::mem::take(&mut running.translation.text);
+    let chars: Vec<(usize, char)> = buffer.char_indices().collect();
+    let mut completed = Vec::new();
+    let mut consumed = 0;
+    for (char_idx, (byte_idx, ch)) in chars.iter().enumerate() {
+        if !is_sentence_end(&chars, char_idx) {
+            continue;
+        }
+        let end = byte_idx + ch.len_utf8();
+        if let Some(segment) = translated_segment(running, &buffer[consumed..end]) {
+            completed.push(segment);
+        }
+        consumed = end;
+    }
+    let tail = &buffer[consumed..];
+    if tail.trim().is_empty() {
+        running.translation.start = None;
+    } else {
+        running.translation.text = tail.to_owned();
+        if consumed > 0 {
+            running.translation.start = Some(running.translation.end);
+        }
+    }
+    completed
+}
+
+/// Flushes the open translated sentence (turn boundary, swap or stop).
+fn take_translation_tail(running: &mut RunningSession) -> Option<LiveSegment> {
+    let text = std::mem::take(&mut running.translation.text);
+    let segment = translated_segment(running, &text);
+    running.translation.start = None;
+    segment
 }
 
 /// Abbreviations that end in a dot without ending the sentence when the next
@@ -1829,6 +2276,10 @@ mod tests {
             error_category: None,
             recording_state: RecordingState::Active,
             storage_error_reported: false,
+            target: LiveTarget::None,
+            swap: SwapContext::default(),
+            translation: TranslationBuffer::default(),
+            candidate: None,
         });
         fixture.actor.next_generation = generation.saturating_add(1);
         fixture.actor.snapshot = fixture.actor.snapshot_for_running();
@@ -1982,6 +2433,10 @@ mod tests {
             error_category: None,
             recording_state: RecordingState::Active,
             storage_error_reported: false,
+            target: LiveTarget::None,
+            swap: SwapContext::default(),
+            translation: TranslationBuffer::default(),
+            candidate: None,
         };
 
         let completed = split_complete_sentences(&mut running);
@@ -2420,6 +2875,7 @@ mod tests {
             .start(LiveStartParams {
                 source: "mic:test".to_owned(),
                 language: TranscribeLanguage::Auto,
+                target: LiveTarget::None,
                 tag_ids: Vec::new(),
                 locale: None,
                 ui_language: UiLanguage::En,
@@ -2447,6 +2903,7 @@ mod tests {
             .start(LiveStartParams {
                 source: "mic:test".to_owned(),
                 language: TranscribeLanguage::Auto,
+                target: LiveTarget::None,
                 tag_ids: Vec::new(),
                 locale: None,
                 ui_language: UiLanguage::En,
@@ -2489,6 +2946,7 @@ mod tests {
             .start(LiveStartParams {
                 source: "mic:test".to_owned(),
                 language: TranscribeLanguage::Auto,
+                target: LiveTarget::None,
                 tag_ids: Vec::new(),
                 locale: None,
                 ui_language: UiLanguage::En,
@@ -2514,6 +2972,7 @@ mod tests {
             .start(LiveStartParams {
                 source: "mic:test".to_owned(),
                 language: TranscribeLanguage::Auto,
+                target: LiveTarget::None,
                 tag_ids: Vec::new(),
                 locale: None,
                 ui_language: UiLanguage::En,
@@ -2555,6 +3014,10 @@ mod tests {
             error_category: None,
             recording_state: RecordingState::Active,
             storage_error_reported: false,
+            target: LiveTarget::None,
+            swap: SwapContext::default(),
+            translation: TranslationBuffer::default(),
+            candidate: None,
         });
         let started = std::time::Instant::now();
         let result = fixture.actor.finish_current(None, false).await;
@@ -2720,6 +3183,10 @@ mod tests {
             error_category: None,
             recording_state: RecordingState::Active,
             storage_error_reported: false,
+            target: LiveTarget::None,
+            swap: SwapContext::default(),
+            translation: TranslationBuffer::default(),
+            candidate: None,
         }
     }
 
@@ -3017,6 +3484,7 @@ mod tests {
         LiveStartParams {
             source: "mic:test".to_owned(),
             language: TranscribeLanguage::Auto,
+            target: LiveTarget::None,
             tag_ids: Vec::new(),
             locale: None,
             ui_language: UiLanguage::En,
@@ -3101,5 +3569,494 @@ mod tests {
         // Unknown ids are a no-op.
         fixture.actor.unregister_subscriber(first_id);
         assert_eq!(fixture.actor.subscribers.len(), 1);
+    }
+
+    // ---- Story 5.1: translation Target swap (fake transport) ----
+
+    use crate::gemini::live::{
+        CloseFuture, LiveConnectError, LiveReceiveMessage, LiveSocket, ReceiveFuture, SendFuture,
+    };
+    use std::collections::VecDeque;
+
+    #[derive(Clone, Copy)]
+    enum Plan {
+        Ok,
+        Fail,
+        NoSetup,
+    }
+
+    struct ScriptedConnector {
+        plans: Mutex<VecDeque<Plan>>,
+        setups: Arc<Mutex<Vec<String>>>,
+        senders: Arc<Mutex<Vec<mpsc::UnboundedSender<String>>>>,
+    }
+
+    impl LiveSocketConnector for ScriptedConnector {
+        fn connect<'a>(
+            &'a self,
+            _api_key: &'a crate::core::Sensitive<String>,
+        ) -> ConnectFuture<'a> {
+            Box::pin(async move {
+                let plan = self.plans.lock().unwrap().pop_front().unwrap_or(Plan::Ok);
+                if matches!(plan, Plan::Fail) {
+                    return Err(LiveConnectError::Transport);
+                }
+                let (tx, rx) = mpsc::unbounded_channel();
+                self.senders.lock().unwrap().push(tx);
+                Ok(Box::new(ScriptedSocket {
+                    setups: self.setups.clone(),
+                    incoming: rx,
+                    plan,
+                    setup_seen: false,
+                    setup_sent: false,
+                }) as Box<dyn LiveSocket>)
+            })
+        }
+    }
+
+    struct ScriptedSocket {
+        setups: Arc<Mutex<Vec<String>>>,
+        incoming: mpsc::UnboundedReceiver<String>,
+        plan: Plan,
+        setup_seen: bool,
+        setup_sent: bool,
+    }
+
+    impl LiveSocket for ScriptedSocket {
+        fn send_text<'a>(&'a mut self, text: String) -> SendFuture<'a> {
+            Box::pin(async move {
+                if text.contains("\"setup\"") {
+                    self.setups.lock().unwrap().push(text);
+                    self.setup_seen = true;
+                }
+                Ok(())
+            })
+        }
+
+        fn receive_text<'a>(&'a mut self) -> ReceiveFuture<'a> {
+            Box::pin(async move {
+                if matches!(self.plan, Plan::NoSetup) {
+                    std::future::pending::<()>().await;
+                }
+                if self.setup_seen && !self.setup_sent {
+                    self.setup_sent = true;
+                    return Ok(LiveReceiveMessage::Text(r#"{"setupComplete":{}}"#.to_owned()));
+                }
+                match self.incoming.recv().await {
+                    Some(text) => Ok(LiveReceiveMessage::Text(text)),
+                    None => Ok(LiveReceiveMessage::Eof),
+                }
+            })
+        }
+
+        fn ping<'a>(&'a mut self) -> SendFuture<'a> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn close<'a>(&'a mut self) -> CloseFuture<'a> {
+            Box::pin(async {})
+        }
+    }
+
+    async fn scripted_fixture(plans: &[Plan]) -> (Fixture, Arc<ScriptedConnector>) {
+        let mut fixture = fixture();
+        let (key_pool, key_actor) =
+            KeyPoolHandle::channel(Arc::new(OneKeyProvider), Arc::new(SystemClock));
+        tokio::spawn(key_actor.run());
+        key_pool.refresh().await.unwrap();
+        let connector = Arc::new(ScriptedConnector {
+            plans: Mutex::new(plans.iter().copied().collect()),
+            setups: Arc::new(Mutex::new(Vec::new())),
+            senders: Arc::new(Mutex::new(Vec::new())),
+        });
+        fixture.actor.key_pool = key_pool.clone();
+        fixture.actor.gateway = LiveGateway::new(connector.clone(), key_pool);
+        (fixture, connector)
+    }
+
+    async fn pump_until(
+        actor: &mut LiveSessionActor,
+        mut done: impl FnMut(&mut LiveSessionActor) -> bool,
+    ) {
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if done(actor) {
+                    break;
+                }
+                match tokio::time::timeout(
+                    Duration::from_millis(25),
+                    actor.internal_receiver.recv(),
+                )
+                .await
+                {
+                    Ok(Some(internal)) => actor.handle_internal(internal).await,
+                    _ => actor.check_running_session().await,
+                }
+            }
+        })
+        .await
+        .expect("condition was not reached in time");
+    }
+
+    async fn pump_for(actor: &mut LiveSessionActor, duration: Duration) {
+        let started = tokio::time::Instant::now();
+        pump_until(actor, |_| started.elapsed() >= duration).await;
+    }
+
+    fn feed(connector: &ScriptedConnector, index: usize, message: &str) {
+        let _ = connector.senders.lock().unwrap()[index].send(message.to_owned());
+    }
+
+    fn count_events(
+        events: &Arc<Mutex<Vec<LiveEvent>>>,
+        matches: impl Fn(&LiveEvent) -> bool,
+    ) -> usize {
+        events.lock().unwrap().iter().filter(|e| matches(e)).count()
+    }
+
+    fn target_params(target: LiveTarget) -> LiveStartParams {
+        LiveStartParams {
+            target,
+            ..start_params()
+        }
+    }
+
+    #[tokio::test]
+    async fn swap_promotes_the_new_generation_after_setup_and_keeps_the_source_transcript_gapless()
+    {
+        let (mut fx, conn) = scripted_fixture(&[]).await;
+        let events = Arc::new(Mutex::new(Vec::new()));
+        fx.actor.register_subscriber(collect_channel(events.clone()));
+        fx.actor
+            .start(target_params(LiveTarget::Vi))
+            .await
+            .unwrap();
+        pump_until(&mut fx.actor, |a| {
+            a.running.as_ref().unwrap().connection == ConnectionState::Connected
+        })
+        .await;
+
+        let setup: serde_json::Value =
+            serde_json::from_str(&conn.setups.lock().unwrap()[0]).unwrap();
+        assert_eq!(setup["setup"]["outputAudioTranscription"], serde_json::json!({}));
+        assert_eq!(
+            setup["setup"]["generationConfig"]["translationConfig"],
+            serde_json::json!({ "targetLanguageCode": "vi", "echoTargetLanguage": true })
+        );
+
+        fx.backend.emit_chunk();
+        fx.backend.emit_chunk();
+        pump_for(&mut fx.actor, Duration::from_millis(150)).await;
+        feed(
+            &conn,
+            0,
+            r#"{"serverContent":{"inputTranscription":{"text":"First sentence."}}}"#,
+        );
+        pump_until(&mut fx.actor, |_| {
+            count_events(&events, |e| matches!(e, LiveEvent::Segment { .. })) == 1
+        })
+        .await;
+        let first_end = events
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|e| match e {
+                LiveEvent::Segment { segment, .. } => Some(segment.end_sec),
+                _ => None,
+            })
+            .unwrap();
+
+        let (tx, mut rx) = oneshot::channel();
+        fx.actor.set_target(LiveTarget::En, tx);
+        // Not swapped until the candidate reports setupComplete.
+        assert_eq!(fx.actor.running.as_ref().unwrap().generation, 1);
+        pump_until(&mut fx.actor, |a| {
+            a.running.as_ref().unwrap().candidate.is_none()
+        })
+        .await;
+        assert!(matches!(rx.try_recv(), Ok(Ok(()))));
+        {
+            let running = fx.actor.running.as_ref().unwrap();
+            assert_eq!(running.generation, 2);
+            assert_eq!(running.target, LiveTarget::En);
+        }
+        let setup: serde_json::Value =
+            serde_json::from_str(&conn.setups.lock().unwrap()[1]).unwrap();
+        assert_eq!(
+            setup["setup"]["generationConfig"]["translationConfig"]["targetLanguageCode"],
+            "en"
+        );
+        assert_eq!(
+            count_events(&events, |e| matches!(
+                e,
+                LiveEvent::Target {
+                    target: LiveTarget::En,
+                    ..
+                }
+            )),
+            1
+        );
+
+        // The old generation is drained within a second.
+        tokio::time::timeout(OLD_GENERATION_DRAIN + Duration::from_millis(500), async {
+            while !conn.senders.lock().unwrap()[0].is_closed() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("old generation socket must be dropped after the drain");
+        // Anything the old generation still says is ignored.
+        feed(
+            &conn,
+            0,
+            r#"{"serverContent":{"inputTranscription":{"text":"Ghost."}}}"#,
+        );
+
+        fx.backend.emit_chunk();
+        fx.backend.emit_chunk();
+        pump_for(&mut fx.actor, Duration::from_millis(200)).await;
+        feed(
+            &conn,
+            1,
+            r#"{"serverContent":{"inputTranscription":{"text":"Second sentence."},"outputTranscription":{"text":"Translated words."}}}"#,
+        );
+        pump_until(&mut fx.actor, |_| {
+            count_events(&events, |e| matches!(e, LiveEvent::Segment { .. })) == 2
+        })
+        .await;
+        pump_until(&mut fx.actor, |_| {
+            count_events(&events, |e| matches!(e, LiveEvent::SegmentTranslated { .. })) == 1
+        })
+        .await;
+        let texts: Vec<(f64, f64, String)> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                LiveEvent::Segment { segment, .. } => {
+                    Some((segment.start_sec, segment.end_sec, segment.text.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts[0].2, "First sentence.");
+        assert_eq!(texts[1].2, "Second sentence.");
+        assert!(
+            texts[1].0 >= first_end - 1e-9,
+            "timestamps must not jump back after the swap: {texts:?}"
+        );
+        assert!(texts[1].0 > 0.0, "the new generation starts at the swap sample");
+
+        // The translation reached the UI but is never persisted.
+        assert_eq!(
+            count_events(&events, |e| matches!(e, LiveEvent::DeltaTranslated { .. })),
+            1
+        );
+        let transcript_id = fx.actor.running.as_ref().unwrap().transcript_id;
+        fx.actor.finish_current(None, false).await.unwrap();
+        let segments = fx
+            .db
+            .with_connection(|c| Ok(repo::segments::list_for_transcript(c, transcript_id)?))
+            .unwrap();
+        let stored: Vec<&str> = segments.iter().map(|s| s.text.as_str()).collect();
+        assert!(stored.iter().any(|t| t.contains("First sentence")));
+        assert!(stored.iter().any(|t| t.contains("Second sentence")));
+        assert!(!stored.iter().any(|t| t.contains("Translated")));
+        assert_eq!(
+            stored.iter().filter(|t| t.contains("First sentence")).count(),
+            1,
+            "no repeated segment"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_swap_keeps_the_current_generation_and_target() {
+        let (mut fx, conn) = scripted_fixture(&[Plan::Ok, Plan::Fail]).await;
+        fx.actor
+            .start(target_params(LiveTarget::Vi))
+            .await
+            .unwrap();
+        pump_until(&mut fx.actor, |a| {
+            a.running.as_ref().unwrap().connection == ConnectionState::Connected
+        })
+        .await;
+        let (tx, mut rx) = oneshot::channel();
+        fx.actor.set_target(LiveTarget::En, tx);
+        pump_until(&mut fx.actor, |a| {
+            a.running.as_ref().unwrap().candidate.is_none()
+        })
+        .await;
+        let error = rx.try_recv().unwrap().unwrap_err();
+        assert_eq!(error.category, Category::Network);
+        let running = fx.actor.running.as_ref().unwrap();
+        assert_eq!(running.generation, 1);
+        assert_eq!(running.target, LiveTarget::Vi);
+        assert_eq!(fx.actor.snapshot_for_running().target, LiveTarget::Vi);
+        // The original socket is still the live one.
+        assert!(!conn.senders.lock().unwrap()[0].is_closed());
+        fx.actor.finish_current(None, false).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn consecutive_target_changes_only_swap_the_latest_choice() {
+        let (mut fx, conn) = scripted_fixture(&[]).await;
+        let events = Arc::new(Mutex::new(Vec::new()));
+        fx.actor.register_subscriber(collect_channel(events.clone()));
+        fx.actor
+            .start(target_params(LiveTarget::None))
+            .await
+            .unwrap();
+        pump_until(&mut fx.actor, |a| {
+            a.running.as_ref().unwrap().connection == ConnectionState::Connected
+        })
+        .await;
+        let (tx_vi, mut rx_vi) = oneshot::channel();
+        let (tx_en, mut rx_en) = oneshot::channel();
+        let (tx_ja, mut rx_ja) = oneshot::channel();
+        fx.actor.set_target(LiveTarget::Vi, tx_vi);
+        fx.actor.set_target(LiveTarget::En, tx_en);
+        fx.actor.set_target(LiveTarget::Ja, tx_ja);
+        pump_until(&mut fx.actor, |a| {
+            a.running.as_ref().unwrap().candidate.is_none()
+                && a.running.as_ref().unwrap().target == LiveTarget::Ja
+        })
+        .await;
+        assert!(matches!(rx_vi.try_recv(), Ok(Ok(()))), "superseded");
+        assert!(matches!(rx_en.try_recv(), Ok(Ok(()))), "superseded");
+        assert!(matches!(rx_ja.try_recv(), Ok(Ok(()))));
+        assert_eq!(fx.actor.running.as_ref().unwrap().generation, 4);
+        assert_eq!(
+            count_events(&events, |e| matches!(e, LiveEvent::Target { .. })),
+            1,
+            "only the latest choice is announced"
+        );
+        let setups = conn.setups.lock().unwrap();
+        assert_eq!(setups.len(), 2, "cancelled candidates never connect");
+        assert!(setups[1].contains("\"targetLanguageCode\":\"ja\""));
+        drop(setups);
+        // Choosing the current Target again is a no-op.
+        let (tx, mut rx) = oneshot::channel();
+        fx.actor.set_target(LiveTarget::Ja, tx);
+        assert!(matches!(rx.try_recv(), Ok(Ok(()))));
+        assert!(fx.actor.running.as_ref().unwrap().candidate.is_none());
+        fx.actor.finish_current(None, false).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_cancels_a_swap_in_flight() {
+        let (mut fx, conn) = scripted_fixture(&[Plan::Ok, Plan::NoSetup]).await;
+        fx.actor
+            .start(target_params(LiveTarget::Vi))
+            .await
+            .unwrap();
+        pump_until(&mut fx.actor, |a| {
+            a.running.as_ref().unwrap().connection == ConnectionState::Connected
+        })
+        .await;
+        let (tx, mut rx) = oneshot::channel();
+        fx.actor.set_target(LiveTarget::En, tx);
+        pump_for(&mut fx.actor, Duration::from_millis(150)).await;
+        assert!(fx.actor.running.as_ref().unwrap().candidate.is_some());
+
+        fx.actor.finish_current(None, false).await.unwrap();
+        assert!(fx.actor.running.is_none());
+        assert_eq!(rx.try_recv().unwrap().unwrap_err().code, Code::Request);
+        tokio::time::timeout(OLD_GENERATION_DRAIN + Duration::from_millis(500), async {
+            while !conn.senders.lock().unwrap()[1].is_closed() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the candidate socket must be dropped");
+    }
+
+    #[tokio::test]
+    async fn swap_without_setup_complete_times_out_and_keeps_the_current_target() {
+        let (mut fx, _conn) = scripted_fixture(&[Plan::Ok, Plan::NoSetup]).await;
+        fx.actor
+            .start(target_params(LiveTarget::Vi))
+            .await
+            .unwrap();
+        pump_until(&mut fx.actor, |a| {
+            a.running.as_ref().unwrap().connection == ConnectionState::Connected
+        })
+        .await;
+        let (tx, mut rx) = oneshot::channel();
+        fx.actor.set_target(LiveTarget::En, tx);
+        fx.actor
+            .running
+            .as_mut()
+            .unwrap()
+            .candidate
+            .as_mut()
+            .unwrap()
+            .deadline = tokio::time::Instant::now() - Duration::from_millis(1);
+        fx.actor.check_running_session().await;
+        assert_eq!(rx.try_recv().unwrap().unwrap_err().code, Code::Timeout);
+        assert_eq!(fx.actor.running.as_ref().unwrap().target, LiveTarget::Vi);
+        fx.actor.finish_current(None, false).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn no_translation_mode_requests_no_output_transcription_and_drops_output() {
+        let (mut fx, conn) = scripted_fixture(&[]).await;
+        let events = Arc::new(Mutex::new(Vec::new()));
+        fx.actor.register_subscriber(collect_channel(events.clone()));
+        fx.actor
+            .start(target_params(LiveTarget::None))
+            .await
+            .unwrap();
+        pump_until(&mut fx.actor, |a| {
+            a.running.as_ref().unwrap().connection == ConnectionState::Connected
+        })
+        .await;
+        let setup: serde_json::Value =
+            serde_json::from_str(&conn.setups.lock().unwrap()[0]).unwrap();
+        assert!(setup["setup"].get("outputAudioTranscription").is_none());
+        assert_eq!(
+            setup["setup"]["generationConfig"]["translationConfig"],
+            serde_json::json!({ "targetLanguageCode": "ja" })
+        );
+        feed(
+            &conn,
+            0,
+            r#"{"serverContent":{"outputTranscription":{"text":"stray."},"turnComplete":{}}}"#,
+        );
+        pump_until(&mut fx.actor, |_| {
+            count_events(&events, |e| matches!(e, LiveEvent::Turn { .. })) == 1
+        })
+        .await;
+        assert_eq!(
+            count_events(&events, |e| matches!(
+                e,
+                LiveEvent::DeltaTranslated { .. } | LiveEvent::SegmentTranslated { .. }
+            )),
+            0
+        );
+        fx.actor.finish_current(None, false).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn set_target_is_rejected_when_no_session_is_running() {
+        let mut fixture = fixture();
+        let (tx, mut rx) = oneshot::channel();
+        fixture.actor.set_target(LiveTarget::Vi, tx);
+        assert_eq!(rx.try_recv().unwrap().unwrap_err().code, Code::Request);
+    }
+
+    #[tokio::test]
+    async fn translated_sentences_split_without_touching_pending_segments() {
+        let mut running = running_with_buffer("", 0);
+        running.target = LiveTarget::Vi;
+        running.translation.text = "Xin chao. Ban khoe khong".to_owned();
+        running.translation.start = Some(0);
+        running.translation.end = 16_000;
+        let completed = split_translated_sentences(&mut running);
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].text, "Xin chao.");
+        assert!(running.pending.is_empty(), "translations are never persisted");
+        let tail = take_translation_tail(&mut running).unwrap();
+        assert_eq!(tail.text, "Ban khoe khong");
+        assert!(take_translation_tail(&mut running).is_none());
     }
 }

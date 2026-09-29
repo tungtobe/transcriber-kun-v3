@@ -17,6 +17,7 @@ function settings(
   chunkMinutes = 5,
   timestampOffsetSec = 0,
   transcribeLanguage: 'auto' | 'ja' | 'vi' | 'en' = 'auto',
+  liveTarget: 'none' | 'ja' | 'vi' | 'en' = 'none',
 ) {
   return {
     theme,
@@ -28,6 +29,7 @@ function settings(
     chunkMinutes,
     timestampOffsetSec,
     transcribeLanguage,
+    liveTarget,
   };
 }
 
@@ -581,6 +583,27 @@ describe('settingsStore chunking/offset/language setters', () => {
     await store.setTranscribeLanguage('ko');
     expect(mocks.settingsSave).not.toHaveBeenCalled();
     expect(store.transcribeLanguage).toBe('ja');
+  });
+
+  it('persists liveTarget and rejects an unknown value', async () => {
+    mocks.settingsGet.mockResolvedValue({ status: 'ok', data: settings() });
+    mocks.settingsSave.mockResolvedValue({ status: 'ok', data: null });
+    const { createSettingsStore } = await import('./settings.svelte');
+    const store = createSettingsStore();
+    await store.load();
+    expect(store.liveTarget).toBe('none');
+
+    await store.setLiveTarget('vi');
+    expect(store.liveTarget).toBe('vi');
+    expect(mocks.settingsSave).toHaveBeenLastCalledWith(
+      settings('system', 'system', false, undefined, undefined, undefined, undefined, undefined, undefined, 'vi'),
+    );
+
+    mocks.settingsSave.mockClear();
+    // @ts-expect-error deliberately invalid at the runtime boundary
+    await store.setLiveTarget('auto');
+    expect(mocks.settingsSave).not.toHaveBeenCalled();
+    expect(store.liveTarget).toBe('vi');
   });
 
   it('rolls back chunkMinutes to the last persisted value on a typed save failure', async () => {
