@@ -350,16 +350,109 @@ pub fn recover_live_session(
     outcome
 }
 
+/// Marker (inside the session media dir) recording that a Proxy repair was
+/// already attempted and failed. It stops the same deterministic failure from
+/// being retried at every boot. `reconcile` keeps it; deleting the session
+/// removes it with the directory.
+const PROXY_FAILED_MARKER: &str = ".proxy-failed";
+
+fn proxy_failed_marker(root: &Path, session_id: SessionId) -> std::path::PathBuf {
+    paths::media_dir(root, session_id).join(PROXY_FAILED_MARKER)
+}
+
+fn mark_proxy_failed(root: &Path, session_id: SessionId) {
+    if let Err(error) = fs::write(proxy_failed_marker(root, session_id), b"") {
+        tracing::warn!(session_id = %session_id, error = %error, "could not record the failed Live Proxy repair");
+    }
+}
+
+/// Claims sessions in a shared busy set (`AppState::recovering`) and releases
+/// them on every exit, panic included.
+pub struct ClaimGuard {
+    set: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<SessionId>>>,
+    ids: std::collections::HashSet<SessionId>,
+}
+
+impl ClaimGuard {
+    /// Wraps ids that the caller has already inserted into `set`.
+    pub fn new(
+        set: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<SessionId>>>,
+        ids: std::collections::HashSet<SessionId>,
+    ) -> Self {
+        Self { set, ids }
+    }
+
+    /// Claims one session, or returns `None` when somebody else holds it.
+    pub fn try_claim(
+        set: &std::sync::Arc<std::sync::Mutex<std::collections::HashSet<SessionId>>>,
+        id: SessionId,
+    ) -> Option<Self> {
+        let inserted = set
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(id);
+        inserted.then(|| Self::new(set.clone(), std::collections::HashSet::from([id])))
+    }
+}
+
+impl Drop for ClaimGuard {
+    fn drop(&mut self) {
+        let mut set = self
+            .set
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for id in &self.ids {
+            set.remove(id);
+        }
+    }
+}
+
+/// Derives the Proxy of a `complete` Live session that has none, as one
+/// detached, best-effort step after Stop already committed. The caller holds
+/// the session's [`ClaimGuard`] for the duration of the encode so delete and
+/// rerun see it as busy. Returns `Ok(true)` when a Proxy was published.
+pub fn derive_live_proxy(
+    db: &Db,
+    root: &Path,
+    session_id: SessionId,
+    _claim: &ClaimGuard,
+) -> Result<bool, AppError> {
+    let candidate = db.with_connection(|conn| {
+        Ok(repo::sessions::get(conn, session_id)?.and_then(|row| {
+            (row.kind == "live" && row.status == "complete" && row.proxy_ext.is_none()).then_some(
+                repo::sessions::LiveProxyCandidate {
+                    id: row.id,
+                    updated_at: row.updated_at,
+                },
+            )
+        }))
+    })?;
+    match candidate {
+        Some(candidate) => repair_live_proxy(db, root, candidate),
+        None => Ok(false),
+    }
+}
+
 /// Retries only the derived Proxy for a completed Live session. The row and
 /// revision are checked under an immediate transaction before the staged
 /// Proxy is published, so deletion during encoding cannot resurrect files.
+/// A failed attempt leaves a marker so it is not retried at every boot, and
+/// the finalized WAV is only read, never truncated.
 pub fn repair_live_proxy(
     db: &Db,
     root: &Path,
     candidate: repo::sessions::LiveProxyCandidate,
 ) -> Result<bool, AppError> {
+    if proxy_failed_marker(root, candidate.id).is_file() {
+        return Ok(false);
+    }
     let recording_path = paths::recording_path(root, candidate.id);
-    finalize_checkpointed_wav(&recording_path)?;
+    // A `complete` session's WAV is already finalized: validate it read-only.
+    if let Err(error) = hound::WavReader::open(&recording_path) {
+        tracing::warn!(session_id = %candidate.id, error = %error, "Live Proxy repair skipped: recording is unreadable");
+        mark_proxy_failed(root, candidate.id);
+        return Ok(false);
+    }
     let job_id = JobId::new();
     let staging_dir = paths::staging_dir(root, job_id);
     let staged_proxy = match media::create_proxy(&staging_dir, &recording_path) {
@@ -368,7 +461,8 @@ pub fn repair_live_proxy(
             if let Err(cleanup_error) = discard_staging(root, job_id) {
                 tracing::warn!(session_id = %candidate.id, error = %cleanup_error, "could not clean failed Live Proxy repair staging");
             }
-            tracing::warn!(session_id = %candidate.id, error = %error, "Live Proxy repair will retry at a later boot");
+            tracing::warn!(session_id = %candidate.id, error = %error, "Live Proxy repair failed; it will not be retried automatically");
+            mark_proxy_failed(root, candidate.id);
             return Ok(false);
         }
     };
@@ -1785,6 +1879,9 @@ fn reconcile_session_dir(
     if kind == "live" && dir.join("recording.wav").is_file() {
         keep_names.push("recording.wav".to_owned());
     }
+    if kind == "live" && dir.join(PROXY_FAILED_MARKER).is_file() {
+        keep_names.push(PROXY_FAILED_MARKER.to_owned());
+    }
 
     // `proxy_ext` is NULL (never set, or a `relink_proxy` DB write that
     // failed even after its retry) but a proxy file exists on disk -- repair
@@ -2178,6 +2275,165 @@ mod tests {
         assert_eq!(repaired.proxy_ext.as_deref(), Some("flac"));
         assert!(recording_path.is_file());
         assert!(paths::proxy_path(root.path(), session_id, "flac").is_file());
+    }
+
+    #[test]
+    fn live_session_creation_caps_selected_tags_at_twenty() {
+        let root = tempdir().unwrap();
+        let db = open_db(root.path());
+        let too_many = (0..21)
+            .map(|_| crate::core::id::TagId::new())
+            .collect::<Vec<_>>();
+        let session_id = SessionId::new();
+
+        let error = create_live_session_with_tags(&db, session_id, "Live", &too_many).unwrap_err();
+        assert_eq!(error.code, Code::Request);
+        assert!(error.detail_redacted.contains("20"));
+        assert!(db
+            .with_connection(|conn| Ok(repo::sessions::get(conn, session_id)?))
+            .unwrap()
+            .is_none());
+
+        // Exactly twenty real tags is allowed.
+        let twenty = (0..20)
+            .map(|index| {
+                crate::library::tags::create_or_get(&db, &format!("tag {index}"))
+                    .unwrap()
+                    .id
+            })
+            .collect::<Vec<_>>();
+        create_live_session_with_tags(&db, session_id, "Live", &twenty).unwrap();
+        assert_eq!(
+            db.with_connection(|conn| Ok(repo::tags::list_for_session(conn, session_id)?))
+                .unwrap()
+                .len(),
+            20
+        );
+    }
+
+    #[test]
+    fn repair_live_proxy_ignores_a_stale_candidate_revision() {
+        let root = tempdir().unwrap();
+        let db = open_db(root.path());
+        let (session_id, _) = seed_finalizing_live(root.path(), &db);
+        finalize_live_session_minimal(&db, session_id, 1.0).unwrap();
+        let stale = live_proxy_candidates(&db).unwrap().remove(0);
+        // Someone renames the session while the (slow) encode is running.
+        rename_session(&db, session_id, "renamed meanwhile").unwrap();
+
+        assert!(!repair_live_proxy(&db, root.path(), stale).unwrap());
+
+        let row = db
+            .with_connection(|conn| Ok(repo::sessions::get(conn, session_id)?.unwrap()))
+            .unwrap();
+        assert_eq!(row.proxy_ext, None);
+        assert!(!paths::proxy_path(root.path(), session_id, "flac").exists());
+        assert!(staging_root_is_empty(root.path()));
+    }
+
+    #[test]
+    fn failed_proxy_repair_leaves_a_marker_and_is_not_retried_or_truncating() {
+        let root = tempdir().unwrap();
+        let db = open_db(root.path());
+        let (session_id, recording_path) = seed_finalizing_live(root.path(), &db);
+        finalize_live_session_minimal(&db, session_id, 1.0).unwrap();
+        // Corrupt the recording so the repair fails deterministically.
+        fs::write(&recording_path, b"definitely not a wav").unwrap();
+        let before = fs::read(&recording_path).unwrap();
+
+        let candidate = live_proxy_candidates(&db).unwrap().remove(0);
+        assert!(!repair_live_proxy(&db, root.path(), candidate).unwrap());
+        assert!(proxy_failed_marker(root.path(), session_id).is_file());
+        assert_eq!(fs::read(&recording_path).unwrap(), before);
+
+        // Even a healthy WAV is not attempted again once the marker exists.
+        let (_, healthy) = (session_id, recording_path.clone());
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&healthy, spec).unwrap();
+        for sample in 0..1_600 {
+            writer.write_sample((sample % 50) as i16).unwrap();
+        }
+        writer.finalize().unwrap();
+        let candidate = live_proxy_candidates(&db).unwrap().remove(0);
+        assert!(!repair_live_proxy(&db, root.path(), candidate).unwrap());
+        assert_eq!(
+            db.with_connection(|conn| Ok(repo::sessions::get(conn, session_id)?.unwrap()))
+                .unwrap()
+                .proxy_ext,
+            None
+        );
+
+        // Reconcile keeps the marker so a later boot still skips the session.
+        reconcile(&db, root.path()).unwrap();
+        assert!(proxy_failed_marker(root.path(), session_id).is_file());
+    }
+
+    #[test]
+    fn proxy_repair_never_truncates_the_wav_of_a_complete_session() {
+        let root = tempdir().unwrap();
+        let db = open_db(root.path());
+        let (session_id, recording_path) = seed_finalizing_live(root.path(), &db);
+        finalize_live_session_minimal(&db, session_id, 1.0).unwrap();
+        // Bytes after the header-declared data length must survive.
+        OpenOptions::new()
+            .append(true)
+            .open(&recording_path)
+            .unwrap()
+            .write_all(&[7; 64])
+            .unwrap();
+        let length_before = fs::metadata(&recording_path).unwrap().len();
+
+        let candidate = live_proxy_candidates(&db).unwrap().remove(0);
+        let _ = repair_live_proxy(&db, root.path(), candidate).unwrap();
+
+        assert_eq!(fs::metadata(&recording_path).unwrap().len(), length_before);
+    }
+
+    #[test]
+    fn derive_live_proxy_publishes_once_and_skips_sessions_that_are_not_complete() {
+        let root = tempdir().unwrap();
+        let db = open_db(root.path());
+        let busy = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        let (complete_id, _) = seed_finalizing_live(root.path(), &db);
+        let (still_finalizing, _) = seed_finalizing_live(root.path(), &db);
+        finalize_live_session_minimal(&db, complete_id, 1.0).unwrap();
+
+        let claim = ClaimGuard::try_claim(&busy, complete_id).unwrap();
+        assert!(busy.lock().unwrap().contains(&complete_id));
+        assert!(derive_live_proxy(&db, root.path(), complete_id, &claim).unwrap());
+        assert!(!derive_live_proxy(&db, root.path(), complete_id, &claim).unwrap());
+        drop(claim);
+        assert!(busy.lock().unwrap().is_empty());
+
+        let claim = ClaimGuard::try_claim(&busy, still_finalizing).unwrap();
+        assert!(!derive_live_proxy(&db, root.path(), still_finalizing, &claim).unwrap());
+        // A session already claimed elsewhere cannot be claimed twice.
+        assert!(ClaimGuard::try_claim(&busy, still_finalizing).is_none());
+    }
+
+    #[test]
+    fn revision_token_changes_on_every_session_write_even_within_one_millisecond() {
+        let root = tempdir().unwrap();
+        let db = open_db(root.path());
+        let session_id = SessionId::new();
+        create_live_session(&db, session_id, "t").unwrap();
+        let read = || {
+            db.with_connection(|conn| Ok(repo::sessions::get(conn, session_id)?.unwrap()))
+                .unwrap()
+                .updated_at
+        };
+        let mut previous = read();
+        for name in ["a", "b", "c", "d"] {
+            rename_session(&db, session_id, name).unwrap();
+            let current = read();
+            assert!(current > previous);
+            previous = current;
+        }
     }
 
     #[test]

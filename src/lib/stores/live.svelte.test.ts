@@ -4,6 +4,8 @@ import type { LiveEvent } from '../bindings';
 
 const mocks = vi.hoisted(() => ({
   liveSubscribe: vi.fn(),
+  liveUnsubscribe: vi.fn(),
+  librarySessionDetail: vi.fn(),
   liveSources: vi.fn(),
   liveStart: vi.fn(),
   liveStop: vi.fn(),
@@ -11,8 +13,9 @@ const mocks = vi.hoisted(() => ({
   liveSetSource: vi.fn(),
 }));
 
+let nextChannelId = 1;
 class FakeChannel<T> {
-  id = 1;
+  id = nextChannelId++;
   onmessage: (event: T) => void = () => {};
 }
 
@@ -20,6 +23,8 @@ vi.mock('@tauri-apps/api/core', () => ({ Channel: FakeChannel }));
 vi.mock('../bindings', () => ({
   commands: {
     liveSubscribe: (...args: unknown[]) => mocks.liveSubscribe(...args),
+    liveUnsubscribe: (...args: unknown[]) => mocks.liveUnsubscribe(...args),
+    librarySessionDetail: (...args: unknown[]) => mocks.librarySessionDetail(...args),
     liveSources: (...args: unknown[]) => mocks.liveSources(...args),
     liveStart: (...args: unknown[]) => mocks.liveStart(...args),
     liveStop: (...args: unknown[]) => mocks.liveStop(...args),
@@ -45,6 +50,12 @@ function snapshot(sessionId: string | null = 'session-1') {
 beforeEach(() => {
   vi.resetModules();
   channels = [];
+  nextChannelId = 1;
+  mocks.liveUnsubscribe.mockReset().mockResolvedValue({ status: 'ok', data: null });
+  mocks.librarySessionDetail.mockReset().mockResolvedValue({
+    status: 'ok',
+    data: { transcript: null },
+  });
   mocks.liveSubscribe.mockReset().mockImplementation((channel: FakeChannel<LiveEvent>) => {
     channels.push(channel);
     return Promise.resolve({ status: 'ok', data: null });
@@ -168,5 +179,112 @@ describe('liveStore', () => {
     });
     expect(store.snapshot.transcription).toBe('recordingOnly');
     expect(store.error).toBe('quota');
+  });
+
+  it('unregisters its Channel when the last subscriber leaves and when it resubscribes', async () => {
+    const { createLiveStore } = await import('./live.svelte');
+    const store = createLiveStore();
+    await store.subscribe();
+    const first = channels[0];
+    first.onmessage({ type: 'ready', seq: 0, snapshot: snapshot() });
+    expect(mocks.liveUnsubscribe).not.toHaveBeenCalled();
+
+    store.unsubscribe();
+    expect(mocks.liveUnsubscribe).toHaveBeenCalledTimes(1);
+    expect(mocks.liveUnsubscribe).toHaveBeenLastCalledWith(first);
+
+    await store.subscribe();
+    const second = channels[1];
+    second.onmessage({ type: 'ready', seq: 0, snapshot: snapshot() });
+    // A seq gap replaces the Channel: the stale one is dropped first.
+    second.onmessage({ type: 'connection', seq: 5, state: { type: 'connected' } });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(mocks.liveUnsubscribe).toHaveBeenLastCalledWith(second);
+    expect(channels).toHaveLength(3);
+  });
+
+  it('reloads persisted lines after a sequence gap and keeps only newer unflushed ones', async () => {
+    const { createLiveStore } = await import('./live.svelte');
+    const store = createLiveStore();
+    await store.subscribe();
+    const first = channels[0];
+    first.onmessage({ type: 'ready', seq: 5, snapshot: snapshot() });
+    first.onmessage({
+      type: 'segment', seq: 6,
+      segment: { startSec: 0, endSec: 1, text: 'streamed one' },
+    });
+    first.onmessage({
+      type: 'segment', seq: 7,
+      segment: { startSec: 5, endSec: 6, text: 'not flushed yet' },
+    });
+    mocks.librarySessionDetail.mockResolvedValue({
+      status: 'ok',
+      data: {
+        transcript: {
+          segments: [
+            { idx: 0, startSec: 0, endSec: 1, kind: 'text', gapReason: null, text: 'persisted one' },
+            { idx: 1, startSec: 1, endSec: 2, kind: 'gap', gapReason: 'disconnected', text: '' },
+            { idx: 2, startSec: 2, endSec: 3, kind: 'text', gapReason: null, text: 'persisted two' },
+          ],
+        },
+      },
+    });
+
+    // Events 8..9 were lost: the store resubscribes.
+    first.onmessage({ type: 'connection', seq: 10, state: { type: 'connected' } });
+    await vi.waitFor(() => expect(channels).toHaveLength(2));
+    channels[1].onmessage({ type: 'ready', seq: 10, snapshot: snapshot() });
+    await vi.waitFor(() => expect(mocks.librarySessionDetail).toHaveBeenCalledWith('session-1'));
+    await vi.waitFor(() => expect(store.lines.length).toBe(4));
+
+    const texts = store.lines.map((line) => (line.kind === 'segment' ? line.segment.text : `gap:${line.reason}`));
+    expect(texts).toEqual([
+      'persisted one',
+      'gap:disconnected',
+      'persisted two',
+      'not flushed yet',
+    ]);
+  });
+
+  it('keeps the streamed lines when the persisted transcript cannot be loaded', async () => {
+    const { createLiveStore } = await import('./live.svelte');
+    const store = createLiveStore();
+    mocks.librarySessionDetail.mockRejectedValue(new Error('offline'));
+    await store.subscribe();
+    const channel = channels[0];
+    channel.onmessage({ type: 'ready', seq: 0, snapshot: snapshot() });
+    channel.onmessage({
+      type: 'segment', seq: 1,
+      segment: { startSec: 0, endSec: 1, text: 'kept' },
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(store.lines).toHaveLength(1);
+  });
+
+  it('clears lines, draft and the finalized session when a new session starts', async () => {
+    const { createLiveStore } = await import('./live.svelte');
+    const store = createLiveStore();
+    await store.subscribe();
+    const channel = channels[0];
+    channel.onmessage({ type: 'ready', seq: 0, snapshot: snapshot() });
+    channel.onmessage({
+      type: 'segment', seq: 1,
+      segment: { startSec: 0, endSec: 1, text: 'old session' },
+    });
+    channel.onmessage({ type: 'delta', seq: 2, text: 'half a sentence' });
+    channel.onmessage({
+      type: 'final', seq: 3, sessionId: 'session-1', transcriptId: 'transcript-1', durationSec: 1,
+    });
+    expect(store.lines).toHaveLength(1);
+    expect(store.draft).toBe('half a sentence');
+    expect(store.finalizedSessionId).toBe('session-1');
+
+    expect(await store.start('system', 'auto', 'en', [])).toBeNull();
+
+    expect(store.lines).toEqual([]);
+    expect(store.draft).toBe('');
+    expect(store.finalizedSessionId).toBeNull();
   });
 });

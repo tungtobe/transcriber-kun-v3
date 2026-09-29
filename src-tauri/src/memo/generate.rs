@@ -953,4 +953,108 @@ mod tests {
         let after_rerun = view_after(&db, session_id, template.id);
         assert!(after_rerun.from_previous_transcript);
     }
+
+    fn insert_retranscribe(db: &Db, session_id: SessionId, text: &str) -> TranscriptId {
+        let id = TranscriptId::new();
+        db.with_connection(|conn| {
+            Ok(repo::transcripts::insert_with_segments(
+                conn,
+                id,
+                session_id,
+                repo::transcripts::Variant::Retranscribe,
+                "m",
+                None,
+                &[draft_text(0.0, 2.0, text)],
+                1,
+            )?)
+        })
+        .unwrap();
+        id
+    }
+
+    #[test]
+    fn capture_inputs_rejects_a_transcript_that_belongs_to_another_session() {
+        let (_dir, db) = open_db();
+        let mine = SessionId::new();
+        let other = SessionId::new();
+        insert_session(&db, mine);
+        insert_session(&db, other);
+        insert_transcript(&db, mine, vec![draft_text(0.0, 2.0, "của tôi")]);
+        let foreign = insert_transcript(&db, other, vec![draft_text(0.0, 2.0, "của người khác")]);
+        let template =
+            crate::memo::templates::create(&db, "Mẫu".to_string(), "{transcript}".to_string())
+                .unwrap();
+
+        let error = match capture_inputs(&db, mine, template.id, Some(foreign)) {
+            Err(error) => error,
+            Ok(_) => panic!("a foreign transcript must be rejected"),
+        };
+        assert_eq!(error.code, Code::Request);
+    }
+
+    #[test]
+    fn capture_inputs_uses_the_selected_own_transcript_over_the_primary() {
+        let (_dir, db) = open_db();
+        let session_id = SessionId::new();
+        insert_session(&db, session_id);
+        let primary = insert_transcript(&db, session_id, vec![draft_text(0.0, 2.0, "live")]);
+        let retranscribe = insert_retranscribe(&db, session_id, "recording");
+        let template =
+            crate::memo::templates::create(&db, "Mẫu".to_string(), "{transcript}".to_string())
+                .unwrap();
+
+        let Ok(selected) = capture_inputs(&db, session_id, template.id, Some(retranscribe)) else {
+            panic!("own transcript is accepted");
+        };
+        assert_eq!(selected.transcript_id, retranscribe);
+        assert_eq!(selected.segments[0].text, "recording");
+        let Ok(default) = capture_inputs(&db, session_id, template.id, None) else {
+            panic!("primary is the default");
+        };
+        assert_eq!(default.transcript_id, primary);
+    }
+
+    #[test]
+    fn view_for_source_compares_against_the_selected_transcript() {
+        let (_dir, db) = open_db();
+        let session_id = SessionId::new();
+        insert_session(&db, session_id);
+        insert_transcript(&db, session_id, vec![draft_text(0.0, 2.0, "live")]);
+        let retranscribe = insert_retranscribe(&db, session_id, "recording");
+        let template =
+            crate::memo::templates::create(&db, "Mẫu".to_string(), "{transcript}".to_string())
+                .unwrap();
+        let body = Sensitive::new("memo".to_string());
+        let prompt = Sensitive::new(template.prompt.clone());
+        db.with_connection(|conn| {
+            Ok(repo::memos::upsert(
+                conn,
+                session_id,
+                template.id,
+                &body,
+                0,
+                retranscribe,
+                "complete",
+                None,
+                &template.name,
+                &prompt,
+                "m",
+            )?)
+        })
+        .unwrap();
+
+        let for_retranscribe = view_for_source(&db, session_id, template.id, Some(retranscribe))
+            .unwrap()
+            .unwrap();
+        assert!(!for_retranscribe.from_previous_transcript);
+        // Viewed against the primary the memo comes from another transcript.
+        let for_primary = view_for_source(&db, session_id, template.id, None)
+            .unwrap()
+            .unwrap();
+        assert!(for_primary.from_previous_transcript);
+        assert_eq!(
+            view_for_source(&db, SessionId::new(), template.id, None).unwrap(),
+            None
+        );
+    }
 }

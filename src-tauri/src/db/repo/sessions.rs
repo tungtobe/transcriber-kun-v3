@@ -143,7 +143,7 @@ pub fn set_proxy_ext(
     updated_at: i64,
 ) -> rusqlite::Result<()> {
     conn.execute(
-        "UPDATE sessions SET proxy_ext = ?1, updated_at = ?2 WHERE id = ?3",
+        "UPDATE sessions SET proxy_ext = ?1, updated_at = MAX(?2, updated_at + 1) WHERE id = ?3",
         params![proxy_ext, updated_at, id.to_string()],
     )?;
     Ok(())
@@ -161,13 +161,14 @@ pub fn set_title(
     updated_at: i64,
 ) -> rusqlite::Result<usize> {
     conn.execute(
-        "UPDATE sessions SET title = ?1, updated_at = ?2 WHERE id = ?3",
+        "UPDATE sessions SET title = ?1, updated_at = MAX(?2, updated_at + 1) WHERE id = ?3",
         params![title, updated_at, id.to_string()],
     )
 }
 
 /// Updates only a live session's sample-derived duration and lifecycle state.
-/// Returns false when the row is missing or is not a Live session.
+/// Returns false when the row is missing, is not a Live session, or is no
+/// longer `recording` (a late flush must never reopen a finalized session).
 pub fn update_live_progress(
     conn: &Connection,
     id: SessionId,
@@ -176,8 +177,9 @@ pub fn update_live_progress(
     updated_at: i64,
 ) -> rusqlite::Result<bool> {
     let changed = conn.execute(
-        "UPDATE sessions SET duration_sec = MAX(duration_sec, ?1), status = ?2, updated_at = ?3 \
-         WHERE id = ?4 AND kind = 'live'",
+        "UPDATE sessions SET duration_sec = MAX(duration_sec, ?1), status = ?2, \
+             updated_at = MAX(?3, updated_at + 1) \
+         WHERE id = ?4 AND kind = 'live' AND status = 'recording'",
         params![duration_sec.max(0.0), status, updated_at, id.to_string()],
     )?;
     Ok(changed == 1)
@@ -194,8 +196,8 @@ pub fn finalize_live(
     updated_at: i64,
 ) -> rusqlite::Result<bool> {
     let changed = conn.execute(
-        "UPDATE sessions SET duration_sec = MAX(duration_sec, ?1), proxy_ext = ?2, \
-             status = 'complete', updated_at = ?3 \
+        "UPDATE sessions SET duration_sec = ?1, proxy_ext = ?2, \
+             status = 'complete', updated_at = MAX(?3, updated_at + 1) \
          WHERE id = ?4 AND kind = 'live' AND status = 'finalizing'",
         params![duration_sec.max(0.0), proxy_ext, updated_at, id.to_string()],
     )?;
@@ -256,7 +258,7 @@ pub fn finalize_recovered_live(
 ) -> rusqlite::Result<bool> {
     let changed = conn.execute(
         "UPDATE sessions SET duration_sec = ?1, proxy_ext = ?2, status = 'complete', \
-             recovered = 1, updated_at = ?3 \
+             recovered = 1, updated_at = MAX(?3, updated_at + 1) \
          WHERE id = ?4 AND kind = 'live' AND status IN ('recording', 'finalizing') \
              AND updated_at = ?5",
         params![
@@ -960,5 +962,56 @@ mod tests {
         ];
         expected.sort_by_key(|(id, _, _)| id.to_string());
         assert_eq!(refs, expected);
+    }
+
+    #[test]
+    fn progress_write_never_reopens_a_finalized_live_session() {
+        let conn = open_migrated();
+        let id = SessionId::new();
+        insert(
+            &conn,
+            NewSession {
+                kind: "live",
+                status: "recording",
+                source_hash: None,
+                ..sample(id)
+            },
+        )
+        .unwrap();
+        assert!(update_live_progress(&conn, id, 2.0, "finalizing", 1_100).unwrap());
+        // No longer `recording`: a late periodic flush is refused.
+        assert!(!update_live_progress(&conn, id, 3.0, "recording", 1_200).unwrap());
+        assert_eq!(get(&conn, id).unwrap().unwrap().status, "finalizing");
+        assert!(finalize_live(&conn, id, 2.5, None, 1_300).unwrap());
+        assert!(!update_live_progress(&conn, id, 9.0, "recording", 1_400).unwrap());
+        let row = get(&conn, id).unwrap().unwrap();
+        assert_eq!(row.status, "complete");
+        assert_eq!(row.duration_sec, 2.5);
+    }
+
+    #[test]
+    fn revision_token_is_strictly_monotonic_even_within_one_millisecond() {
+        let conn = open_migrated();
+        let id = SessionId::new();
+        insert(
+            &conn,
+            NewSession {
+                kind: "live",
+                status: "recording",
+                source_hash: None,
+                ..sample(id)
+            },
+        )
+        .unwrap();
+        let mut previous = get(&conn, id).unwrap().unwrap().updated_at;
+        for _ in 0..3 {
+            set_title(&conn, id, "same ms", previous).unwrap();
+            let current = get(&conn, id).unwrap().unwrap().updated_at;
+            assert!(current > previous);
+            previous = current;
+        }
+        // A clock that moved backwards still cannot shrink the token.
+        set_proxy_ext(&conn, id, None, 1).unwrap();
+        assert!(get(&conn, id).unwrap().unwrap().updated_at > previous);
     }
 }

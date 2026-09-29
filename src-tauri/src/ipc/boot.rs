@@ -25,26 +25,14 @@ pub struct LiveRecoveryCompleted {
     pub session_id: SessionId,
 }
 
-/// Releases boot-recovery claims when dropped, so a panic mid-recovery cannot
-/// leave sessions stuck in `recovering`.
-struct ClaimGuard {
-    set: Arc<Mutex<HashSet<SessionId>>>,
-    ids: HashSet<SessionId>,
-}
+use crate::library::store::ClaimGuard;
 
-impl ClaimGuard {
-    fn new(set: Arc<Mutex<HashSet<SessionId>>>, ids: HashSet<SessionId>) -> Self {
-        Self { set, ids }
-    }
-}
-
-impl Drop for ClaimGuard {
-    fn drop(&mut self) {
-        let mut set = self.set.lock().unwrap_or_else(|e| e.into_inner());
-        for id in &self.ids {
-            set.remove(id);
-        }
-    }
+/// The Recording export currently holding the one export slot. `session_id`
+/// lets delete/wipe refuse (Busy) while the session's WAV is being read.
+#[derive(Debug, Clone)]
+pub struct ActiveRecordingExport {
+    pub session_id: SessionId,
+    pub cancel: Arc<AtomicBool>,
 }
 
 /// State managed toàn app. `db` là `Err` khi thư mục dữ liệu không mở được —
@@ -102,7 +90,7 @@ pub struct AppState {
     pub memo_running: Arc<Mutex<HashMap<(SessionId, MemoTemplateId), CancellationToken>>>,
     /// One export at a time. The token is installed before the native save
     /// dialog opens so cancellation and duplicate requests share one owner.
-    pub recording_export: Arc<Mutex<Option<Arc<AtomicBool>>>>,
+    pub recording_export: Arc<Mutex<Option<ActiveRecordingExport>>>,
     /// Coalesces window/menu/Cmd+Q close requests and lets an approved exit
     /// pass through Tauri's `ExitRequested` callback exactly once.
     /// Unix ms of the active close request, `0` when none. Claims expire so a
@@ -176,98 +164,31 @@ pub fn boot<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
                                     interrupted.iter().map(|candidate| candidate.id).collect();
                                 let proxy_ids: HashSet<SessionId> =
                                     proxy_repairs.iter().map(|candidate| candidate.id).collect();
-                                let mut claimed = recovery_ids.clone();
-                                claimed.extend(proxy_ids.iter().copied());
+                                // Interrupted sessions are claimed up front; Proxy
+                                // repairs are claimed lazily, one at a time.
                                 if let Ok(mut busy) = recovering.lock() {
-                                    busy.extend(claimed.iter().copied());
+                                    busy.extend(recovery_ids.iter().copied());
                                 }
                                 let db = db.clone();
                                 let root = data_dir.clone();
                                 let busy = recovering.clone();
                                 let app = app.clone();
                                 tauri::async_runtime::spawn_blocking(move || {
-                                    // Releases every claim on all exits, panic included.
-                                    let _claims = ClaimGuard::new(busy, claimed);
-                                    if let Err(error) =
-                                        crate::library::store::cleanup_detached_staging(&root)
-                                    {
-                                        tracing::warn!(error = %error, "could not remove detached staging at boot");
-                                    }
-                                    // Full media scan can be unbounded with a large
-                                    // library, so it and all Proxy work stay behind
-                                    // setup. Only rows captured before actors start
-                                    // are eligible for recovery in this boot.
-                                    if let Err(error) =
-                                        crate::library::store::reconcile_media_snapshot(
-                                            &db,
-                                            &root,
-                                            media_snapshot,
-                                        )
-                                    {
-                                        tracing::warn!(error = %error, "could not reconcile media at boot");
-                                    }
-
-                                    match crate::library::store::live_recovery_candidates(&db) {
-                                        Ok(candidates) => {
-                                            for candidate in
-                                                candidates.into_iter().filter(|candidate| {
-                                                    recovery_ids.contains(&candidate.id)
-                                                })
+                                    run_boot_recovery(
+                                        &db,
+                                        &root,
+                                        media_snapshot,
+                                        &recovery_ids,
+                                        &proxy_ids,
+                                        busy,
+                                        |session_id| {
+                                            if let Err(error) =
+                                                (LiveRecoveryCompleted { session_id }).emit(&app)
                                             {
-                                                let session_id = candidate.id;
-                                                match crate::library::store::recover_live_session(
-                                                    &db, &root, candidate,
-                                                ) {
-                                                    Ok(true) => {
-                                                        if let Err(error) =
-                                                            (LiveRecoveryCompleted { session_id })
-                                                                .emit(&app)
-                                                        {
-                                                            tracing::warn!(session_id = %session_id, error = %error, "could not notify Home about Live recovery");
-                                                        }
-                                                    }
-                                                    Ok(false) => {}
-                                                    Err(error) => {
-                                                        tracing::warn!(session_id = %session_id, error = %error, "could not recover interrupted Live session")
-                                                    }
-                                                }
+                                                tracing::warn!(session_id = %session_id, error = %error, "could not notify Home about Live recovery");
                                             }
-                                        }
-                                        Err(error) => {
-                                            tracing::warn!(error = %error, "could not scan interrupted Live sessions at boot")
-                                        }
-                                    }
-
-                                    match crate::library::store::live_proxy_candidates(&db) {
-                                        Ok(candidates) => {
-                                            for candidate in
-                                                candidates.into_iter().filter(|candidate| {
-                                                    proxy_ids.contains(&candidate.id)
-                                                })
-                                            {
-                                                let session_id = candidate.id;
-                                                match crate::library::store::repair_live_proxy(
-                                                    &db, &root, candidate,
-                                                ) {
-                                                    Ok(true) => {
-                                                        if let Err(error) =
-                                                            (LiveRecoveryCompleted { session_id })
-                                                                .emit(&app)
-                                                        {
-                                                            tracing::warn!(session_id = %session_id, error = %error, "could not notify Home about Live Proxy repair");
-                                                        }
-                                                    }
-                                                    Ok(false) => {}
-                                                    Err(error) => {
-                                                        tracing::warn!(session_id = %session_id, error = %error, "could not repair Live Proxy at boot")
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        Err(error) => {
-                                            tracing::warn!(error = %error, "could not scan Live Proxy repairs at boot")
-                                        }
-                                    }
+                                        },
+                                    );
                                 });
                             }
                             (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
@@ -333,7 +254,7 @@ pub fn boot<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
                 key_pool.clone(),
                 crate::gemini::live::LiveGateway::production(key_pool.clone()),
             );
-            tauri::async_runtime::spawn(actor.run());
+            tauri::async_runtime::spawn(actor.with_recovering(recovering.clone()).run());
             Ok(handle)
         }
         (Err(error), _) | (_, Err(error)) => Err(error.clone()),
@@ -359,6 +280,79 @@ pub fn boot<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
     }
 }
 
+/// The startup recovery worker body. Interrupted sessions (`recovery_ids`)
+/// stay claimed for the whole run (released on every exit, panic included);
+/// Proxy repairs (`proxy_ids`) claim each session lazily, only while it is
+/// being encoded, and skip one that another worker (a just-finished Stop)
+/// already holds. `notify` runs for each session that changed.
+fn run_boot_recovery(
+    db: &Db,
+    root: &std::path::Path,
+    media_snapshot: Vec<(SessionId, String, Option<String>)>,
+    recovery_ids: &HashSet<SessionId>,
+    proxy_ids: &HashSet<SessionId>,
+    busy: Arc<Mutex<HashSet<SessionId>>>,
+    notify: impl Fn(SessionId),
+) {
+    // The caller inserted `recovery_ids` into `busy`; this guard releases them
+    // on every exit, panic included.
+    let _claims = ClaimGuard::new(busy.clone(), recovery_ids.clone());
+    if let Err(error) = crate::library::store::cleanup_detached_staging(root) {
+        tracing::warn!(error = %error, "could not remove detached staging at boot");
+    }
+    // Full media scan can be unbounded with a large library, so it and all
+    // Proxy work stay behind setup. Only rows captured before actors start are
+    // eligible for recovery in this boot.
+    if let Err(error) = crate::library::store::reconcile_media_snapshot(db, root, media_snapshot) {
+        tracing::warn!(error = %error, "could not reconcile media at boot");
+    }
+
+    match crate::library::store::live_recovery_candidates(db) {
+        Ok(candidates) => {
+            for candidate in candidates
+                .into_iter()
+                .filter(|candidate| recovery_ids.contains(&candidate.id))
+            {
+                let session_id = candidate.id;
+                match crate::library::store::recover_live_session(db, root, candidate) {
+                    Ok(true) => notify(session_id),
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::warn!(session_id = %session_id, error = %error, "could not recover interrupted Live session")
+                    }
+                }
+            }
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "could not scan interrupted Live sessions at boot")
+        }
+    }
+
+    match crate::library::store::live_proxy_candidates(db) {
+        Ok(candidates) => {
+            for candidate in candidates
+                .into_iter()
+                .filter(|candidate| proxy_ids.contains(&candidate.id))
+            {
+                let session_id = candidate.id;
+                let Some(_claim) = ClaimGuard::try_claim(&busy, session_id) else {
+                    continue;
+                };
+                match crate::library::store::repair_live_proxy(db, root, candidate) {
+                    Ok(true) => notify(session_id),
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::warn!(session_id = %session_id, error = %error, "could not repair Live Proxy at boot")
+                    }
+                }
+            }
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "could not scan Live Proxy repairs at boot")
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,5 +371,127 @@ mod tests {
         let held = set.lock().unwrap_or_else(|e| e.into_inner());
         assert!(!held.contains(&id));
         assert!(held.contains(&other));
+    }
+
+    fn write_wav(path: &std::path::Path) {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(path, spec).unwrap();
+        for sample in 0..16_000 {
+            writer.write_sample((sample % 100) as i16).unwrap();
+        }
+        writer.finalize().unwrap();
+    }
+
+    /// Returns `(interrupted, completed_without_proxy)` session ids.
+    fn seed_boot_sessions(root: &std::path::Path, db: &Db) -> (SessionId, SessionId) {
+        use crate::library::store;
+        let interrupted = SessionId::new();
+        store::create_live_session(db, interrupted, "interrupted").unwrap();
+        let completed = SessionId::new();
+        store::create_live_session(db, completed, "completed").unwrap();
+        let transcript = store::create_live_transcript(db, completed, "m", None).unwrap();
+        store::append_live_batch(db, completed, transcript, &[], 1.0, "finalizing").unwrap();
+        store::finalize_live_session_minimal(db, completed, 1.0).unwrap();
+        for id in [interrupted, completed] {
+            let dir = crate::core::paths::media_dir(root, id);
+            std::fs::create_dir_all(&dir).unwrap();
+            write_wav(&crate::core::paths::recording_path(root, id));
+        }
+        (interrupted, completed)
+    }
+
+    #[test]
+    fn boot_recovery_recovers_and_repairs_then_releases_every_claim() {
+        let root = tempfile::tempdir().unwrap();
+        let db = Db::open(root.path()).unwrap();
+        let (interrupted, completed) = seed_boot_sessions(root.path(), &db);
+        let busy = Arc::new(Mutex::new(HashSet::from([interrupted])));
+        let notified = Mutex::new(Vec::new());
+        let snapshot = crate::library::store::media_refs(&db).unwrap();
+
+        run_boot_recovery(
+            &db,
+            root.path(),
+            snapshot,
+            &HashSet::from([interrupted]),
+            &HashSet::from([completed]),
+            busy.clone(),
+            |id| notified.lock().unwrap().push(id),
+        );
+
+        let notified = notified.into_inner().unwrap();
+        assert!(notified.contains(&interrupted));
+        assert!(notified.contains(&completed));
+        assert!(busy.lock().unwrap().is_empty(), "no claim may leak");
+        db.with_connection(|conn| {
+            let recovered = crate::db::repo::sessions::get(conn, interrupted)?.unwrap();
+            assert_eq!(recovered.status, "complete");
+            assert!(recovered.recovered);
+            let repaired = crate::db::repo::sessions::get(conn, completed)?.unwrap();
+            assert_eq!(repaired.proxy_ext.as_deref(), Some("flac"));
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn boot_recovery_claims_proxy_repairs_lazily_and_skips_a_busy_one() {
+        let root = tempfile::tempdir().unwrap();
+        let db = Db::open(root.path()).unwrap();
+        let (_interrupted, completed) = seed_boot_sessions(root.path(), &db);
+        // Another worker (a just-finished Stop) already owns this session.
+        let busy = Arc::new(Mutex::new(HashSet::from([completed])));
+        let notified = Mutex::new(Vec::new());
+        let snapshot = crate::library::store::media_refs(&db).unwrap();
+
+        run_boot_recovery(
+            &db,
+            root.path(),
+            snapshot,
+            &HashSet::new(),
+            &HashSet::from([completed]),
+            busy.clone(),
+            |id| notified.lock().unwrap().push(id),
+        );
+
+        assert!(notified.into_inner().unwrap().is_empty());
+        // The foreign claim is untouched; nothing was repaired under it.
+        assert!(busy.lock().unwrap().contains(&completed));
+        db.with_connection(|conn| {
+            let row = crate::db::repo::sessions::get(conn, completed)?.unwrap();
+            assert_eq!(row.proxy_ext, None);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn boot_recovery_releases_claims_even_when_the_worker_panics() {
+        let root = tempfile::tempdir().unwrap();
+        let db = Db::open(root.path()).unwrap();
+        let (interrupted, _completed) = seed_boot_sessions(root.path(), &db);
+        let busy = Arc::new(Mutex::new(HashSet::from([interrupted])));
+        let snapshot = crate::library::store::media_refs(&db).unwrap();
+        let worker_busy = busy.clone();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_boot_recovery(
+                &db,
+                root.path(),
+                snapshot,
+                &HashSet::from([interrupted]),
+                &HashSet::new(),
+                worker_busy,
+                |_| panic!("notification blew up"),
+            );
+        }));
+
+        assert!(result.is_err());
+        assert!(busy.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
     }
 }

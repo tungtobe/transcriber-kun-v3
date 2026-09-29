@@ -31,11 +31,16 @@ pub enum RecordingExportOutcome {
 }
 
 /// Copy a canonical Recording WAV or encode it as FLAC without retaining the
-/// complete audio in memory. Output is built in a unique sibling file and is
-/// published only after the copy/encode and flush succeed.
+/// complete audio in memory. Output is built in a unique partial file and is
+/// published only after the copy/encode and flush succeed. When `staging_dir`
+/// (under the app data dir, swept at boot) is on the same volume as the
+/// destination the partial lives there, so a crash cannot leave litter next to
+/// the user's file; otherwise a sibling file is used. Every error path removes
+/// the partial.
 pub fn export_recording(
     source: &Path,
     destination: &Path,
+    staging_dir: Option<&Path>,
     format: RecordingExportFormat,
     duration_seconds: f64,
     cancelled: &AtomicBool,
@@ -56,7 +61,7 @@ pub fn export_recording(
     if total_bytes == 0 {
         return Err(storage_error());
     }
-    let temporary_path = temporary_sibling(destination)?;
+    let temporary_path = temporary_path_for(destination, staging_dir)?;
     let mut staging = StagingFile::create(temporary_path)?;
     progress(0.0);
 
@@ -179,6 +184,55 @@ fn encode_flac(
     // path guard before returning so every failure still removes the partial.
     staging.set_file(file);
     Ok(RecordingExportOutcome::Saved)
+}
+
+/// The partial file location: inside `staging_dir` when it is on the
+/// destination's volume, else a sibling of the destination.
+fn temporary_path_for(
+    destination: &Path,
+    staging_dir: Option<&Path>,
+) -> Result<PathBuf, crate::core::error::AppError> {
+    if let Some(dir) = staging_dir {
+        let parent = destination
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        if fs::create_dir_all(dir).is_ok() && same_volume(dir, parent) {
+            return Ok(dir.join(format!("{}.partial", Uuid::now_v7())));
+        }
+    }
+    temporary_sibling(destination)
+}
+
+#[cfg(unix)]
+fn same_volume(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (fs::metadata(a), fs::metadata(b)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev(),
+        _ => false,
+    }
+}
+
+#[cfg(windows)]
+fn same_volume(a: &Path, b: &Path) -> bool {
+    use std::path::Component;
+    let prefix = |path: &Path| {
+        fs::canonicalize(path).ok().and_then(|canonical| {
+            canonical
+                .components()
+                .next()
+                .and_then(|component| match component {
+                    Component::Prefix(prefix) => Some(prefix.as_os_str().to_ascii_lowercase()),
+                    _ => None,
+                })
+        })
+    };
+    matches!((prefix(a), prefix(b)), (Some(a), Some(b)) if a == b)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_volume(_a: &Path, _b: &Path) -> bool {
+    false
 }
 
 fn temporary_sibling(destination: &Path) -> Result<PathBuf, crate::core::error::AppError> {
@@ -339,6 +393,7 @@ mod tests {
         let outcome = export_recording(
             &source,
             &target,
+            None,
             RecordingExportFormat::Wav,
             75.0,
             &progress,
@@ -363,6 +418,7 @@ mod tests {
         let outcome = export_recording(
             &source,
             &target,
+            None,
             RecordingExportFormat::Wav,
             75.0,
             &cancelled,
@@ -391,6 +447,7 @@ mod tests {
         let result = export_recording(
             &source,
             &target,
+            None,
             RecordingExportFormat::Flac,
             1.0,
             &cancelled,
@@ -414,6 +471,7 @@ mod tests {
         let outcome = export_recording(
             &source,
             &target,
+            None,
             RecordingExportFormat::Flac,
             75.0,
             &cancelled,
@@ -442,6 +500,7 @@ mod tests {
         let error = export_recording(
             &source,
             &destination,
+            None,
             RecordingExportFormat::Wav,
             1.0,
             &cancelled,
@@ -452,5 +511,38 @@ mod tests {
         assert!(error.detail_redacted.contains("free disk space"));
         assert_eq!(fs::read(&source).unwrap(), original);
         assert!(partial_files(directory.path()).is_empty());
+    }
+
+    #[test]
+    fn partial_lives_in_the_staging_dir_on_the_same_volume_and_is_removed_on_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path().join("app-staging");
+        let destination = directory.path().join("out").join("saved.flac");
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+
+        let temporary = temporary_path_for(&destination, Some(&staging)).unwrap();
+        assert!(temporary.starts_with(&staging));
+        assert_ne!(temporary.parent(), destination.parent());
+
+        // Without a staging dir the sibling location is used.
+        let sibling = temporary_path_for(&destination, None).unwrap();
+        assert_eq!(sibling.parent(), destination.parent());
+
+        // A failed export leaves no partial in either place.
+        let source = directory.path().join("broken.wav");
+        fs::write(&source, b"not a wav file").unwrap();
+        let cancelled = AtomicBool::new(false);
+        let result = export_recording(
+            &source,
+            &destination,
+            Some(&staging),
+            RecordingExportFormat::Flac,
+            1.0,
+            &cancelled,
+            |_| {},
+        );
+        assert!(result.is_err());
+        assert!(partial_files(&staging).is_empty());
+        assert!(partial_files(destination.parent().unwrap()).is_empty());
     }
 }

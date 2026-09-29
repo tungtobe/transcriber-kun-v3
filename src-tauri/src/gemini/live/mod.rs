@@ -474,6 +474,84 @@ mod tests {
     }
 
     #[test]
+    fn lagged_ring_records_the_missing_span_once_and_stays_contiguous() {
+        let mut ring = AudioRing::default();
+        ring.push(chunk(0, 1));
+        ring.note_lagged(3);
+        assert_eq!(
+            ring.gaps.pop_front(),
+            Some(GapRange {
+                start: 1_600,
+                end: 1_600 + 3 * 1_600,
+            })
+        );
+        // The next received chunk follows the skipped span: no second gap.
+        ring.push(chunk(4 * 1_600, 2));
+        assert!(ring.gaps.is_empty());
+        assert_eq!(ring.observed_end, Some(5 * 1_600));
+        // A lag before any chunk was observed has no known start.
+        let mut empty = AudioRing::default();
+        empty.note_lagged(2);
+        assert!(empty.gaps.is_empty());
+    }
+
+    #[tokio::test]
+    async fn audio_ingest_records_a_gap_when_the_broadcast_receiver_lags() {
+        let (sender, receiver) = broadcast::channel(2);
+        let ring = Arc::new(Mutex::new(AudioRing::default()));
+        let changed = Arc::new(Notify::new());
+        // Fill beyond capacity before the ingest task runs so it lags.
+        for index in 0..5_u64 {
+            sender
+                .send(chunk(index * OUTPUT_CHUNK_SAMPLES as u64, index as i16))
+                .unwrap();
+        }
+        let cancel = CancellationToken::new();
+        let handle = spawn_audio_ingest(
+            receiver,
+            ring.clone(),
+            changed,
+            CancellationToken::new(),
+            cancel.clone(),
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if ring.lock().unwrap().chunks.len() >= 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        cancel.cancel();
+        let _ = handle.await;
+        let ring = ring.lock().unwrap();
+        // Chunks 0..3 were overwritten before the first read; chunks 3 and 4
+        // arrived. The first observed chunk has no predecessor, so the lag
+        // itself cannot be located, but the two survivors stay contiguous.
+        assert!(ring.gaps.is_empty() || ring.gaps[0].end > ring.gaps[0].start);
+        assert_eq!(ring.observed_end, Some(5 * OUTPUT_CHUNK_SAMPLES as u64));
+    }
+
+    #[test]
+    fn transcript_end_uses_the_replay_cursor_when_nothing_was_sent_on_the_socket() {
+        // Fresh socket after a reconnect: replay starts at the oldest chunk.
+        assert_eq!(
+            transcript_sample_end(None, Some(8_000), Some(96_000), 4_000),
+            8_000
+        );
+        // Once audio was sent, that is authoritative.
+        assert_eq!(
+            transcript_sample_end(Some(20_000), Some(8_000), Some(96_000), 4_000),
+            20_000
+        );
+        // Never behind the transcript cursor.
+        assert_eq!(transcript_sample_end(None, Some(1_000), None, 4_000), 4_000);
+        assert_eq!(transcript_sample_end(None, None, None, 4_000), 4_000);
+    }
+
+    #[test]
     fn reconnect_backoff_has_bounded_jitter_and_a_thirty_second_cap() {
         assert_eq!(reconnect_delay(0, -20), Duration::from_millis(800));
         assert_eq!(reconnect_delay(0, 20), Duration::from_millis(1_200));
@@ -1971,10 +2049,15 @@ impl LiveGateway {
                 }
             }
             if let Some(text) = parsed.input_transcription {
-                let sample_end = last_sent_sample_end
-                    .or_else(|| ring.lock().expect("audio ring poisoned").observed_end)
-                    .unwrap_or(*transcript_sample_cursor)
-                    .max(*transcript_sample_cursor);
+                let sample_end = {
+                    let ring = ring.lock().expect("audio ring poisoned");
+                    transcript_sample_end(
+                        last_sent_sample_end,
+                        ring.replay_cursor(),
+                        ring.observed_end,
+                        *transcript_sample_cursor,
+                    )
+                };
                 if !emit_event(
                     events,
                     LiveEvent::InputTranscription {
@@ -1993,10 +2076,15 @@ impl LiveGateway {
                 }
             }
             if parsed.turn_complete {
-                let sample_end = last_sent_sample_end
-                    .or_else(|| ring.lock().expect("audio ring poisoned").observed_end)
-                    .unwrap_or(*transcript_sample_cursor)
-                    .max(*transcript_sample_cursor);
+                let sample_end = {
+                    let ring = ring.lock().expect("audio ring poisoned");
+                    transcript_sample_end(
+                        last_sent_sample_end,
+                        ring.replay_cursor(),
+                        ring.observed_end,
+                        *transcript_sample_cursor,
+                    )
+                };
                 if !emit_event(
                     events,
                     LiveEvent::TurnComplete {
@@ -2347,6 +2435,23 @@ async fn emit_connection(
     emit_event(events, LiveEvent::ConnectionChanged { state }, cancellation).await
 }
 
+/// End sample for a transcription event. Audio sent on this socket is the
+/// best evidence; before anything was sent (a fresh socket after a reconnect)
+/// the replay cursor -- the first retained chunk -- is used, not the newest
+/// observed sample, so replayed audio is not attributed to its future.
+fn transcript_sample_end(
+    last_sent_sample_end: Option<u64>,
+    replay_cursor: Option<u64>,
+    observed_end: Option<u64>,
+    transcript_cursor: u64,
+) -> u64 {
+    last_sent_sample_end
+        .or(replay_cursor)
+        .or(observed_end)
+        .unwrap_or(transcript_cursor)
+        .max(transcript_cursor)
+}
+
 fn spawn_audio_ingest(
     mut receiver: broadcast::Receiver<PcmChunk>,
     ring: Arc<Mutex<AudioRing>>,
@@ -2366,7 +2471,15 @@ fn spawn_audio_ingest(
                     ring.lock().expect("audio ring poisoned").push(chunk);
                     changed.notify_one();
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Lagged(missed)) => {
+                    // The skipped chunks never reached the ring: record the
+                    // missing span as a gap right away.
+                    ring.lock()
+                        .expect("audio ring poisoned")
+                        .note_lagged(missed);
+                    changed.notify_one();
+                    continue;
+                }
                 Err(broadcast::error::RecvError::Closed) => break,
             }
         }
@@ -2441,6 +2554,26 @@ impl AudioRing {
             chunk,
             ever_sent: false,
         });
+    }
+
+    /// Records the span of `missed` chunks skipped by a lagging broadcast
+    /// receiver as a gap directly after the last observed sample.
+    fn note_lagged(&mut self, missed: u64) {
+        let Some(end) = self.observed_end else {
+            return;
+        };
+        let span = missed.saturating_mul(OUTPUT_CHUNK_SAMPLES as u64);
+        let gap_end = end.saturating_add(span);
+        self.push_gap(GapRange {
+            start: end,
+            end: gap_end,
+        });
+        self.observed_end = Some(gap_end);
+    }
+
+    /// Where a replay on a fresh socket starts: the oldest retained chunk.
+    fn replay_cursor(&self) -> Option<u64> {
+        self.chunks.front().map(|item| item.chunk.start_sample)
     }
 
     fn push_gap(&mut self, gap: GapRange) {

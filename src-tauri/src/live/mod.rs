@@ -3,8 +3,9 @@
 
 pub mod recording;
 
+use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -248,6 +249,17 @@ impl LiveSessionHandle {
             .map_err(|_| actor_error())?;
         response.await.map_err(|_| actor_error())
     }
+
+    /// Drops the subscriber registered with this Channel id (a no-op when it
+    /// is already gone).
+    pub async fn unsubscribe(&self, channel_id: u32) -> Result<(), AppError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::Unsubscribe { channel_id, reply })
+            .await
+            .map_err(|_| actor_error())?;
+        response.await.map_err(|_| actor_error())
+    }
 }
 
 enum Command {
@@ -271,6 +283,10 @@ enum Command {
     },
     Subscribe {
         channel: Channel<LiveEvent>,
+        reply: oneshot::Sender<()>,
+    },
+    Unsubscribe {
+        channel_id: u32,
         reply: oneshot::Sender<()>,
     },
 }
@@ -324,6 +340,9 @@ pub struct LiveSessionActor {
     running: Option<RunningSession>,
     pending_close_finalize: Option<(SessionId, f64)>,
     close_failed: bool,
+    /// Sessions whose derived Proxy is being encoded off-actor (shared with
+    /// boot recovery). Delete and rerun treat them as busy.
+    recovering: Arc<Mutex<HashSet<SessionId>>>,
 }
 
 /// Creates the one process-wide LiveSession handle and actor.
@@ -362,11 +381,19 @@ pub fn channel(
             running: None,
             pending_close_finalize: None,
             close_failed: false,
+            recovering: Arc::new(Mutex::new(HashSet::new())),
         },
     )
 }
 
 impl LiveSessionActor {
+    /// Shares the app-wide busy set so a detached Proxy encode is visible to
+    /// delete/rerun guards.
+    pub fn with_recovering(mut self, recovering: Arc<Mutex<HashSet<SessionId>>>) -> Self {
+        self.recovering = recovering;
+        self
+    }
+
     pub async fn run(mut self) {
         let mut flush_check = tokio::time::interval(FLUSH_CHECK_PERIOD);
         flush_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -400,6 +427,10 @@ impl LiveSessionActor {
                         self.register_subscriber(channel);
                         let _ = reply.send(());
                     }
+                    Some(Command::Unsubscribe { channel_id, reply }) => {
+                        self.unregister_subscriber(channel_id);
+                        let _ = reply.send(());
+                    }
                     None => {
                         let _ = self.finish_current(None, false).await;
                         break;
@@ -422,6 +453,12 @@ impl LiveSessionActor {
             return Err(AppError::new(
                 Code::Request,
                 "A Live session is already running",
+            ));
+        }
+        if self.pending_close_finalize.is_some() || self.close_failed {
+            return Err(AppError::new(
+                Code::Request,
+                "The previous Live session has not been saved yet",
             ));
         }
         if !params.consent.is_current() {
@@ -498,13 +535,24 @@ impl LiveSessionActor {
         let transcript_id = match transcript {
             Ok(id) => id,
             Err(error) => {
-                // The session row and checkpointed WAV are recovery evidence;
-                // stop both workers, but keep those durable artifacts.
+                // Nothing was transcribed yet: stop both workers, then remove
+                // the just-created row and its media in-process so no phantom
+                // `recording` session outlives this failed start. If removal
+                // fails too, boot recovery still owns the leftovers.
                 let mut recording = recording;
                 recording.begin_shutdown();
                 let capture = self.capture.clone();
                 let _ = tokio::task::spawn_blocking(move || capture.stop_capture()).await;
                 let _ = tokio::task::spawn_blocking(move || recording.stop()).await;
+                let db = self.db.clone();
+                let data_dir = self.data_dir.clone();
+                let cleanup = tokio::task::spawn_blocking(move || {
+                    store::delete_session(&db, &data_dir, session_id)
+                })
+                .await;
+                if !matches!(cleanup, Ok(Ok(()))) {
+                    tracing::warn!(session_id = %session_id, "could not remove the Live session of a failed start; boot recovery will handle it");
+                }
                 return Err(error);
             }
         };
@@ -663,14 +711,19 @@ impl LiveSessionActor {
                                 let start = running.sentence_start.unwrap_or(sample_start);
                                 let end = sample_end.max(running.sentence_end).max(start);
                                 let text = std::mem::take(&mut running.sentence_buffer);
-                                let draft = text_draft(start, end, running.baseline_sample, text);
-                                running.pending.push(draft.clone());
                                 running.sentence_start = None;
-                                Some(LiveSegment {
-                                    start_sec: draft.start_sec,
-                                    end_sec: draft.end_sec,
-                                    text: draft.text,
-                                })
+                                if has_content(&text) {
+                                    let draft =
+                                        text_draft(start, end, running.baseline_sample, text);
+                                    running.pending.push(draft.clone());
+                                    Some(LiveSegment {
+                                        start_sec: draft.start_sec,
+                                        end_sec: draft.end_sec,
+                                        text: draft.text,
+                                    })
+                                } else {
+                                    None
+                                }
                             } else {
                                 None
                             }
@@ -980,19 +1033,23 @@ impl LiveSessionActor {
             if !running.sentence_buffer.trim().is_empty() {
                 let start = running.sentence_start.unwrap_or(running.sentence_end);
                 let text = std::mem::take(&mut running.sentence_buffer);
-                let draft = text_draft(
-                    start,
-                    running.sentence_end.max(start),
-                    running.baseline_sample,
-                    text,
-                );
-                running.pending.push(draft.clone());
                 running.sentence_start = None;
-                Some(LiveSegment {
-                    start_sec: draft.start_sec,
-                    end_sec: draft.end_sec,
-                    text: draft.text,
-                })
+                if has_content(&text) {
+                    let draft = text_draft(
+                        start,
+                        running.sentence_end.max(start),
+                        running.baseline_sample,
+                        text,
+                    );
+                    running.pending.push(draft.clone());
+                    Some(LiveSegment {
+                        start_sec: draft.start_sec,
+                        end_sec: draft.end_sec,
+                        text: draft.text,
+                    })
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -1067,12 +1124,14 @@ impl LiveSessionActor {
                 Err(err) => recording::RecordingStopOutcome {
                     wav_finalized: false,
                     error: Some(AppError::new(Code::Storage, err.to_string())),
+                    written_samples: 0,
                 },
             }
         } else {
             recording::RecordingStopOutcome {
                 wav_finalized: true,
                 error: None,
+                written_samples: 0,
             }
         };
         match tokio::time::timeout(OLD_GENERATION_DRAIN, &mut running.gateway_task).await {
@@ -1080,6 +1139,11 @@ impl LiveSessionActor {
             Ok(Err(_)) => {}
             Err(_) => running.gateway_task.abort(),
         }
+
+        // The WAV length is the authoritative duration; the sample clock is
+        // only a fallback when the writer reported nothing.
+        let duration_sec =
+            duration_from_written_samples(recording_result.written_samples).unwrap_or(duration_sec);
 
         if let Err(error) = final_flush {
             if recording_result.wav_finalized {
@@ -1150,21 +1214,10 @@ impl LiveSessionActor {
             });
         }
 
-        let data_dir = self.data_dir.clone();
         let db = self.db.clone();
-        let recording_path = crate::core::paths::recording_path(&data_dir, session_id);
+        // Commit `complete` first: Stop must not wait for a Proxy encode.
         let outcome = tokio::task::spawn_blocking(move || {
-            if for_close {
-                store::finalize_live_session_minimal(&db, session_id, duration_sec)
-            } else {
-                store::finalize_live_session(
-                    &db,
-                    &data_dir,
-                    session_id,
-                    &recording_path,
-                    duration_sec,
-                )
-            }
+            store::finalize_live_session_minimal(&db, session_id, duration_sec)
         })
         .await;
         let outcome = match outcome {
@@ -1204,6 +1257,9 @@ impl LiveSessionActor {
                 error: error.clone(),
             });
         }
+        if !for_close {
+            self.spawn_proxy_derivation(session_id);
+        }
         self.snapshot = LiveSnapshot {
             session_id: Some(session_id),
             transcript_id: Some(transcript_id),
@@ -1235,6 +1291,27 @@ impl LiveSessionActor {
         Ok(outcome.session_id)
     }
 
+    /// Encodes the Proxy of a just-completed session off the actor. The
+    /// session is claimed in the shared `recovering` set first, so delete and
+    /// rerun see it as busy; a failure leaves the failed-repair marker and the
+    /// WAV/transcript untouched.
+    fn spawn_proxy_derivation(&self, session_id: SessionId) {
+        let Some(claim) = store::ClaimGuard::try_claim(&self.recovering, session_id) else {
+            return;
+        };
+        let db = self.db.clone();
+        let root = self.data_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            match store::derive_live_proxy(&db, &root, session_id, &claim) {
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(session_id = %session_id, error = %error, "Live Proxy could not be derived after Stop");
+                }
+            }
+            drop(claim);
+        });
+    }
+
     fn snapshot_for_running(&self) -> LiveSnapshot {
         self.running.as_ref().map_or_else(
             || self.snapshot.clone(),
@@ -1261,6 +1338,11 @@ impl LiveSessionActor {
         if channel.send(ready).is_ok() {
             self.subscribers.push(channel);
         }
+    }
+
+    fn unregister_subscriber(&mut self, channel_id: u32) {
+        self.subscribers
+            .retain(|channel| channel.id() != channel_id);
     }
 
     fn emit(&mut self, event: LiveEvent) {
@@ -1362,6 +1444,16 @@ fn text_draft(
     }
 }
 
+fn duration_from_written_samples(written_samples: u64) -> Option<f64> {
+    (written_samples > 0).then(|| written_samples as f64 / f64::from(OUTPUT_SAMPLE_RATE))
+}
+
+/// A segment worth persisting contains at least one letter or digit; a piece
+/// of pure punctuation (for example a stray `.` between sentences) is dropped.
+fn has_content(text: &str) -> bool {
+    text.chars().any(char::is_alphanumeric)
+}
+
 fn tail_gap_draft(
     start_sample: u64,
     end_sample: u64,
@@ -1380,15 +1472,79 @@ fn tail_gap_draft(
     })
 }
 
+/// Abbreviations that end in a dot without ending the sentence when the next
+/// word starts in lowercase.
+const ABBREVIATIONS: &[&str] = &[
+    "mr", "mrs", "ms", "dr", "prof", "sr", "jr", "vs", "etc", "vol", "fig", "inc", "ltd", "e.g",
+    "i.e", "approx", "dept",
+];
+
+/// Whether the terminator at `chars[index]` closes a sentence. `chars` is the
+/// whole buffered text, so a `.` at the very end is judged without knowing what
+/// follows: it splits unless it could be part of a decimal or an abbreviation.
+fn is_sentence_end(chars: &[(usize, char)], index: usize) -> bool {
+    let ch = chars[index].1;
+    if !matches!(ch, '.' | '!' | '?' | '。' | '！' | '？' | '\n') {
+        return false;
+    }
+    if ch != '.' {
+        return true;
+    }
+    let previous = index.checked_sub(1).map(|i| chars[i].1);
+    let next = chars.get(index + 1).map(|(_, c)| *c);
+    // `...` is an ellipsis, not a sentence end.
+    if previous == Some('.') || next == Some('.') {
+        return false;
+    }
+    // Decimal or version number such as `3.14`; a trailing digit-dot waits
+    // for the next delta to disambiguate.
+    if previous.is_some_and(|c| c.is_ascii_digit()) {
+        match next {
+            Some(c) if c.is_ascii_digit() => return false,
+            None => return false,
+            _ => {}
+        }
+    }
+    // Abbreviation followed by a lowercase word (or by nothing yet).
+    let word_end = index;
+    let mut word_start = word_end;
+    while word_start > 0 {
+        let c = chars[word_start - 1].1;
+        if c.is_alphabetic()
+            || (c == '.' && word_start >= 2 && chars[word_start - 2].1.is_alphabetic())
+        {
+            word_start -= 1;
+        } else {
+            break;
+        }
+    }
+    let word: String = chars[word_start..word_end]
+        .iter()
+        .map(|(_, c)| c.to_ascii_lowercase())
+        .collect();
+    let is_abbreviation = !word.is_empty()
+        && (ABBREVIATIONS.contains(&word.as_str())
+            || (word.chars().count() == 1 && word.chars().all(|c| c.is_alphabetic())));
+    if is_abbreviation {
+        let following = chars[index + 1..]
+            .iter()
+            .map(|(_, c)| *c)
+            .find(|c| !c.is_whitespace());
+        return match following {
+            Some(c) => !c.is_lowercase(),
+            None => false,
+        };
+    }
+    true
+}
+
 fn split_complete_sentences(running: &mut RunningSession) -> Vec<LiveSegment> {
-    let split_points: Vec<(usize, usize)> = running
-        .sentence_buffer
-        .char_indices()
+    let chars: Vec<(usize, char)> = running.sentence_buffer.char_indices().collect();
+    let split_points: Vec<(usize, usize)> = chars
+        .iter()
         .enumerate()
-        .filter_map(|(char_idx, (byte_idx, ch))| {
-            matches!(ch, '.' | '!' | '?' | '。' | '！' | '？' | '\n')
-                .then_some((byte_idx + ch.len_utf8(), char_idx + 1))
-        })
+        .filter(|(char_idx, _)| is_sentence_end(&chars, *char_idx))
+        .map(|(char_idx, (byte_idx, ch))| (byte_idx + ch.len_utf8(), char_idx + 1))
         .collect();
     if split_points.is_empty() {
         return Vec::new();
@@ -1407,7 +1563,7 @@ fn split_complete_sentences(running: &mut RunningSession) -> Vec<LiveSegment> {
         let sentence_end = sample_start.saturating_add(
             ((sample_span as u128 * char_end as u128) / total_chars as u128) as u64,
         );
-        if !sentence.is_empty() {
+        if has_content(sentence) {
             let draft = text_draft(
                 previous_end,
                 sentence_end.max(previous_end),
@@ -1662,6 +1818,21 @@ mod tests {
         fixture.actor.next_generation = generation.saturating_add(1);
         fixture.actor.snapshot = fixture.actor.snapshot_for_running();
         (session_id, transcript_id)
+    }
+
+    /// The Proxy is derived off the actor after Stop returned; wait for it.
+    async fn wait_for_proxy(db: &Db, session_id: SessionId) -> Option<String> {
+        for _ in 0..400 {
+            let ext = db
+                .with_connection(|conn| Ok(repo::sessions::get(conn, session_id)?.unwrap()))
+                .unwrap()
+                .proxy_ext;
+            if ext.is_some() {
+                return ext;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        None
     }
 
     #[test]
@@ -2288,7 +2459,10 @@ mod tests {
             .with_connection(|conn| Ok(repo::sessions::get(conn, session_id)?.unwrap()))
             .unwrap();
         assert_eq!(row.status, "complete");
-        assert_eq!(row.proxy_ext.as_deref(), Some("flac"));
+        assert_eq!(
+            wait_for_proxy(&fixture.db, session_id).await.as_deref(),
+            Some("flac")
+        );
     }
 
     #[tokio::test]
@@ -2489,7 +2663,10 @@ mod tests {
             .with_connection(|conn| Ok(repo::sessions::get(conn, session_id)?.unwrap()))
             .unwrap();
         assert_eq!(row.status, "complete");
-        assert_eq!(row.proxy_ext.as_deref(), Some("flac"));
+        assert_eq!(
+            wait_for_proxy(&fixture.db, session_id).await.as_deref(),
+            Some("flac")
+        );
         assert_eq!(
             fixture.actor.snapshot.error_category,
             Some(Category::Permission)
@@ -2503,5 +2680,411 @@ mod tests {
             event,
             LiveEvent::Final { session_id: final_id, .. } if *final_id == session_id
         )));
+    }
+
+    fn running_with_buffer(buffer: &str, span_samples: u64) -> RunningSession {
+        let (terminal_errors, terminal_rx) = watch::channel(None);
+        drop(terminal_errors);
+        RunningSession {
+            generation: 1,
+            session_id: SessionId::new(),
+            transcript_id: TranscriptId::new(),
+            baseline_sample: 0,
+            last_flush_sample: 0,
+            pending: Vec::new(),
+            sentence_buffer: buffer.to_owned(),
+            sentence_start: Some(0),
+            sentence_end: span_samples,
+            recording: None,
+            terminal_errors: terminal_rx,
+            gateway_cancel: CancellationToken::new(),
+            gateway_task: tokio::spawn(async {}),
+            connection: ConnectionState::Connected,
+            transcription: TranscriptionState::Active,
+            transcript_stopped_sample: None,
+            error_category: None,
+            recording_state: RecordingState::Active,
+            storage_error_reported: false,
+        }
+    }
+
+    fn split_texts(buffer: &str) -> (Vec<String>, String) {
+        let mut running = running_with_buffer(buffer, 16_000);
+        let completed = split_complete_sentences(&mut running)
+            .into_iter()
+            .map(|segment| segment.text)
+            .collect();
+        (completed, running.sentence_buffer)
+    }
+
+    #[tokio::test]
+    async fn sentences_are_not_split_inside_decimals_ellipses_or_abbreviations() {
+        assert_eq!(
+            split_texts("3.14 is out."),
+            (vec!["3.14 is out.".to_owned()], String::new())
+        );
+        // A trailing `3.` waits: the next delta may continue the number.
+        assert_eq!(split_texts("Pi is 3."), (Vec::new(), "Pi is 3.".to_owned()));
+        assert_eq!(
+            split_texts("Wait... what?"),
+            (vec!["Wait... what?".to_owned()], String::new())
+        );
+        assert_eq!(
+            split_texts("Ask Dr. smith about it. Then go."),
+            (
+                vec!["Ask Dr. smith about it.".to_owned(), "Then go.".to_owned()],
+                String::new()
+            )
+        );
+        // An abbreviation before a capital still ends the sentence.
+        assert_eq!(
+            split_texts("I met Dr. Smith. Fine."),
+            (
+                vec![
+                    "I met Dr.".to_owned(),
+                    "Smith.".to_owned(),
+                    "Fine.".to_owned()
+                ],
+                String::new()
+            )
+        );
+        // A plain sentence end and CJK terminators still split.
+        assert_eq!(
+            split_texts("Hello. 元気ですか？はい。"),
+            (
+                vec![
+                    "Hello.".to_owned(),
+                    "元気ですか？".to_owned(),
+                    "はい。".to_owned()
+                ],
+                String::new()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn punctuation_only_pieces_are_never_persisted() {
+        let mut running = running_with_buffer("Done. . ... ! Next.", 16_000);
+        let completed = split_complete_sentences(&mut running);
+        let texts = completed
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(texts, ["Done.", "Next."]);
+        assert!(running.pending.iter().all(|draft| has_content(&draft.text)));
+        assert!(!has_content("... !?"));
+        assert!(has_content("v2"));
+    }
+
+    #[tokio::test]
+    async fn streamed_decimal_is_reassembled_before_it_can_split() {
+        let mut fixture = fixture();
+        add_recording(&mut fixture, 1);
+        let baseline = fixture.actor.running.as_ref().unwrap().baseline_sample;
+        for (index, text) in ["Version 3.", "14 is out."].into_iter().enumerate() {
+            fixture
+                .actor
+                .handle_internal(Internal::GatewayEvent {
+                    generation: 1,
+                    event: GatewayEvent::InputTranscription {
+                        text: crate::core::sensitive::Sensitive::new(text.to_owned()),
+                        sample_start: baseline + index as u64 * 800,
+                        sample_end: baseline + (index as u64 + 1) * 800,
+                    },
+                })
+                .await;
+        }
+        let running = fixture.actor.running.as_ref().unwrap();
+        assert_eq!(running.pending.len(), 1);
+        assert_eq!(running.pending[0].text, "Version 3.14 is out.");
+        fixture.actor.finish_current(None, false).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn turn_complete_flushes_the_open_sentence_emits_turn_and_persists() {
+        let mut fixture = fixture();
+        let (_session_id, transcript_id) = add_recording(&mut fixture, 1);
+        let baseline = fixture.actor.running.as_ref().unwrap().baseline_sample;
+        let events = Arc::new(Mutex::new(Vec::new()));
+        fixture
+            .actor
+            .register_subscriber(collect_channel(events.clone()));
+        fixture
+            .actor
+            .handle_internal(Internal::GatewayEvent {
+                generation: 1,
+                event: GatewayEvent::InputTranscription {
+                    text: crate::core::sensitive::Sensitive::new("no terminator yet".to_owned()),
+                    sample_start: baseline + 800,
+                    sample_end: baseline + 2_400,
+                },
+            })
+            .await;
+        assert!(fixture.actor.running.as_ref().unwrap().pending.is_empty());
+
+        fixture
+            .actor
+            .handle_internal(Internal::GatewayEvent {
+                generation: 1,
+                event: GatewayEvent::TurnComplete {
+                    sample_start: baseline + 800,
+                    sample_end: baseline + 3_200,
+                },
+            })
+            .await;
+
+        {
+            let events = events.lock().unwrap();
+            let segment_at = events
+                .iter()
+                .position(|event| {
+                    matches!(event, LiveEvent::Segment { segment, .. }
+                        if segment.text == "no terminator yet")
+                })
+                .expect("open sentence becomes a segment");
+            let turn_at = events
+                .iter()
+                .position(|event| matches!(event, LiveEvent::Turn { .. }))
+                .expect("turn is announced");
+            assert!(segment_at < turn_at);
+        }
+        let running = fixture.actor.running.as_ref().unwrap();
+        assert!(running.sentence_buffer.is_empty());
+        assert!(running.sentence_start.is_none());
+        // The turn boundary also checkpointed the batch.
+        let persisted = fixture
+            .db
+            .with_connection(|conn| Ok(repo::segments::list_for_transcript(conn, transcript_id)?))
+            .unwrap();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].text, "no terminator yet");
+        fixture.actor.finish_current(None, false).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn turn_complete_with_only_punctuation_emits_no_segment() {
+        let mut fixture = fixture();
+        let (_session_id, transcript_id) = add_recording(&mut fixture, 1);
+        let baseline = fixture.actor.running.as_ref().unwrap().baseline_sample;
+        {
+            let running = fixture.actor.running.as_mut().unwrap();
+            running.sentence_buffer = " ... ".to_owned();
+            running.sentence_start = Some(baseline);
+        }
+        fixture
+            .actor
+            .handle_internal(Internal::GatewayEvent {
+                generation: 1,
+                event: GatewayEvent::TurnComplete {
+                    sample_start: baseline,
+                    sample_end: baseline + 1_600,
+                },
+            })
+            .await;
+        let persisted = fixture
+            .db
+            .with_connection(|conn| Ok(repo::segments::list_for_transcript(conn, transcript_id)?))
+            .unwrap();
+        assert!(persisted.is_empty());
+        fixture.actor.finish_current(None, false).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_persists_an_unterminated_sentence_buffer() {
+        let mut fixture = fixture();
+        let (_session_id, transcript_id) = add_recording(&mut fixture, 1);
+        let baseline = fixture.actor.running.as_ref().unwrap().baseline_sample;
+        fixture
+            .actor
+            .handle_internal(Internal::GatewayEvent {
+                generation: 1,
+                event: GatewayEvent::InputTranscription {
+                    text: crate::core::sensitive::Sensitive::new("trailing words".to_owned()),
+                    sample_start: baseline + 800,
+                    sample_end: baseline + 2_400,
+                },
+            })
+            .await;
+        assert!(fixture.actor.running.as_ref().unwrap().pending.is_empty());
+
+        fixture.actor.finish_current(None, false).await.unwrap();
+
+        let persisted = fixture
+            .db
+            .with_connection(|conn| Ok(repo::segments::list_for_transcript(conn, transcript_id)?))
+            .unwrap();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].text, "trailing words");
+    }
+
+    #[tokio::test]
+    async fn stop_duration_comes_from_the_written_wav_samples() {
+        let mut fixture = fixture();
+        let (session_id, _) = add_recording(&mut fixture, 1);
+        let baseline = fixture.actor.running.as_ref().unwrap().baseline_sample;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while fixture.capture.sample_clock() <= baseline {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        fixture.actor.finish_current(None, false).await.unwrap();
+
+        let wav = hound::WavReader::open(crate::core::paths::recording_path(
+            fixture._root.path(),
+            session_id,
+        ))
+        .unwrap();
+        let expected = f64::from(wav.duration()) / f64::from(OUTPUT_SAMPLE_RATE);
+        let row = fixture
+            .db
+            .with_connection(|conn| Ok(repo::sessions::get(conn, session_id)?.unwrap()))
+            .unwrap();
+        assert_eq!(row.duration_sec, expected);
+        assert_eq!(duration_from_written_samples(0), None);
+        assert_eq!(duration_from_written_samples(32_000), Some(2.0));
+    }
+
+    #[tokio::test]
+    async fn stop_commits_complete_before_the_proxy_and_releases_its_claim_afterwards() {
+        let mut fixture = fixture();
+        let busy = Arc::new(Mutex::new(HashSet::new()));
+        fixture.actor.recovering = busy.clone();
+        let (session_id, _) = add_recording(&mut fixture, 1);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        fixture.actor.finish_current(None, false).await.unwrap();
+
+        // `complete` is committed by the time Stop returns; the Proxy is a
+        // detached follow-up that eventually appears and frees its claim.
+        let row = fixture
+            .db
+            .with_connection(|conn| Ok(repo::sessions::get(conn, session_id)?.unwrap()))
+            .unwrap();
+        assert_eq!(row.status, "complete");
+        assert_eq!(
+            wait_for_proxy(&fixture.db, session_id).await.as_deref(),
+            Some("flac")
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !busy.lock().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the proxy claim must be released");
+    }
+
+    #[tokio::test]
+    async fn a_session_claimed_elsewhere_is_not_encoded_by_stop() {
+        let mut fixture = fixture();
+        let busy = Arc::new(Mutex::new(HashSet::new()));
+        fixture.actor.recovering = busy.clone();
+        let (session_id, _) = add_recording(&mut fixture, 1);
+        busy.lock().unwrap().insert(session_id);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        fixture.actor.finish_current(None, false).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let row = fixture
+            .db
+            .with_connection(|conn| Ok(repo::sessions::get(conn, session_id)?.unwrap()))
+            .unwrap();
+        assert_eq!(row.status, "complete");
+        assert_eq!(row.proxy_ext, None);
+        assert!(busy.lock().unwrap().contains(&session_id));
+    }
+
+    fn start_params() -> LiveStartParams {
+        LiveStartParams {
+            source: "mic:test".to_owned(),
+            language: TranscribeLanguage::Auto,
+            tag_ids: Vec::new(),
+            locale: None,
+            ui_language: UiLanguage::En,
+            model: "live-start-test".to_owned(),
+            consent: ConsentSnapshot::new(crate::consent::CURRENT_VERSION, false),
+        }
+    }
+
+    #[tokio::test]
+    async fn start_is_refused_while_a_close_save_is_pending_or_failed() {
+        let mut fixture = fixture();
+        fixture.actor.pending_close_finalize = Some((SessionId::new(), 1.0));
+        let error = fixture.actor.start(start_params()).await.unwrap_err();
+        assert_eq!(error.code, Code::Request);
+        assert!(fixture.capture.active_source().is_none());
+
+        fixture.actor.pending_close_finalize = None;
+        fixture.actor.close_failed = true;
+        let error = fixture.actor.start(start_params()).await.unwrap_err();
+        assert_eq!(error.code, Code::Request);
+        assert!(fixture.capture.active_source().is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_transcript_creation_leaves_no_phantom_recording_row() {
+        let mut fixture = fixture();
+        let (pool, pool_actor) =
+            KeyPoolHandle::channel(Arc::new(OneKeyProvider), Arc::new(SystemClock));
+        tokio::spawn(pool_actor.run());
+        pool.refresh().await.unwrap();
+        fixture.actor.key_pool = pool.clone();
+        fixture.actor.gateway = LiveGateway::new(Arc::new(PendingConnector), pool);
+        fixture
+            .db
+            .with_connection(|conn| {
+                conn.execute_batch(
+                    "CREATE TRIGGER fail_transcripts BEFORE INSERT ON transcripts \
+                     BEGIN SELECT RAISE(FAIL, 'injected'); END;",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let error = fixture.actor.start(start_params()).await.unwrap_err();
+
+        assert_eq!(error.code, Code::Storage);
+        assert!(fixture.actor.running.is_none());
+        assert!(fixture.capture.active_source().is_none());
+        let sessions = fixture
+            .db
+            .with_connection(|conn| Ok(repo::sessions::list(conn)?))
+            .unwrap();
+        assert!(sessions.is_empty(), "no phantom recording row");
+        let media_left = std::fs::read_dir(crate::core::paths::media_root(fixture._root.path()))
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(media_left, 0);
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_drops_only_the_named_channel() {
+        let mut fixture = fixture();
+        let first_events = Arc::new(Mutex::new(Vec::new()));
+        let second_events = Arc::new(Mutex::new(Vec::new()));
+        let first = collect_channel(first_events.clone());
+        let first_id = first.id();
+        fixture.actor.register_subscriber(first);
+        fixture
+            .actor
+            .register_subscriber(collect_channel(second_events.clone()));
+        assert_eq!(fixture.actor.subscribers.len(), 2);
+
+        fixture.actor.unregister_subscriber(first_id);
+        assert_eq!(fixture.actor.subscribers.len(), 1);
+        fixture.actor.emit(LiveEvent::Turn { seq: 0 });
+        assert_eq!(
+            first_events.lock().unwrap().len(),
+            1,
+            "only the Ready event"
+        );
+        assert_eq!(second_events.lock().unwrap().len(), 2);
+        // Unknown ids are a no-op.
+        fixture.actor.unregister_subscriber(first_id);
+        assert_eq!(fixture.actor.subscribers.len(), 1);
     }
 }

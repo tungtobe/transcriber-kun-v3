@@ -32,7 +32,7 @@ use crate::settings::{self, Settings, SettingsChanged, TranscribeLanguage};
 use crate::transcribe::job::{CancelOutcome, JobEvent};
 use crate::transcribe::registry::{self, RerunOutcome, RerunParams, RetranscribeParams};
 use crate::transcribe::rerun::{self, RerunScope};
-use boot::AppState;
+use boot::{ActiveRecordingExport, AppState};
 
 /// Story 3.1: `true` khi `session_id` đang bị `library_session_delete` đánh
 /// dấu "deleting" (spec Design Notes AD-1: chỉ `ipc/` đọc/ghi
@@ -293,6 +293,21 @@ async fn live_subscribe(
 ) -> Result<(), AppError> {
     let result = match state.live.clone() {
         Ok(live) => live.subscribe(on_event).await,
+        Err(error) => Err(error),
+    };
+    track_ipc_error(&state.db, result).await
+}
+
+/// Drop the subscriber registered with `on_event` (the same Channel object the
+/// frontend passed to `live_subscribe`). Idempotent.
+#[tauri::command]
+#[specta::specta]
+async fn live_unsubscribe(
+    on_event: tauri::ipc::Channel<LiveEvent>,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), AppError> {
+    let result = match state.live.clone() {
+        Ok(live) => live.unsubscribe(on_event.id()).await,
         Err(error) => Err(error),
     };
     track_ipc_error(&state.db, result).await
@@ -1682,21 +1697,8 @@ async fn library_recording_export(
     on_progress: tauri::ipc::Channel<RecordingExportProgress>,
 ) -> Result<bool, AppError> {
     let cancel_token = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let reservation = state
-        .recording_export
-        .lock()
-        .map_err(|_| AppError::new(Code::Storage, "Recording export state is unavailable."))
-        .and_then(|mut current| {
-            if current.is_some() {
-                Err(AppError::new(
-                    Code::Request,
-                    "Another Recording export is already running.",
-                ))
-            } else {
-                *current = Some(cancel_token.clone());
-                Ok(())
-            }
-        });
+    let reservation =
+        reserve_recording_export(&state.recording_export, session_id, cancel_token.clone());
     if let Err(error) = reservation {
         return track_ipc_error(&state.db, Err(error)).await;
     }
@@ -1749,10 +1751,17 @@ async fn library_recording_export(
         let total_seconds = source.duration_seconds;
         let channel = on_progress;
         let cancel = cancel_token.clone();
+        let staging_dir = state
+            .data_dir
+            .clone()
+            .ok()
+            .map(|root| crate::core::paths::staging_dir(&root, crate::core::id::JobId::new()));
+        let staging_cleanup = staging_dir.clone();
         let outcome = tauri::async_runtime::spawn_blocking(move || {
-            crate::media::export_recording(
+            let outcome = crate::media::export_recording(
                 &source.path,
                 &destination,
+                staging_dir.as_deref(),
                 format.media_format(),
                 total_seconds,
                 &cancel,
@@ -1762,7 +1771,12 @@ async fn library_recording_export(
                         total_seconds,
                     });
                 },
-            )
+            );
+            // The per-export staging dir is empty by now; drop it.
+            if let Some(dir) = staging_cleanup {
+                let _ = std::fs::remove_dir(dir);
+            }
+            outcome
         })
         .await
         .map_err(|err| AppError::new(Code::Storage, err.to_string()))??;
@@ -1770,15 +1784,58 @@ async fn library_recording_export(
     }
     .await;
 
-    if let Ok(mut active) = state.recording_export.lock() {
+    release_recording_export(&state.recording_export, &cancel_token);
+    track_ipc_error(&state.db, result).await
+}
+
+/// Takes the one export slot for `session_id`, or refuses when another export
+/// already holds it.
+fn reserve_recording_export(
+    slot: &std::sync::Mutex<Option<ActiveRecordingExport>>,
+    session_id: SessionId,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+) -> Result<(), AppError> {
+    let mut current = slot
+        .lock()
+        .map_err(|_| AppError::new(Code::Storage, "Recording export state is unavailable."))?;
+    if current.is_some() {
+        return Err(AppError::new(
+            Code::Request,
+            "Another Recording export is already running.",
+        ));
+    }
+    *current = Some(ActiveRecordingExport { session_id, cancel });
+    Ok(())
+}
+
+/// Frees the slot, but only if `cancel` still owns it.
+fn release_recording_export(
+    slot: &std::sync::Mutex<Option<ActiveRecordingExport>>,
+    cancel: &Arc<std::sync::atomic::AtomicBool>,
+) {
+    if let Ok(mut active) = slot.lock() {
         if active
             .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(current, &cancel_token))
+            .is_some_and(|current| Arc::ptr_eq(&current.cancel, cancel))
         {
             *active = None;
         }
     }
-    track_ipc_error(&state.db, result).await
+}
+
+/// `true` while an export is reading the WAV of `session_id`, or of any
+/// session when `session_id` is `None` (wipe).
+fn recording_export_active_for(
+    slot: &std::sync::Mutex<Option<ActiveRecordingExport>>,
+    session_id: Option<SessionId>,
+) -> bool {
+    slot.lock()
+        .map(|active| {
+            active
+                .as_ref()
+                .is_some_and(|export| session_id.is_none_or(|id| export.session_id == id))
+        })
+        .unwrap_or(false)
 }
 
 #[tauri::command]
@@ -1788,8 +1845,10 @@ fn library_recording_export_cancel(state: tauri::State<'_, AppState>) -> Result<
         .recording_export
         .lock()
         .map_err(|_| AppError::new(Code::Storage, "Recording export state is unavailable."))?;
-    if let Some(token) = active.as_ref() {
-        token.store(true, std::sync::atomic::Ordering::Release);
+    if let Some(export) = active.as_ref() {
+        export
+            .cancel
+            .store(true, std::sync::atomic::Ordering::Release);
     }
     Ok(())
 }
@@ -2009,6 +2068,7 @@ async fn library_session_delete_inner(
     let live = state.live.clone()?;
     let mark_set = state.deleting.clone();
     let unmark_set = state.deleting.clone();
+    let export_slot = state.recording_export.clone();
 
     let memo_running_for_mark = state.memo_running.clone();
 
@@ -2025,6 +2085,10 @@ async fn library_session_delete_inner(
         },
         move || async move {
             // A running Live session owns its row and WAV; never delete under it.
+            // An active Recording export is reading the same WAV.
+            if recording_export_active_for(&export_slot, Some(session_id)) {
+                return Ok(true);
+            }
             busy_when_live_running(live.is_running(), jobs.is_busy(session_id)).await
         },
         move || blocking(move || library::store::delete_session(&db, &root, session_id)),
@@ -2650,6 +2714,7 @@ async fn library_wipe_all_inner(state: &AppState) -> Result<WipeAllOutcome, AppE
     let live = state.live.clone()?;
     let mark_wiping = state.wiping.clone();
     let unmark_wiping = state.wiping.clone();
+    let export_slot = state.recording_export.clone();
     let memo_running_for_mark = state.memo_running.clone();
 
     decide_wipe_all(
@@ -2658,6 +2723,9 @@ async fn library_wipe_all_inner(state: &AppState) -> Result<WipeAllOutcome, AppE
             cancel_all_memo_requests(&memo_running_for_mark);
         },
         move || async move {
+            if recording_export_active_for(&export_slot, None) {
+                return Ok(true);
+            }
             busy_when_live_running(live.is_running(), async {
                 Ok(!jobs.snapshot().await?.is_empty())
             })
@@ -2691,12 +2759,12 @@ async fn app_close_confirm(
     let live = state.live.clone();
     let save_live = async move {
         if let Ok(live) = live {
-            match live.is_running().await? {
-                true => {
-                    live.stop_for_close().await?;
-                }
-                false => {}
-            }
+            let running = live.clone();
+            close::save_live_for_close(
+                move || async move { running.is_running().await },
+                move || async move { live.stop_for_close().await.map(|_| ()) },
+            )
+            .await?;
         }
         Ok(())
     };
@@ -2704,25 +2772,29 @@ async fn app_close_confirm(
     let jobs = state.jobs.clone();
     let cancel_jobs = async move {
         if let Ok(jobs) = jobs {
-            let pending = jobs.snapshot().await?;
-            for job in &pending {
-                let _ = jobs.cancel(job.job_id).await;
-            }
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(4);
-            loop {
-                match jobs.snapshot().await {
-                    Ok(remaining) if remaining.is_empty() => break,
-                    Ok(_) if tokio::time::Instant::now() < deadline => {}
-                    Ok(_) => {
-                        return Err(AppError::new(
-                            Code::Storage,
-                            "Transcription jobs did not stop before the close timeout",
-                        ));
+            let snapshot_jobs = jobs.clone();
+            close::cancel_jobs_until_empty(
+                move || {
+                    let jobs = snapshot_jobs.clone();
+                    async move {
+                        Ok(jobs
+                            .snapshot()
+                            .await?
+                            .into_iter()
+                            .map(|job| job.job_id)
+                            .collect::<Vec<_>>())
                     }
-                    Err(error) => return Err(error),
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
+                },
+                move |job_id| {
+                    let jobs = jobs.clone();
+                    async move {
+                        let _ = jobs.cancel(job_id).await;
+                    }
+                },
+                std::time::Duration::from_secs(4),
+                std::time::Duration::from_millis(100),
+            )
+            .await?;
         }
         Ok(())
     };
@@ -2760,6 +2832,7 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             live_stop,
             live_continue_recording_only,
             live_subscribe,
+            live_unsubscribe,
             settings_get,
             settings_save,
             consent_policy,
@@ -4045,6 +4118,33 @@ mod tests {
     // `decide_session_delete` (story 3.1) — spec Design Notes gate order
     // "Đánh dấu trước khi hỏi `is_busy`" and "gỡ ở mọi nhánh thoát, kể cả
     // lỗi".
+
+    #[test]
+    fn recording_export_slot_is_exclusive_released_by_its_owner_and_visible_to_delete_and_wipe() {
+        let slot = std::sync::Mutex::new(None);
+        let session_id = SessionId::new();
+        let other_session = SessionId::new();
+        let first = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let second = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        assert!(!recording_export_active_for(&slot, Some(session_id)));
+        assert!(!recording_export_active_for(&slot, None));
+        reserve_recording_export(&slot, session_id, first.clone()).unwrap();
+        // A second export is refused while the slot is held.
+        let error = reserve_recording_export(&slot, other_session, second.clone()).unwrap_err();
+        assert_eq!(error.code, Code::Request);
+        // Delete of the exported session and wipe are blocked; other sessions are not.
+        assert!(recording_export_active_for(&slot, Some(session_id)));
+        assert!(!recording_export_active_for(&slot, Some(other_session)));
+        assert!(recording_export_active_for(&slot, None));
+
+        // Only the owner's token releases the slot.
+        release_recording_export(&slot, &second);
+        assert!(recording_export_active_for(&slot, Some(session_id)));
+        release_recording_export(&slot, &first);
+        assert!(!recording_export_active_for(&slot, None));
+        reserve_recording_export(&slot, other_session, second).unwrap();
+    }
 
     #[test]
     fn recovering_session_rejects_delete_and_rerun_until_recovery_releases_it() {

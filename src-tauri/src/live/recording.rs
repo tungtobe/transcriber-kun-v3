@@ -49,12 +49,16 @@ pub struct RecordingHandle {
     terminal_errors: watch::Receiver<Option<AppError>>,
     worker: Option<JoinHandle<Result<(), AppError>>>,
     wav_finalized: Arc<std::sync::atomic::AtomicBool>,
+    written_samples: Arc<AtomicU64>,
 }
 
 #[derive(Debug)]
 pub struct RecordingStopOutcome {
     pub wav_finalized: bool,
     pub error: Option<AppError>,
+    /// Mono samples actually written to the WAV (its length), the
+    /// authoritative source for the session duration.
+    pub written_samples: u64,
 }
 
 impl RecordingHandle {
@@ -77,6 +81,7 @@ impl RecordingHandle {
         RecordingStopOutcome {
             wav_finalized: self.wav_finalized.load(Ordering::Acquire),
             error,
+            written_samples: self.written_samples.load(Ordering::Acquire),
         }
     }
 
@@ -309,6 +314,7 @@ fn start_inner_with_receiver(
         terminal_errors,
         worker: Some(worker),
         wav_finalized,
+        written_samples,
     })
 }
 
@@ -619,11 +625,23 @@ fn default_title(
     ui_language: UiLanguage,
     resolved_ui_locale: Option<&str>,
 ) -> String {
-    let process_locale = system_locale();
-    match resolve_ui_language(
-        ui_language,
-        resolved_ui_locale.or(process_locale.as_deref()),
-    ) {
+    default_title_with_env(now, ui_language, resolved_ui_locale, || system_locale())
+}
+
+/// Locale priority: the UI locale passed by `live_start` (a blank value counts
+/// as absent), then the process environment. `sys-locale` is not a dependency
+/// of this crate, so the environment stays the last-resort fallback.
+fn default_title_with_env(
+    now: DateTime<Local>,
+    ui_language: UiLanguage,
+    resolved_ui_locale: Option<&str>,
+    env_locale: impl FnOnce() -> Option<String>,
+) -> String {
+    let passed = resolved_ui_locale
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let process_locale = if passed.is_some() { None } else { env_locale() };
+    match resolve_ui_language(ui_language, passed.or(process_locale.as_deref())) {
         UiLanguage::Ja => now.format("%Y年%-m月%-d日 %H:%M:%S").to_string(),
         UiLanguage::Vi => now.format("%d/%m/%Y %H:%M:%S").to_string(),
         UiLanguage::En | UiLanguage::System => now.format("%Y-%m-%d %H:%M:%S").to_string(),
@@ -668,6 +686,20 @@ mod tests {
     use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::tempdir;
+
+    #[test]
+    fn default_title_prefers_the_passed_locale_over_the_environment() {
+        let now = Local::now();
+        let from_env = || Some("ja_JP.UTF-8".to_owned());
+        let vi = default_title_with_env(now, UiLanguage::System, Some("vi"), from_env);
+        assert_eq!(vi, now.format("%d/%m/%Y %H:%M:%S").to_string());
+        // A blank passed locale falls back to the environment.
+        let ja = default_title_with_env(now, UiLanguage::System, Some("  "), from_env);
+        assert_eq!(ja, now.format("%Y年%-m月%-d日 %H:%M:%S").to_string());
+        // An explicit UI language always wins.
+        let en = default_title_with_env(now, UiLanguage::En, Some("vi"), from_env);
+        assert_eq!(en, now.format("%Y-%m-%d %H:%M:%S").to_string());
+    }
 
     #[test]
     fn recording_start_requires_capture_before_creating_a_row_or_file() {
