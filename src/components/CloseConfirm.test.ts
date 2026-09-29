@@ -97,7 +97,7 @@ describe('CloseConfirm', () => {
     expect(mocks.appStore.stayOpen).toHaveBeenCalledTimes(1);
   });
 
-  it('keeps the app open when note flush fails and offers retry or stay only', async () => {
+  it('keeps the app open when note flush fails and offers retry, stay, or quit anyway', async () => {
     mocks.notesStore.flushAll.mockResolvedValue(false);
     render(CloseConfirm);
     await Promise.resolve();
@@ -107,7 +107,11 @@ describe('CloseConfirm', () => {
     expect(mocks.appStore.confirmClose).not.toHaveBeenCalled();
     expect(screen.getByRole('button', { name: 'Ở lại' })).toBeTruthy();
     expect(screen.getByRole('button', { name: 'Thử lưu và thoát lại' })).toBeTruthy();
-    expect(screen.queryByText('Vẫn thoát')).toBeNull();
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Vẫn thoát' }));
+    await waitFor(() => expect(mocks.appStore.confirmClose).toHaveBeenCalledTimes(1));
+    // Quitting anyway must not try to save the failing notes again.
+    expect(mocks.notesStore.flushAll).toHaveBeenCalledTimes(1);
   });
 
   it('keeps the dialog open when Live metadata commit fails, then permits a retry', async () => {

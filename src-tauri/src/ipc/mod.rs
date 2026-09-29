@@ -16,7 +16,7 @@ use specta::Type;
 use tauri::Manager;
 use tauri_specta::{collect_commands, collect_events, Builder, Event};
 
-use crate::audio::{CaptureController, LiveSources};
+use crate::audio::LiveSources;
 use crate::consent::{self, ConsentPolicy};
 use crate::core::error::{AppError, Code};
 use crate::core::id::{JobId, MemoTemplateId, SessionId, TagId, TranscriptId};
@@ -204,19 +204,21 @@ async fn live_open_permission_settings(
     track_ipc_error(&state.db, result).await
 }
 
-/// Prepare and switch the shared live capture source. `source` is one of
-/// `system`, `mic:<name>`, or `mixed:<mic>` as returned by `live_sources`.
+/// Switch the capture source of the running Live session. `source` is one of
+/// `system`, `mic:<name>`, or `mixed:<mic>` as returned by `live_sources`. The
+/// swap runs inside the Live actor (serialized with start/stop) and is
+/// rejected when no session is running, so no capture opens while idle.
 #[tauri::command]
 #[specta::specta]
 async fn live_set_source(
     source: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), AppError> {
-    let capture: Arc<CaptureController> = state.capture.clone();
-    let result = tauri::async_runtime::spawn_blocking(move || capture.set_source(&source))
-        .await
-        .map_err(|err| AppError::new(Code::Storage, err.to_string()))
-        .and_then(|inner| inner);
+    let result = async {
+        let live = state.live.clone()?;
+        live.set_source(source).await
+    }
+    .await;
     track_ipc_error(&state.db, result).await
 }
 
@@ -232,6 +234,9 @@ async fn live_start(
     state: tauri::State<'_, AppState>,
 ) -> Result<SessionId, AppError> {
     let result = async {
+        if is_wiping(&state.wiping) {
+            return Err(wiping_error());
+        }
         let db = state.db.clone()?;
         let settings = settings::load(&db);
         let live = state.live.clone()?;
@@ -1608,6 +1613,23 @@ impl RecordingExportFormat {
     }
 }
 
+/// Keep a picked path that already ends in the target extension; otherwise
+/// append it. Never rewrite a dotted segment (`a.v2` becomes `a.v2.wav`), so
+/// the file the user confirmed in the dialog is the file that gets written.
+fn with_export_extension(path: std::path::PathBuf, extension: &str) -> std::path::PathBuf {
+    let has_target = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case(extension));
+    if has_target {
+        return path;
+    }
+    let mut name = path.into_os_string();
+    name.push(".");
+    name.push(extension);
+    std::path::PathBuf::from(name)
+}
+
 /// Open the system save dialog on Tauri's main thread. The picker returns a
 /// Rust-only path; only progress crosses IPC while export work is running.
 fn pick_recording_export_destination(
@@ -1636,9 +1658,7 @@ fn pick_recording_export_destination(
         let Some(path) = picked else {
             return Ok(None);
         };
-        let mut path = path;
-        path.set_extension(format.extension());
-        Ok(Some(path))
+        Ok(Some(with_export_extension(path, format.extension())))
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
@@ -1957,6 +1977,22 @@ where
     outcome
 }
 
+/// `true` (Busy) when a Live session is running; otherwise defers to the
+/// Job check. Live is asked first so a running session short-circuits.
+async fn busy_when_live_running<LiveFut, OtherFut>(
+    live_running: LiveFut,
+    other_busy: OtherFut,
+) -> Result<bool, AppError>
+where
+    LiveFut: std::future::Future<Output = Result<bool, AppError>>,
+    OtherFut: std::future::Future<Output = Result<bool, AppError>>,
+{
+    if live_running.await? {
+        return Ok(true);
+    }
+    other_busy.await
+}
+
 async fn library_session_delete_inner(
     state: &AppState,
     session_id: SessionId,
@@ -1970,6 +2006,7 @@ async fn library_session_delete_inner(
     let db = state.db.clone()?;
     let root = state.data_dir.clone()?;
     let jobs = state.jobs.clone()?;
+    let live = state.live.clone()?;
     let mark_set = state.deleting.clone();
     let unmark_set = state.deleting.clone();
 
@@ -1986,7 +2023,10 @@ async fn library_session_delete_inner(
             // bắt đầu chặn `memo_generate` mới), trước khi kiểm `is_busy`.
             cancel_memo_requests_for_session(&memo_running_for_mark, session_id);
         },
-        move || async move { jobs.is_busy(session_id).await },
+        move || async move {
+            // A running Live session owns its row and WAV; never delete under it.
+            busy_when_live_running(live.is_running(), jobs.is_busy(session_id)).await
+        },
         move || blocking(move || library::store::delete_session(&db, &root, session_id)),
         move || {
             if let Ok(mut set) = unmark_set.lock() {
@@ -2607,6 +2647,7 @@ async fn library_wipe_all_inner(state: &AppState) -> Result<WipeAllOutcome, AppE
     let db = state.db.clone()?;
     let root = state.data_dir.clone()?;
     let jobs = state.jobs.clone()?;
+    let live = state.live.clone()?;
     let mark_wiping = state.wiping.clone();
     let unmark_wiping = state.wiping.clone();
     let memo_running_for_mark = state.memo_running.clone();
@@ -2617,8 +2658,10 @@ async fn library_wipe_all_inner(state: &AppState) -> Result<WipeAllOutcome, AppE
             cancel_all_memo_requests(&memo_running_for_mark);
         },
         move || async move {
-            let snapshot = jobs.snapshot().await?;
-            Ok(!snapshot.is_empty())
+            busy_when_live_running(live.is_running(), async {
+                Ok(!jobs.snapshot().await?.is_empty())
+            })
+            .await
         },
         move || blocking(move || library::store::wipe_all(&db, &root)),
         move || unmark_wiping.store(false, std::sync::atomic::Ordering::SeqCst),
@@ -4057,6 +4100,55 @@ mod tests {
         move || {
             flag.store(true, std::sync::atomic::Ordering::SeqCst);
         }
+    }
+
+    #[tokio::test]
+    async fn running_live_session_makes_delete_and_wipe_busy_without_asking_jobs() {
+        let asked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = asked.clone();
+        let busy = busy_when_live_running(async { Ok(true) }, async move {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(false)
+        })
+        .await
+        .unwrap();
+        assert!(busy);
+        assert!(!asked.load(std::sync::atomic::Ordering::SeqCst));
+
+        assert!(
+            !busy_when_live_running(async { Ok(false) }, async { Ok(false) })
+                .await
+                .unwrap()
+        );
+        assert!(
+            busy_when_live_running(async { Ok(false) }, async { Ok(true) })
+                .await
+                .unwrap()
+        );
+        assert!(
+            busy_when_live_running(async { Err(AppError::new(Code::Storage, "x")) }, async {
+                Ok(false)
+            })
+            .await
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn export_extension_appends_instead_of_replacing_dotted_segments() {
+        use std::path::PathBuf;
+        assert_eq!(
+            with_export_extension(PathBuf::from("/x/a.v2"), "wav"),
+            PathBuf::from("/x/a.v2.wav")
+        );
+        assert_eq!(
+            with_export_extension(PathBuf::from("/x/a"), "wav"),
+            PathBuf::from("/x/a.wav")
+        );
+        assert_eq!(
+            with_export_extension(PathBuf::from("/x/a.WAV"), "wav"),
+            PathBuf::from("/x/a.WAV")
+        );
     }
 
     #[tokio::test]

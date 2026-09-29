@@ -25,6 +25,28 @@ pub struct LiveRecoveryCompleted {
     pub session_id: SessionId,
 }
 
+/// Releases boot-recovery claims when dropped, so a panic mid-recovery cannot
+/// leave sessions stuck in `recovering`.
+struct ClaimGuard {
+    set: Arc<Mutex<HashSet<SessionId>>>,
+    ids: HashSet<SessionId>,
+}
+
+impl ClaimGuard {
+    fn new(set: Arc<Mutex<HashSet<SessionId>>>, ids: HashSet<SessionId>) -> Self {
+        Self { set, ids }
+    }
+}
+
+impl Drop for ClaimGuard {
+    fn drop(&mut self) {
+        let mut set = self.set.lock().unwrap_or_else(|e| e.into_inner());
+        for id in &self.ids {
+            set.remove(id);
+        }
+    }
+}
+
 /// State managed toàn app. `db` là `Err` khi thư mục dữ liệu không mở được —
 /// app vẫn khởi động bình thường, mọi command chạm DB trả lại đúng lỗi này
 /// (spec I/O Matrix: "App vẫn khởi động; ... trả AppError category storage").
@@ -83,7 +105,9 @@ pub struct AppState {
     pub recording_export: Arc<Mutex<Option<Arc<AtomicBool>>>>,
     /// Coalesces window/menu/Cmd+Q close requests and lets an approved exit
     /// pass through Tauri's `ExitRequested` callback exactly once.
-    pub close_requested: Arc<AtomicBool>,
+    /// Unix ms of the active close request, `0` when none. Claims expire so a
+    /// frontend that never answered cannot block later close attempts.
+    pub close_requested: Arc<std::sync::atomic::AtomicU64>,
     pub close_confirmed: Arc<AtomicBool>,
     // Giữ sống suốt vòng đời app — drop sớm sẽ ngắt worker ghi log không
     // đồng bộ của `tracing-appender`. Không đọc trực tiếp ở đâu khác nên
@@ -162,6 +186,8 @@ pub fn boot<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
                                 let busy = recovering.clone();
                                 let app = app.clone();
                                 tauri::async_runtime::spawn_blocking(move || {
+                                    // Releases every claim on all exits, panic included.
+                                    let _claims = ClaimGuard::new(busy, claimed);
                                     if let Err(error) =
                                         crate::library::store::cleanup_detached_staging(&root)
                                     {
@@ -240,12 +266,6 @@ pub fn boot<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
                                         }
                                         Err(error) => {
                                             tracing::warn!(error = %error, "could not scan Live Proxy repairs at boot")
-                                        }
-                                    }
-
-                                    if let Ok(mut set) = busy.lock() {
-                                        for session_id in claimed {
-                                            set.remove(&session_id);
                                         }
                                     }
                                 });
@@ -333,8 +353,29 @@ pub fn boot<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
         wiping: Arc::new(AtomicBool::new(false)),
         memo_running: Arc::new(Mutex::new(HashMap::new())),
         recording_export: Arc::new(Mutex::new(None)),
-        close_requested: Arc::new(AtomicBool::new(false)),
+        close_requested: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         close_confirmed: Arc::new(AtomicBool::new(false)),
         _log_guard: log_guard,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn claim_guard_releases_claims_on_panic() {
+        let id = SessionId::new();
+        let other = SessionId::new();
+        let set = Arc::new(Mutex::new(HashSet::from([id, other])));
+        let worker_set = set.clone();
+        let result = std::panic::catch_unwind(move || {
+            let _guard = ClaimGuard::new(worker_set, HashSet::from([id]));
+            panic!("recovery blew up");
+        });
+        assert!(result.is_err());
+        let held = set.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(!held.contains(&id));
+        assert!(held.contains(&other));
     }
 }

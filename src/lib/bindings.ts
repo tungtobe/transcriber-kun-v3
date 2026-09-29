@@ -23,8 +23,10 @@ export const commands = {
 	 */
 	liveOpenPermissionSettings: (system: boolean) => typedError<null, AppError>(__TAURI_INVOKE("live_open_permission_settings", { system })),
 	/**
-	 *  Prepare and switch the shared live capture source. `source` is one of
-	 *  `system`, `mic:<name>`, or `mixed:<mic>` as returned by `live_sources`.
+	 *  Switch the capture source of the running Live session. `source` is one of
+	 *  `system`, `mic:<name>`, or `mixed:<mic>` as returned by `live_sources`. The
+	 *  swap runs inside the Live actor (serialized with start/stop) and is
+	 *  rejected when no session is running, so no capture opens while idle.
 	 */
 	liveSetSource: (source: string) => typedError<null, AppError>(__TAURI_INVOKE("live_set_source", { source })),
 	/**

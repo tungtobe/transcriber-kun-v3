@@ -11,11 +11,14 @@
   let liveBusy = $state(false);
   let jobBusy = $state(false);
   let closeError = $state<string | null>(null);
+  // Set when saving notes failed: the user may still quit without them.
+  let notesFlushFailed = $state(false);
 
   async function handleCloseRequested(request: { liveBusy: boolean; jobBusy: boolean }): Promise<void> {
     liveBusy = request.liveBusy;
     jobBusy = request.jobBusy;
     closeError = null;
+    notesFlushFailed = false;
     if (liveBusy || jobBusy) {
       dialogVisible = true;
       return;
@@ -23,14 +26,16 @@
     await flushAndConfirm();
   }
 
-  async function flushAndConfirm(): Promise<void> {
+  async function flushAndConfirm(skipNotes = false): Promise<void> {
     closing = true;
     try {
-      if (!(await notesStore.flushAll())) {
-        closeError = i18n.t('closeConfirm.storageError.body');
+      if (!skipNotes && !(await notesStore.flushAll())) {
+        notesFlushFailed = true;
+        closeError = i18n.t('closeConfirm.flushError.body');
         dialogVisible = true;
         return;
       }
+      notesFlushFailed = false;
       const error = await appStore.confirmClose();
       if (error) {
         closeError = i18n.t('closeConfirm.storageError.body');
@@ -69,11 +74,14 @@
   function stayOpen(): void {
     dialogVisible = false;
     closeError = null;
+    notesFlushFailed = false;
     void appStore.stayOpen();
   }
 
   function dialogTitle(): string {
-    if (closeError) return i18n.t('closeConfirm.storageError.title');
+    if (closeError) {
+      return notesFlushFailed ? i18n.t('closeConfirm.flushError.title') : i18n.t('closeConfirm.storageError.title');
+    }
     if (liveBusy) return i18n.t('closeConfirm.dialog.liveTitle');
     return i18n.t('closeConfirm.dialog.title');
   }
@@ -102,6 +110,11 @@
         <button type="button" class="button button-secondary" disabled={closing} onclick={stayOpen}>
           {i18n.t('closeConfirm.dialog.stay')}
         </button>
+        {#if notesFlushFailed}
+          <button type="button" class="button button-secondary" disabled={closing} onclick={() => void flushAndConfirm(true)}>
+            {i18n.t('closeConfirm.flushError.exit')}
+          </button>
+        {/if}
         <button type="button" class="button button-danger" disabled={closing} onclick={() => void flushAndConfirm()}>
           {closing ? i18n.t('closeConfirm.dialog.closing') : confirmLabel()}
         </button>

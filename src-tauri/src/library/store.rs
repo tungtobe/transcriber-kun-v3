@@ -263,7 +263,15 @@ pub fn recover_live_session(
     }
 
     let recording_path = paths::recording_path(root, candidate.id);
-    let duration_sec = finalize_checkpointed_wav(&recording_path)?;
+    // Best effort: a missing, short, or corrupt WAV must still leave the
+    // recovery list, otherwise the row would be retried on every boot.
+    let duration_sec = match finalize_checkpointed_wav(&recording_path) {
+        Ok(duration) => duration,
+        Err(error) => {
+            tracing::warn!(session_id = %candidate.id, error = %error, "Live recovery could not trust the checkpointed WAV; salvaging what is on disk");
+            salvage_wav(&recording_path)
+        }
+    };
 
     let job_id = JobId::new();
     let staging_dir = paths::staging_dir(root, job_id);
@@ -397,6 +405,49 @@ pub fn repair_live_proxy(
         tracing::warn!(session_id = %candidate.id, error = %error, "could not clean Live Proxy repair staging");
     }
     outcome
+}
+
+/// Last-resort finalize for a WAV whose checkpoint cannot be trusted. Keeps the
+/// real data bytes (whole frames only), rewrites the 44-byte header to match,
+/// and returns the duration. Returns `0.0` when nothing is readable.
+fn salvage_wav(recording_path: &Path) -> f64 {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let salvage = || -> std::io::Result<f64> {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(recording_path)?;
+        let actual_len = file.metadata()?.len();
+        if actual_len < 44 {
+            return Ok(0.0);
+        }
+        let mut header = [0_u8; 44];
+        file.read_exact(&mut header)?;
+        let channels = u16::from_le_bytes([header[22], header[23]]);
+        let rate = u32::from_le_bytes([header[24], header[25], header[26], header[27]]);
+        let bits = u16::from_le_bytes([header[34], header[35]]);
+        if &header[0..4] != b"RIFF"
+            || &header[8..12] != b"WAVE"
+            || !(1..=2).contains(&channels)
+            || rate != crate::audio::OUTPUT_SAMPLE_RATE
+            || bits != 16
+        {
+            return Ok(0.0);
+        }
+        let frame_bytes = u64::from(channels) * 2;
+        let frames = (actual_len - 44) / frame_bytes;
+        let data_bytes = frames * frame_bytes;
+        let real_len = 44 + data_bytes;
+        let data_u32 = u32::try_from(data_bytes).unwrap_or(u32::MAX);
+        file.seek(SeekFrom::Start(4))?;
+        file.write_all(&(data_u32.saturating_add(36)).to_le_bytes())?;
+        file.seek(SeekFrom::Start(40))?;
+        file.write_all(&data_u32.to_le_bytes())?;
+        file.set_len(real_len)?;
+        file.sync_all()?;
+        Ok(frames as f64 / f64::from(rate))
+    };
+    salvage().unwrap_or(0.0)
 }
 
 fn finalize_checkpointed_wav(recording_path: &Path) -> Result<f64, AppError> {
@@ -1900,6 +1951,43 @@ mod tests {
             .with_connection(|conn| Ok(repo::segments::list_for_transcript(conn, transcript_id)?))
             .unwrap();
         assert_eq!(segments.len(), 1);
+    }
+
+    #[test]
+    fn boot_recovery_finalizes_short_or_missing_wav_best_effort_instead_of_retrying_forever() {
+        for case in ["short", "missing", "corrupt"] {
+            let root = tempdir().unwrap();
+            let db = open_db(root.path());
+            let (session_id, recording_path) = seed_finalizing_live(root.path(), &db);
+            let candidate = live_recovery_candidates(&db).unwrap().remove(0);
+            match case {
+                // Header claims 16000 frames but only 100 real data bytes exist.
+                "short" => {
+                    let file = OpenOptions::new()
+                        .write(true)
+                        .open(&recording_path)
+                        .unwrap();
+                    file.set_len(44 + 100).unwrap();
+                }
+                "missing" => fs::remove_file(&recording_path).unwrap(),
+                _ => fs::write(&recording_path, b"not a wav").unwrap(),
+            }
+
+            assert!(recover_live_session(&db, root.path(), candidate).unwrap());
+            let row = db
+                .with_connection(|conn| Ok(repo::sessions::get(conn, session_id)?.unwrap()))
+                .unwrap();
+            assert_eq!(row.status, "complete", "{case}");
+            assert!(row.recovered, "{case}");
+            assert!(live_recovery_candidates(&db).unwrap().is_empty(), "{case}");
+            if case == "short" {
+                assert!((row.duration_sec - 50.0 / 16_000.0).abs() < 1e-9);
+                let reader = hound::WavReader::open(&recording_path).unwrap();
+                assert_eq!(reader.duration(), 50);
+            } else {
+                assert_eq!(row.duration_sec, 0.0, "{case}");
+            }
+        }
     }
 
     #[test]

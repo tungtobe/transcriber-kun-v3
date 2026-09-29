@@ -219,6 +219,18 @@ impl LiveSessionHandle {
         response.await.map_err(|_| actor_error())
     }
 
+    /// Swaps the capture source of the running session. Serialized with
+    /// start/stop by the actor; rejected when no session is running so that
+    /// no capture is ever opened outside a session.
+    pub async fn set_source(&self, source: String) -> Result<(), AppError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::SetSource { source, reply })
+            .await
+            .map_err(|_| actor_error())?;
+        response.await.map_err(|_| actor_error())?
+    }
+
     pub async fn continue_recording_only(&self) -> Result<(), AppError> {
         let (reply, response) = oneshot::channel();
         self.commands
@@ -249,6 +261,10 @@ enum Command {
     },
     IsRunning {
         reply: oneshot::Sender<bool>,
+    },
+    SetSource {
+        source: String,
+        reply: oneshot::Sender<Result<(), AppError>>,
     },
     ContinueRecordingOnly {
         reply: oneshot::Sender<Result<(), AppError>>,
@@ -371,6 +387,10 @@ impl LiveSessionActor {
                                 || self.pending_close_finalize.is_some()
                                 || self.close_failed,
                         );
+                    }
+                    Some(Command::SetSource { source, reply }) => {
+                        let result = self.set_source(source).await;
+                        let _ = reply.send(result);
                     }
                     Some(Command::ContinueRecordingOnly { reply }) => {
                         let result = self.continue_recording_only().await;
@@ -581,6 +601,12 @@ impl LiveSessionActor {
     }
 
     async fn handle_internal(&mut self, internal: Internal) {
+        self.apply_internal(internal, true).await;
+    }
+
+    /// `allow_finish = false` is used while `finish_current` drains queued
+    /// events: a storage failure there is handled by the final flush itself.
+    async fn apply_internal(&mut self, internal: Internal, allow_finish: bool) {
         match internal {
             Internal::GatewayEvent { generation, event } => {
                 let current = self
@@ -655,11 +681,11 @@ impl LiveSessionActor {
                             self.emit(LiveEvent::Segment { seq: 0, segment });
                         }
                         self.emit(LiveEvent::Turn { seq: 0 });
-                        if self.flush_active("recording").await.is_err() {
+                        if self.flush_active("recording").await.is_err() && allow_finish {
                             // Persistent transcript storage is terminal for
                             // this Live session: stop capture and keep the
                             // prior DB checkpoints plus durable WAV bounded.
-                            let _ = self.finish_current(None, false).await;
+                            let _ = Box::pin(self.finish_current(None, false)).await;
                         }
                     }
                     GatewayEvent::AudioGap {
@@ -758,6 +784,19 @@ impl LiveSessionActor {
                 }
             }
         }
+    }
+
+    async fn set_source(&mut self, source: String) -> Result<(), AppError> {
+        if self.running.is_none() {
+            return Err(AppError::new(
+                Code::Request,
+                "Audio source can only be changed while a Live session is running",
+            ));
+        }
+        let capture = self.capture.clone();
+        tokio::task::spawn_blocking(move || capture.set_source(&source))
+            .await
+            .map_err(|err| AppError::new(Code::Storage, err.to_string()))?
     }
 
     async fn continue_recording_only(&mut self) -> Result<(), AppError> {
@@ -881,8 +920,21 @@ impl LiveSessionActor {
                         store::finalize_live_session_minimal(&db, session_id, duration_sec)
                     })
                     .await
-                    .map_err(|error| AppError::new(Code::Storage, error.to_string()))?;
-                    retry?;
+                    .map_err(|error| AppError::new(Code::Storage, error.to_string()))
+                    .and_then(|outcome| outcome);
+                    if let Err(error) = retry {
+                        self.snapshot.recording = RecordingState::Failed;
+                        self.snapshot.error_category = Some(error.category);
+                        self.emit(LiveEvent::Error {
+                            seq: 0,
+                            error: error.clone(),
+                        });
+                        self.emit(LiveEvent::Recording {
+                            seq: 0,
+                            state: RecordingState::Failed,
+                        });
+                        return Err(error);
+                    }
                     self.pending_close_finalize = None;
                     self.close_failed = false;
                     self.snapshot = LiveSnapshot {
@@ -918,6 +970,11 @@ impl LiveSessionActor {
                 Code::Request,
                 "There is no Live session to stop",
             ));
+        }
+        // Deltas already queued by the gateway must be applied before the
+        // final flush, otherwise Stop would silently drop the last sentences.
+        while let Ok(internal) = self.internal_receiver.try_recv() {
+            self.apply_internal(internal, false).await;
         }
         let final_segment = if let Some(running) = self.running.as_mut() {
             if !running.sentence_buffer.trim().is_empty() {
@@ -1025,14 +1082,18 @@ impl LiveSessionActor {
         }
 
         if let Err(error) = final_flush {
-            if for_close {
-                if recording_result.wav_finalized {
-                    running.pending = retry_batch;
-                    running.recording = None;
-                    self.running = Some(running);
-                } else {
-                    self.close_failed = true;
-                }
+            if recording_result.wav_finalized {
+                // Keep the session so Stop can be retried with the same batch.
+                running.pending = retry_batch;
+                running.recording = None;
+                running.recording_state = RecordingState::Failed;
+                running.error_category = Some(error.category);
+                // The old gateway task is already joined or aborted; a fresh
+                // finished task keeps the retry from polling it twice.
+                running.gateway_task = tokio::spawn(async {});
+                self.running = Some(running);
+            } else if for_close {
+                self.close_failed = true;
             }
             self.emit(LiveEvent::Error {
                 seq: 0,
@@ -1051,7 +1112,6 @@ impl LiveSessionActor {
                 seq: 0,
                 state: RecordingState::Failed,
             });
-            self.emit(LiveEvent::Done { seq: 0 });
             return Err(error);
         }
 
@@ -1080,7 +1140,6 @@ impl LiveSessionActor {
                 seq: 0,
                 state: RecordingState::Failed,
             });
-            self.emit(LiveEvent::Done { seq: 0 });
             return Err(error);
         }
 
@@ -1135,7 +1194,6 @@ impl LiveSessionActor {
                     seq: 0,
                     state: RecordingState::Failed,
                 });
-                self.emit(LiveEvent::Done { seq: 0 });
                 return Err(error);
             }
         };
@@ -2012,7 +2070,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn database_flush_failure_restores_pending_then_stops_recording_for_recovery() {
+    async fn stop_flush_failure_keeps_the_session_so_stop_can_be_retried() {
         let mut fixture = fixture();
         let (session_id, transcript_id) = add_recording(&mut fixture, 1);
         let baseline = fixture.actor.running.as_ref().unwrap().baseline_sample;
@@ -2030,28 +2088,136 @@ mod tests {
         fixture
             .db
             .with_connection(|conn| {
-                conn.execute_batch("DROP TABLE segments")?;
+                conn.execute_batch(
+                    "CREATE TRIGGER fail_segments BEFORE INSERT ON segments \
+                     BEGIN SELECT RAISE(FAIL, 'injected'); END;",
+                )?;
                 Ok(())
             })
             .unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        fixture
+            .actor
+            .register_subscriber(collect_channel(events.clone()));
 
         let error = fixture.actor.flush_active("recording").await.unwrap_err();
         assert_eq!(error.code, Code::Storage);
         assert_eq!(fixture.actor.running.as_ref().unwrap().pending.len(), 1);
         assert!(fixture.actor.finish_current(None, false).await.is_err());
-        assert!(fixture.actor.running.is_none());
+        // Session is kept with its pending batch; no Done was announced.
+        let running = fixture
+            .actor
+            .running
+            .as_ref()
+            .expect("Stop must stay retryable");
+        assert_eq!(running.pending.len(), 1);
         assert_eq!(fixture.actor.snapshot.recording, RecordingState::Failed);
-        assert!(fixture.capture.active_source().is_none());
-        assert!(crate::core::paths::recording_path(fixture._root.path(), session_id).is_file());
+        assert!(!events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event, LiveEvent::Done { .. })));
+
+        fixture
+            .db
+            .with_connection(|conn| {
+                conn.execute_batch("DROP TRIGGER fail_segments")?;
+                Ok(())
+            })
+            .unwrap();
         assert_eq!(
-            fixture
-                .db
-                .with_connection(|conn| Ok(repo::sessions::get(conn, session_id)?.unwrap()))
-                .unwrap()
-                .status,
-            "recording"
+            fixture.actor.finish_current(None, false).await.unwrap(),
+            session_id
         );
-        let _ = transcript_id;
+        assert!(fixture.actor.running.is_none());
+        let row = fixture
+            .db
+            .with_connection(|conn| Ok(repo::sessions::get(conn, session_id)?.unwrap()))
+            .unwrap();
+        assert_eq!(row.status, "complete");
+        let segments = fixture
+            .db
+            .with_connection(|conn| Ok(repo::segments::list_for_transcript(conn, transcript_id)?))
+            .unwrap();
+        assert!(segments.iter().any(|segment| segment.text == "Retain me."));
+        assert!(events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event, LiveEvent::Done { .. })));
+    }
+
+    #[tokio::test]
+    async fn close_retry_failure_marks_recording_failed_without_announcing_done() {
+        let mut fixture = fixture();
+        // No session row is in `finalizing`, so the retried commit fails.
+        fixture.actor.pending_close_finalize = Some((SessionId::new(), 1.0));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        fixture
+            .actor
+            .register_subscriber(collect_channel(events.clone()));
+
+        assert!(fixture.actor.finish_current(None, true).await.is_err());
+        assert_eq!(fixture.actor.snapshot.recording, RecordingState::Failed);
+        assert!(fixture.actor.pending_close_finalize.is_some());
+        assert!(!events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event, LiveEvent::Done { .. })));
+    }
+
+    #[tokio::test]
+    async fn stop_persists_events_still_queued_from_the_gateway() {
+        let mut fixture = fixture();
+        let (session_id, transcript_id) = add_recording(&mut fixture, 1);
+        let baseline = fixture.actor.running.as_ref().unwrap().baseline_sample;
+        fixture
+            .actor
+            .internal_sender
+            .send(Internal::GatewayEvent {
+                generation: 1,
+                event: GatewayEvent::InputTranscription {
+                    text: crate::core::sensitive::Sensitive::new("Queued words".to_owned()),
+                    sample_start: baseline + 800,
+                    sample_end: baseline + 1_600,
+                },
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fixture.actor.finish_current(None, false).await.unwrap(),
+            session_id
+        );
+        let segments = fixture
+            .db
+            .with_connection(|conn| Ok(repo::segments::list_for_transcript(conn, transcript_id)?))
+            .unwrap();
+        assert!(segments
+            .iter()
+            .any(|segment| segment.text.contains("Queued words")));
+    }
+
+    #[tokio::test]
+    async fn set_source_is_rejected_when_no_session_is_running_and_opens_no_capture() {
+        let mut fixture = fixture();
+        let error = fixture
+            .actor
+            .set_source("mic:test".to_owned())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, Code::Request);
+        assert!(fixture.capture.active_source().is_none());
+
+        add_recording(&mut fixture, 1);
+        fixture
+            .actor
+            .set_source("mic:test".to_owned())
+            .await
+            .unwrap();
+        assert!(fixture.capture.active_source().is_some());
+        fixture.actor.finish_current(None, false).await.unwrap();
     }
 
     #[tokio::test]
@@ -2208,7 +2374,8 @@ mod tests {
             result.is_err(),
             "the fixture intentionally has no DB session row"
         );
-        assert!(fixture.actor.running.is_none());
+        // A failed final flush keeps the session so Stop can be retried.
+        assert!(fixture.actor.running.is_some());
     }
 
     #[tokio::test]
