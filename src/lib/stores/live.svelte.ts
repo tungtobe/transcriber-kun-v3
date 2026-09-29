@@ -32,6 +32,8 @@ const EMPTY_SNAPSHOT: LiveSnapshot = {
   errorCategory: null,
   durationSec: null,
   target: 'none',
+  tts: false,
+  speaking: false,
 };
 
 const UNAVAILABLE_ERROR: AppError = {
@@ -170,6 +172,12 @@ export function createLiveStore() {
       case 'segmentTranslated':
         translatedLines = [...translatedLines, { seq: event.seq, segment: event.segment }];
         translatedDraft = '';
+        break;
+      case 'tts':
+        snapshot = { ...snapshot, tts: event.enabled, speaking: event.enabled ? snapshot.speaking : false };
+        break;
+      case 'speaking':
+        snapshot = { ...snapshot, speaking: event.speaking };
         break;
       case 'target':
         snapshot = { ...snapshot, target: event.target };
@@ -313,6 +321,8 @@ export function createLiveStore() {
           errorCategory: null,
           durationSec: 0,
           target,
+          tts: snapshot.tts,
+          speaking: false,
         };
         error = null;
         return null;
@@ -377,6 +387,16 @@ export function createLiveStore() {
         error = result.error.category;
       }
       return result.error;
+    } catch {
+      return UNAVAILABLE_ERROR;
+    }
+  }
+
+  /** Bật/tắt đọc bản dịch. Tắt chỉ dừng việc phát (không giảm token dịch). */
+  async function setTts(enabled: boolean): Promise<AppError | null> {
+    try {
+      const result = await commands.liveSetTts(enabled);
+      return result.status === 'ok' ? null : result.error;
     } catch {
       return UNAVAILABLE_ERROR;
     }
@@ -456,6 +476,7 @@ export function createLiveStore() {
     continueRecordingOnly,
     setSource,
     setTarget,
+    setTts,
     redetect,
     clearPermissionDenial,
     clearFinishedSession,

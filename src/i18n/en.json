@@ -603,5 +603,6 @@
   "live.translation.empty": "The translation appears here as the model translates.",
   "live.tts.label": "Read translation aloud",
   "live.tts.noTarget": "Choose a translation language to use this.",
-  "live.tts.comingSoon": "Reading the translation aloud is not available yet."
+  "live.tts.tooltip": "Read the translation aloud. Turning it off only stops playback; it does not reduce translation tokens.",
+  "live.tts.speaking": "Reading aloud"
 }

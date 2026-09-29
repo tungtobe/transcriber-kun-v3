@@ -12,6 +12,7 @@ const mocks = vi.hoisted(() => ({
   liveContinueRecordingOnly: vi.fn(),
   liveSetSource: vi.fn(),
   liveSetTarget: vi.fn(),
+  liveSetTts: vi.fn(),
   liveRedetect: vi.fn(),
 }));
 
@@ -33,6 +34,7 @@ vi.mock('../bindings', () => ({
     liveContinueRecordingOnly: (...args: unknown[]) => mocks.liveContinueRecordingOnly(...args),
     liveSetSource: (...args: unknown[]) => mocks.liveSetSource(...args),
     liveSetTarget: (...args: unknown[]) => mocks.liveSetTarget(...args),
+    liveSetTts: (...args: unknown[]) => mocks.liveSetTts(...args),
     liveRedetect: (...args: unknown[]) => mocks.liveRedetect(...args),
   },
 }));
@@ -49,6 +51,8 @@ function snapshot(sessionId: string | null = 'session-1') {
     errorCategory: null,
     durationSec: 0,
     target: 'none' as const,
+    tts: false,
+    speaking: false,
   };
 }
 
@@ -74,6 +78,7 @@ beforeEach(() => {
   mocks.liveContinueRecordingOnly.mockReset().mockResolvedValue({ status: 'ok', data: null });
   mocks.liveSetSource.mockReset().mockResolvedValue({ status: 'ok', data: null });
   mocks.liveSetTarget.mockReset().mockResolvedValue({ status: 'ok', data: null });
+  mocks.liveSetTts.mockReset().mockResolvedValue({ status: 'ok', data: null });
   mocks.liveRedetect.mockReset().mockResolvedValue({ status: 'ok', data: null });
 });
 
@@ -329,6 +334,22 @@ describe('liveStore', () => {
     expect(store.lines).toEqual([]);
     expect(store.draft).toBe('');
     expect(store.finalizedSessionId).toBeNull();
+  });
+
+  it('tracks the speaker toggle and speaking flag from events and forwards setTts', async () => {
+    const { createLiveStore } = await import('./live.svelte');
+    const store = createLiveStore();
+    await store.subscribe();
+    const channel = channels[0];
+    channel.onmessage({ type: 'ready', seq: 0, snapshot: { ...snapshot(), target: 'vi' as const } });
+    channel.onmessage({ type: 'tts', seq: 1, enabled: true });
+    channel.onmessage({ type: 'speaking', seq: 2, speaking: true });
+    expect(store.snapshot.tts).toBe(true);
+    expect(store.snapshot.speaking).toBe(true);
+    channel.onmessage({ type: 'tts', seq: 3, enabled: false });
+    expect(store.snapshot.speaking).toBe(false);
+    expect(await store.setTts(true)).toBeNull();
+    expect(mocks.liveSetTts).toHaveBeenCalledWith(true);
   });
 
   it('keeps translated text in memory only, resets it per session and follows the confirmed Target', async () => {

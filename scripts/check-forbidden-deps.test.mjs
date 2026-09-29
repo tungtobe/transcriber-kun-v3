@@ -26,6 +26,28 @@ describe('scanSources (hàm thuần)', () => {
     expect(violations).toEqual([{ file: 'src-tauri/Cargo.toml', name: 'tauri-plugin-http' }]);
   });
 
+  it('Dependency cấm: crate TTS trong Cargo.toml/Cargo.lock bị bắt (Story 5.3)', () => {
+    const violations = scanSources([
+      { file: 'src-tauri/Cargo.toml', kind: 'rust', content: '[dependencies]\ntts = "0.26"\n' },
+      { file: 'src-tauri/Cargo.lock', kind: 'rust', content: 'name = "piper-rs"\n' },
+    ]);
+    expect(violations).toEqual([
+      { file: 'src-tauri/Cargo.toml', name: 'tts' },
+      { file: 'src-tauri/Cargo.lock', name: 'piper-rs' },
+    ]);
+  });
+
+  it('Crate hợp lệ có tên chứa "tts" không bị bắt nhầm', () => {
+    const violations = scanSources([
+      {
+        file: 'src-tauri/Cargo.toml',
+        kind: 'rust',
+        content: '[dependencies]\ntts-utils-not-real = "1"\nbutts = "1"\n',
+      },
+    ]);
+    expect(violations).toEqual([]);
+  });
+
   it('Dependency cấm: package.json chứa @tauri-apps/plugin-fs bị bắt', () => {
     const violations = scanSources([
       {

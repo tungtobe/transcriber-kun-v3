@@ -254,7 +254,10 @@ pub fn boot<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
                 key_pool.clone(),
                 crate::gemini::live::LiveGateway::production(key_pool.clone()),
             );
-            tauri::async_runtime::spawn(actor.with_recovering(recovering.clone()).run());
+            tauri::async_runtime::spawn(actor
+                    .with_recovering(recovering.clone())
+                    .with_playback(crate::audio::playback::platform_backend)
+                    .run());
             Ok(handle)
         }
         (Err(error), _) | (_, Err(error)) => Err(error.clone()),

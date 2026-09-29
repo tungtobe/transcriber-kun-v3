@@ -66,6 +66,13 @@
   // The Target actually in effect: the session's while one exists.
   const activeTarget = $derived<LiveTarget>(hasSession ? liveStore.snapshot.target : target);
   const translating = $derived(activeTarget !== 'none');
+  const ttsOn = $derived(translating && liveStore.snapshot.tts);
+  const speaking = $derived(ttsOn && liveStore.snapshot.speaking);
+
+  async function toggleTts(): Promise<void> {
+    if (!translating) return;
+    await liveStore.setTts(!liveStore.snapshot.tts);
+  }
   const showSourceColumn = $derived(!translating || viewMode !== 'translated');
   const showTranslatedColumn = $derived(translating && viewMode !== 'source');
   const twoColumns = $derived(showSourceColumn && showTranslatedColumn);
@@ -730,9 +737,11 @@
             <button
               type="button"
               class="tts-toggle"
-              aria-pressed="false"
-              disabled
-              title={translating ? i18n.t('live.tts.comingSoon') : i18n.t('live.tts.noTarget')}
+              class:tts-on={ttsOn}
+              aria-pressed={ttsOn}
+              disabled={!translating}
+              onclick={toggleTts}
+              title={translating ? i18n.t('live.tts.tooltip') : i18n.t('live.tts.noTarget')}
               aria-label={i18n.t('live.tts.label')}
             >{i18n.t('live.tts.label')}</button>
           </div>
@@ -778,7 +787,12 @@
             {/if}
             {#if showTranslatedColumn}
               <div class="transcript-column" data-column="translated">
-                <h3 class="column-title">{i18n.t('live.column.translated', { target: activeTarget })}</h3>
+                <h3 class="column-title">
+                  {i18n.t('live.column.translated', { target: activeTarget })}
+                  {#if speaking}
+                    <span class="speaking-pill" role="status">{i18n.t('live.tts.speaking')}</span>
+                  {/if}
+                </h3>
                 {#each liveStore.translatedLines as line (line.seq)}
                   <article class="transcript-line">
                     <p>{line.segment.text}</p>
@@ -904,6 +918,8 @@
   .view-toggle button + button { border-left:1px solid var(--color-border-strong); }
   .view-toggle button.view-active { background:var(--color-accent-soft); color:var(--color-accent); font-weight:600; }
   .tts-toggle { min-height:30px; padding:0 var(--space-3); border:1px solid var(--color-border-strong); border-radius:var(--radius-md); background:var(--color-bg); color:var(--color-text-muted); font:inherit; font-size:var(--text-help-size); }
+  .tts-toggle.tts-on { border-color:var(--color-accent); background:var(--color-accent-soft); color:var(--color-text); }
+  .speaking-pill { margin-left:var(--space-2); padding:0 var(--space-2); border:1px solid var(--color-accent); border-radius:var(--radius-md); font-size:var(--text-help-size); font-weight:500; }
   .tts-toggle:disabled { cursor:not-allowed; opacity:.7; }
   .transcript-columns { display:grid; grid-template-columns:minmax(0,1fr); gap:var(--space-5); }
   .transcript-columns.two-columns { grid-template-columns:repeat(2,minmax(0,1fr)); }

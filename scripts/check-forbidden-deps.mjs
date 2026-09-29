@@ -14,6 +14,25 @@ const PLUGIN_NAMES = ['shell', 'fs', 'updater', 'process', 'http', 'store'];
 export const FORBIDDEN_RUST_PLUGINS = PLUGIN_NAMES.map((n) => `tauri-plugin-${n}`);
 export const FORBIDDEN_JS_PLUGINS = PLUGIN_NAMES.map((n) => `@tauri-apps/plugin-${n}`);
 
+// Story 5.3: nguồn giọng duy nhất là audio của model Live Translate. Không
+// crate TTS local/OS/cloud nào được vào manifest Rust.
+export const FORBIDDEN_TTS_CRATES = [
+  'tts',
+  'tts-rs',
+  'espeak-rs',
+  'espeakng',
+  'piper-rs',
+  'sherpa-rs',
+  'sherpa-onnx',
+  'kokoro-tts',
+  'msedge-tts',
+  'coqui-tts',
+  'speech-dispatcher',
+  'google-cloud-texttospeech-v1',
+  'aws-sdk-polly',
+  'tauri-plugin-tts',
+];
+
 function escapeRegExp(literal) {
   return literal.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
@@ -46,7 +65,10 @@ export function scanSources(sources) {
   const violations = [];
   for (const { file, content, kind } of sources) {
     if (kind === 'rust') {
-      for (const name of findForbiddenNames(content, FORBIDDEN_RUST_PLUGINS)) {
+      for (const name of findForbiddenNames(content, [
+        ...FORBIDDEN_RUST_PLUGINS,
+        ...FORBIDDEN_TTS_CRATES,
+      ])) {
         violations.push({ file, name });
       }
     } else if (kind === 'js') {

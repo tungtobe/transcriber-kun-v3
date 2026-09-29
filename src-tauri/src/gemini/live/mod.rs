@@ -80,9 +80,9 @@ pub enum LiveConnectError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LiveTransportError;
 
-/// Events the LiveSession actor needs. Output audio is deliberately absent
-/// from this type (TTS belongs to Story 5.3); output transcription is only
-/// emitted while a translation Target is configured.
+/// Events the LiveSession actor needs. Output audio and output transcription
+/// are only emitted while a translation Target is configured. `OutputAudio`
+/// stays inside the Rust process (never IPC, never logged: `Sensitive`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LiveEvent {
     InputTranscription {
@@ -96,6 +96,14 @@ pub enum LiveEvent {
         sample_start: u64,
         sample_end: u64,
     },
+    /// Decoded PCM16 little-endian mono 24 kHz bytes of the model's spoken
+    /// translation (even length, validated).
+    OutputAudio {
+        pcm: Sensitive<Vec<u8>>,
+    },
+    /// The model was interrupted (`interrupted` / `audio_interrupted`): the
+    /// consumer must stop playback and clear queued audio at once.
+    Interrupted,
     AudioGap {
         start_sample: u64,
         end_sample: u64,
@@ -375,6 +383,22 @@ mod tests {
         .unwrap();
         assert_eq!(parsed.output_transcription.as_deref(), Some("xin chao"));
         assert!(parsed.input_transcription.is_none());
+    }
+
+    #[test]
+    fn parser_decodes_output_audio_and_interrupted_and_drops_bad_chunks() {
+        // "AQID" = [1,2,3] (odd); "AQIDBA==" = [1,2,3,4]; "!!!" invalid.
+        let parsed = parse_server_message(
+            r#"{"serverContent":{"interrupted":true,"modelTurn":{"parts":[{"inlineData":{"data":"AQID"}},{"inlineData":{"data":"AQIDBA=="}},{"inlineData":{"data":"!!!"}},{"text":"x"}]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.output_audio, vec![vec![1u8, 2, 3, 4]]);
+        assert!(parsed.interrupted);
+        let alias =
+            parse_server_message(r#"{"serverContent":{"audioInterrupted":true}}"#).unwrap();
+        assert!(alias.interrupted);
+        let none = parse_server_message(r#"{"serverContent":{}}"#).unwrap();
+        assert!(!none.interrupted && none.output_audio.is_empty());
     }
 
     #[test]
@@ -1039,6 +1063,72 @@ mod tests {
         // event queue cannot block cancellation. The actor also sets Stopped
         // authoritatively when it receives GatewayEnded.
         assert!(clock.delays.lock().unwrap().len() >= 1);
+    }
+
+    async fn collect_events_until_stopped(
+        target: LiveTarget,
+        frame: &'static str,
+    ) -> Vec<LiveEvent> {
+        let socket = FakeSocket::with_incoming([
+            Ok(LiveReceiveMessage::Text(r#"{"setupComplete":{}}"#.to_owned())),
+            Ok(LiveReceiveMessage::Text(frame.to_owned())),
+            Ok(LiveReceiveMessage::Text(
+                r#"{"serverContent":{"turnComplete":true}}"#.to_owned(),
+            )),
+        ]);
+        let connector = FakeConnector::new([ConnectStep::Socket(socket), ConnectStep::Pending]);
+        let pool = test_pool(vec![key("one", "secret-one")]).await;
+        let gateway = LiveGateway::with_clock(connector, pool, FakeClock::new(0, false));
+        let (_audio_tx, audio_rx) = broadcast::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(32);
+        let cancellation = CancellationToken::new();
+        let mut config = run_config();
+        config.target = target;
+        let running = tokio::spawn({
+            let cancellation = cancellation.clone();
+            async move {
+                gateway
+                    .run(
+                        config,
+                        ConsentSnapshot::new(1, false),
+                        audio_rx,
+                        event_tx,
+                        cancellation,
+                    )
+                    .await
+            }
+        });
+        let mut events = Vec::new();
+        while let Ok(Some(event)) =
+            tokio::time::timeout(Duration::from_secs(2), event_rx.recv()).await
+        {
+            let done = matches!(event, LiveEvent::TurnComplete { .. });
+            events.push(event);
+            if done {
+                break;
+            }
+        }
+        cancellation.cancel();
+        let _ = running.await;
+        events
+    }
+
+    #[tokio::test]
+    async fn output_audio_and_interrupted_are_emitted_only_in_translation_mode() {
+        let frame = r#"{"serverContent":{"interrupted":true,"modelTurn":{"parts":[{"inlineData":{"data":"AQIDBA=="}}]}}}"#;
+        let translating = collect_events_until_stopped(LiveTarget::Vi, frame).await;
+        assert!(translating.iter().any(|event| matches!(
+            event,
+            LiveEvent::OutputAudio { pcm } if pcm.expose() == &vec![1u8, 2, 3, 4]
+        )));
+        assert!(translating
+            .iter()
+            .any(|event| matches!(event, LiveEvent::Interrupted)));
+        let silent = collect_events_until_stopped(LiveTarget::None, frame).await;
+        assert!(!silent.iter().any(|event| matches!(
+            event,
+            LiveEvent::OutputAudio { .. } | LiveEvent::Interrupted
+        )));
     }
 
     #[tokio::test]
@@ -2184,6 +2274,32 @@ impl LiveGateway {
                     return Ok(SocketEnd::Cancelled);
                 }
             }
+            if translate {
+                for pcm in parsed.output_audio {
+                    if !emit_event(
+                        events,
+                        LiveEvent::OutputAudio {
+                            pcm: Sensitive::new(pcm),
+                        },
+                        &cancellation,
+                    )
+                    .await
+                    {
+                        if let Some(lease) = lease.take() {
+                            let _ = self.key_pool.cancel(lease.request_id).await;
+                        }
+                        return Ok(SocketEnd::Cancelled);
+                    }
+                }
+                if parsed.interrupted
+                    && !emit_event(events, LiveEvent::Interrupted, &cancellation).await
+                {
+                    if let Some(lease) = lease.take() {
+                        let _ = self.key_pool.cancel(lease.request_id).await;
+                    }
+                    return Ok(SocketEnd::Cancelled);
+                }
+            }
             if parsed.turn_complete {
                 let sample_end = {
                     let ring = ring.lock().expect("audio ring poisoned");
@@ -2287,6 +2403,9 @@ struct ParsedServerMessage {
     error_status: Option<u16>,
     input_transcription: Option<String>,
     output_transcription: Option<String>,
+    /// Decoded, even-length PCM16 payloads. Undecodable/odd chunks are dropped.
+    output_audio: Vec<Vec<u8>>,
+    interrupted: bool,
     /// Outer option means an update was present; inner option clears the saved
     /// handle when the server says the session is no longer resumable.
     resumption_handle: Option<Option<String>>,
@@ -2316,6 +2435,17 @@ fn parse_server_message(raw: &str) -> Option<ParsedServerMessage> {
         parsed.output_transcription = content
             .output_transcription
             .and_then(|transcription| transcription.text);
+        parsed.interrupted = content.interrupted.unwrap_or(false);
+        if let Some(turn) = content.model_turn {
+            for part in turn.parts {
+                let Some(data) = part.inline_data.and_then(|inline| inline.data) else {
+                    continue;
+                };
+                if let Some(pcm) = decode_output_audio(&data) {
+                    parsed.output_audio.push(pcm);
+                }
+            }
+        }
     }
     // Presence of `error` is what matters; an unparsable code maps to 0 so it
     // is still treated as a (non-key, non-request) error.
@@ -2325,8 +2455,19 @@ fn parse_server_message(raw: &str) -> Option<ParsedServerMessage> {
     Some(parsed)
 }
 
-/// Unknown response fields are skipped by serde, including output audio
-/// payloads. The transport never stores them in an intermediate JSON value.
+/// Decodes one base64 output-audio chunk. Invalid base64, an empty payload or
+/// an odd byte count (not whole PCM16 samples) yields `None`: the chunk is
+/// dropped without failing the message.
+fn decode_output_audio(data: &str) -> Option<Vec<u8>> {
+    let bytes = base64::engine::general_purpose::STANDARD.decode(data).ok()?;
+    if bytes.is_empty() || bytes.len() % 2 != 0 {
+        return None;
+    }
+    Some(bytes)
+}
+
+/// Unknown response fields are skipped by serde. Output audio is decoded
+/// straight from the typed struct, never via an intermediate JSON value.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct WireServerMessage {
@@ -2360,6 +2501,29 @@ struct WireServerContent {
     output_transcription: Option<WireTranscription>,
     #[serde(default)]
     turn_complete: Option<serde::de::IgnoredAny>,
+    #[serde(default, alias = "audioInterrupted")]
+    interrupted: Option<bool>,
+    #[serde(default)]
+    model_turn: Option<WireModelTurn>,
+}
+
+#[derive(Deserialize)]
+struct WireModelTurn {
+    #[serde(default)]
+    parts: Vec<WirePart>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WirePart {
+    #[serde(default)]
+    inline_data: Option<WireInlineData>,
+}
+
+#[derive(Deserialize)]
+struct WireInlineData {
+    #[serde(default)]
+    data: Option<String>,
 }
 
 #[derive(Deserialize)]

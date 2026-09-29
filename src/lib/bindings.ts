@@ -42,6 +42,12 @@ export const commands = {
 	 */
 	liveRedetect: () => typedError<null, AppError>(__TAURI_INVOKE("live_redetect")),
 	/**
+	 *  Turns the spoken translation (TTS, in-process playback of the model's own
+	 *  audio) on or off. Off only stops playback: the model still produces audio
+	 *  and tokens are still spent.
+	 */
+	liveSetTts: (enabled: boolean) => typedError<null, AppError>(__TAURI_INVOKE("live_set_tts", { enabled })),
+	/**
 	 *  Starts the one process-wide Live session. Consent and model preferences
 	 *  are captured from the durable Rust settings snapshot before capture opens.
 	 */
@@ -609,6 +615,13 @@ export type LiveEvent = { type: "ready"; seq: number; snapshot: LiveSnapshot } |
 { type: "deltaTranslated"; seq: number; text: string } | 
 /**  A completed translated sentence. UI only: never persisted. */
 { type: "segmentTranslated"; seq: number; segment: LiveSegment } | 
+/**  Speaker toggle changed. */
+{ type: "tts"; seq: number; enabled: boolean } | 
+/**
+ *  The translation started or stopped being read out. Audio itself never
+ *  crosses IPC.
+ */
+{ type: "speaking"; seq: number; speaking: boolean } | 
 /**  The Target actually in effect changed (after a successful swap). */
 { type: "target"; seq: number; target: LiveTarget } | { type: "gap"; seq: number; startSec: number | null; endSec: number | null; reason: string } | { type: "recording"; seq: number; state: RecordingState } | { type: "connection"; seq: number; state: ConnectionState } | { type: "transcription"; seq: number; state: TranscriptionState } | { type: "log"; seq: number; message: string } | { type: "error"; seq: number; error: AppError } | { type: "done"; seq: number } | { type: "final"; seq: number; sessionId: string; transcriptId: string; durationSec: number | null };
 
@@ -642,6 +655,10 @@ export type LiveSnapshot = {
 	durationSec: number | null,
 	/**  Translation Target actually in effect (`none` = no translation). */
 	target: LiveTarget,
+	/**  The speaker toggle (spoken translation) is on. */
+	tts: boolean,
+	/**  The translation is being read out right now. */
+	speaking: boolean,
 };
 
 /**

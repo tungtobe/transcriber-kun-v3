@@ -603,5 +603,6 @@
   "live.translation.empty": "Bản dịch sẽ hiện ở đây khi model dịch.",
   "live.tts.label": "Đọc bản dịch",
   "live.tts.noTarget": "Chọn ngôn ngữ dịch để dùng tính năng này.",
-  "live.tts.comingSoon": "Chưa hỗ trợ đọc bản dịch thành tiếng."
+  "live.tts.tooltip": "Đọc bản dịch qua loa. Chỉ tắt việc phát, không giảm token dịch.",
+  "live.tts.speaking": "Đang đọc"
 }
