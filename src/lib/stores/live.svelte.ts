@@ -382,6 +382,17 @@ export function createLiveStore() {
     }
   }
 
+  /** Bắt model nhận diện lại ngôn ngữ (chỉ khi phiên là `auto`). Lỗi giữ kết
+   * nối cũ; chỉ trả lỗi để UI hiện banner nhẹ tại chỗ. */
+  async function redetect(): Promise<AppError | null> {
+    try {
+      const result = await commands.liveRedetect();
+      return result.status === 'ok' ? null : result.error;
+    } catch {
+      return UNAVAILABLE_ERROR;
+    }
+  }
+
   function clearPermissionDenial(): void {
     deniedSource = null;
     if (error === 'permission') error = null;
@@ -445,6 +456,7 @@ export function createLiveStore() {
     continueRecordingOnly,
     setSource,
     setTarget,
+    redetect,
     clearPermissionDenial,
     clearFinishedSession,
     reset,

@@ -257,6 +257,18 @@ impl LiveSessionHandle {
         response.await.map_err(|_| actor_error())?
     }
 
+    /// Re-detects the spoken language: opens a fresh generation with an empty
+    /// context (no resumption handle). Only allowed while the session
+    /// language is `auto`; shares the Target swap machinery.
+    pub async fn redetect(&self) -> Result<(), AppError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::Redetect { reply })
+            .await
+            .map_err(|_| actor_error())?;
+        response.await.map_err(|_| actor_error())?
+    }
+
     /// Changes the translation Target of the running session. The actor swaps
     /// in a new generation without interrupting the source transcript; the
     /// reply arrives once the swap succeeded, failed or was superseded.
@@ -319,6 +331,9 @@ enum Command {
         target: LiveTarget,
         reply: oneshot::Sender<Result<(), AppError>>,
     },
+    Redetect {
+        reply: oneshot::Sender<Result<(), AppError>>,
+    },
     ContinueRecordingOnly {
         reply: oneshot::Sender<Result<(), AppError>>,
     },
@@ -373,6 +388,8 @@ struct TranslationBuffer {
 struct Candidate {
     generation: u64,
     target: LiveTarget,
+    /// True for a language re-detection: same Target, no Target event.
+    redetect: bool,
     cancel: CancellationToken,
     task: JoinHandle<()>,
     /// Audio reaches the candidate only after the swap, so its transcript
@@ -506,6 +523,9 @@ impl LiveSessionActor {
                     }
                     Some(Command::SetTarget { target, reply }) => {
                         self.set_target(target, reply);
+                    }
+                    Some(Command::Redetect { reply }) => {
+                        self.redetect(reply);
                     }
                     Some(Command::ContinueRecordingOnly { reply }) => {
                         let result = self.continue_recording_only().await;
@@ -779,6 +799,43 @@ impl LiveSessionActor {
             let _ = reply.send(Ok(()));
             return;
         }
+        self.begin_swap(target, false, reply);
+    }
+
+    /// Language re-detection: same swap path as a Target change, with the
+    /// current Target and a brand-new generation (no resumption handle).
+    fn redetect(&mut self, reply: oneshot::Sender<Result<(), AppError>>) {
+        let Some(running) = self.running.as_mut() else {
+            let _ = reply.send(Err(AppError::new(
+                Code::Request,
+                "Language can only be re-detected while a Live session is running",
+            )));
+            return;
+        };
+        if running.transcription != TranscriptionState::Active
+            || running.swap.language != TranscribeLanguage::Auto
+        {
+            let _ = reply.send(Err(AppError::new(
+                Code::Request,
+                "Language re-detection needs an active session with automatic language",
+            )));
+            return;
+        }
+        if let Some(previous) = running.candidate.take() {
+            cancel_candidate(previous, Ok(()));
+        }
+        let target = running.target;
+        self.begin_swap(target, true, reply);
+    }
+
+    /// The one swap path: opens a candidate generation (previous candidate
+    /// already cancelled by the caller) and waits for `setupComplete`.
+    fn begin_swap(
+        &mut self,
+        target: LiveTarget,
+        redetect: bool,
+        reply: oneshot::Sender<Result<(), AppError>>,
+    ) {
         let generation = self.next_generation;
         self.next_generation = self.next_generation.saturating_add(1);
         let (model, language, consent) = {
@@ -812,6 +869,7 @@ impl LiveSessionActor {
             running.candidate = Some(Candidate {
                 generation,
                 target,
+                redetect,
                 cancel,
                 task,
                 gate,
@@ -871,7 +929,9 @@ impl LiveSessionActor {
                 state: ConnectionState::Connected,
             });
         }
-        self.emit(LiveEvent::Target { seq: 0, target });
+        if !candidate.redetect {
+            self.emit(LiveEvent::Target { seq: 0, target });
+        }
         let _ = candidate.reply.send(Ok(()));
     }
 
@@ -4042,6 +4102,142 @@ mod tests {
         let (tx, mut rx) = oneshot::channel();
         fixture.actor.set_target(LiveTarget::Vi, tx);
         assert_eq!(rx.try_recv().unwrap().unwrap_err().code, Code::Request);
+    }
+
+    // ---- Story 5.2: language re-detection (shares the swap path) ----
+
+    fn auto_params(target: LiveTarget) -> LiveStartParams {
+        LiveStartParams {
+            language: TranscribeLanguage::Auto,
+            ..target_params(target)
+        }
+    }
+
+    async fn connected(fx: &mut Fixture) {
+        pump_until(&mut fx.actor, |a| {
+            a.running.as_ref().unwrap().connection == ConnectionState::Connected
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn redetect_opens_a_fresh_generation_and_flushes_the_open_translation_once() {
+        let (mut fx, conn) = scripted_fixture(&[]).await;
+        let events = Arc::new(Mutex::new(Vec::new()));
+        fx.actor.register_subscriber(collect_channel(events.clone()));
+        fx.actor.start(auto_params(LiveTarget::Vi)).await.unwrap();
+        connected(&mut fx).await;
+        fx.backend.emit_chunk();
+        pump_for(&mut fx.actor, Duration::from_millis(100)).await;
+        feed(
+            &conn,
+            0,
+            r#"{"serverContent":{"outputTranscription":{"text":"Cau dang do"}}}"#,
+        );
+        pump_until(&mut fx.actor, |_| {
+            count_events(&events, |e| matches!(e, LiveEvent::DeltaTranslated { .. })) == 1
+        })
+        .await;
+
+        let (tx, mut rx) = oneshot::channel();
+        fx.actor.redetect(tx);
+        assert_eq!(fx.actor.running.as_ref().unwrap().generation, 1);
+        pump_until(&mut fx.actor, |a| {
+            a.running.as_ref().unwrap().candidate.is_none()
+        })
+        .await;
+        assert!(matches!(rx.try_recv(), Ok(Ok(()))));
+        let running = fx.actor.running.as_ref().unwrap();
+        assert_eq!(running.generation, 2);
+        assert_eq!(running.target, LiveTarget::Vi);
+        assert_eq!(conn.setups.lock().unwrap().len(), 2);
+        // The open sentence is flushed exactly once, and no Target event.
+        assert_eq!(
+            count_events(&events, |e| matches!(e, LiveEvent::SegmentTranslated { .. })),
+            1
+        );
+        assert_eq!(count_events(&events, |e| matches!(e, LiveEvent::Target { .. })), 0);
+        // Old generation events are dropped.
+        feed(
+            &conn,
+            0,
+            r#"{"serverContent":{"outputTranscription":{"text":"Ghost."},"turnComplete":{}}}"#,
+        );
+        pump_for(&mut fx.actor, Duration::from_millis(150)).await;
+        assert_eq!(
+            count_events(&events, |e| matches!(e, LiveEvent::SegmentTranslated { .. })),
+            1
+        );
+        fx.actor.finish_current(None, false).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn redetect_is_rejected_for_a_fixed_language_or_without_a_session() {
+        let (mut fx, _conn) = scripted_fixture(&[]).await;
+        let (tx, mut rx) = oneshot::channel();
+        fx.actor.redetect(tx);
+        assert_eq!(rx.try_recv().unwrap().unwrap_err().code, Code::Request);
+
+        let params = LiveStartParams {
+            language: TranscribeLanguage::Ja,
+            ..target_params(LiveTarget::Vi)
+        };
+        fx.actor.start(params).await.unwrap();
+        connected(&mut fx).await;
+        let (tx, mut rx) = oneshot::channel();
+        fx.actor.redetect(tx);
+        assert_eq!(rx.try_recv().unwrap().unwrap_err().code, Code::Request);
+        assert!(fx.actor.running.as_ref().unwrap().candidate.is_none());
+        fx.actor.finish_current(None, false).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_redetect_keeps_the_current_generation() {
+        let (mut fx, conn) = scripted_fixture(&[Plan::Ok, Plan::Fail]).await;
+        fx.actor.start(auto_params(LiveTarget::Vi)).await.unwrap();
+        connected(&mut fx).await;
+        let (tx, mut rx) = oneshot::channel();
+        fx.actor.redetect(tx);
+        pump_until(&mut fx.actor, |a| {
+            a.running.as_ref().unwrap().candidate.is_none()
+        })
+        .await;
+        assert_eq!(rx.try_recv().unwrap().unwrap_err().category, Category::Network);
+        assert_eq!(fx.actor.running.as_ref().unwrap().generation, 1);
+        assert!(!conn.senders.lock().unwrap()[0].is_closed());
+        fx.actor.finish_current(None, false).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn redetect_and_target_change_serialize_latest_wins() {
+        let (mut fx, conn) = scripted_fixture(&[]).await;
+        fx.actor.start(auto_params(LiveTarget::Vi)).await.unwrap();
+        connected(&mut fx).await;
+        let (tx_r, mut rx_r) = oneshot::channel();
+        let (tx_t, mut rx_t) = oneshot::channel();
+        fx.actor.redetect(tx_r);
+        fx.actor.set_target(LiveTarget::En, tx_t);
+        pump_until(&mut fx.actor, |a| {
+            let r = a.running.as_ref().unwrap();
+            r.candidate.is_none() && r.target == LiveTarget::En
+        })
+        .await;
+        assert!(matches!(rx_r.try_recv(), Ok(Ok(()))), "superseded");
+        assert!(matches!(rx_t.try_recv(), Ok(Ok(()))));
+        assert_eq!(conn.setups.lock().unwrap().len(), 2, "cancelled candidate never connects");
+        // And the other way round: a redetect after a Target change wins.
+        let (tx_t, mut rx_t) = oneshot::channel();
+        let (tx_r, mut rx_r) = oneshot::channel();
+        fx.actor.set_target(LiveTarget::Ja, tx_t);
+        fx.actor.redetect(tx_r);
+        pump_until(&mut fx.actor, |a| {
+            a.running.as_ref().unwrap().candidate.is_none()
+        })
+        .await;
+        assert!(matches!(rx_t.try_recv(), Ok(Ok(()))));
+        assert!(matches!(rx_r.try_recv(), Ok(Ok(()))));
+        assert_eq!(fx.actor.running.as_ref().unwrap().target, LiveTarget::En);
+        fx.actor.finish_current(None, false).await.unwrap();
     }
 
     #[tokio::test]

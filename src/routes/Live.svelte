@@ -35,6 +35,8 @@
   let viewMode = $state<ViewMode>('both');
   let targetPending = $state(0);
   let targetError = $state(false);
+  let redetectPending = $state(false);
+  let redetectError = $state(false);
   let selectedTagIds = $state<string[]>([]);
   let tagPickerOpen = $state(false);
   let tagButton = $state<HTMLButtonElement | null>(null);
@@ -304,6 +306,15 @@
     } else if (targetPending === 0) {
       target = liveStore.snapshot.target;
     }
+  }
+
+  async function redetect(): Promise<void> {
+    if (redetectPending) return;
+    redetectError = false;
+    redetectPending = true;
+    const error = await liveStore.redetect();
+    redetectPending = false;
+    redetectError = error !== null;
   }
 
   async function changeMicrophone(event: Event): Promise<void> {
@@ -666,6 +677,16 @@
             <option value="en">{i18n.t('live.target.en')}</option>
           </select>
         </label>
+        {#if isRunning && language === 'auto'}
+          <button
+            class="button button-secondary"
+            type="button"
+            disabled={redetectPending || liveStore.snapshot.transcription !== 'active'}
+            onclick={() => void redetect()}
+          >
+            {redetectPending ? i18n.t('live.redetect.pending') : i18n.t('live.redetect.action')}
+          </button>
+        {/if}
         {#if isRunning}
           <button class="button button-danger-soft" type="button" disabled={stopPending} onclick={() => void stop()}>
             {stopPending ? i18n.t('live.recording.stopping') : i18n.t('live.recording.stop')}
@@ -677,6 +698,12 @@
         {/if}
       </div>
     </div>
+    {#if redetectError}
+      <p class="live-error target-error" role="alert">
+        <AlertTriangleIcon size={18} strokeWidth={1.75} aria-hidden="true" />
+        <span>{i18n.t('live.redetect.error')}</span>
+      </p>
+    {/if}
     {#if targetError}
       <p class="live-error target-error" role="alert">
         <AlertTriangleIcon size={18} strokeWidth={1.75} aria-hidden="true" />

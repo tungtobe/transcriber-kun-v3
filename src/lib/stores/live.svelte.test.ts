@@ -12,6 +12,7 @@ const mocks = vi.hoisted(() => ({
   liveContinueRecordingOnly: vi.fn(),
   liveSetSource: vi.fn(),
   liveSetTarget: vi.fn(),
+  liveRedetect: vi.fn(),
 }));
 
 let nextChannelId = 1;
@@ -32,6 +33,7 @@ vi.mock('../bindings', () => ({
     liveContinueRecordingOnly: (...args: unknown[]) => mocks.liveContinueRecordingOnly(...args),
     liveSetSource: (...args: unknown[]) => mocks.liveSetSource(...args),
     liveSetTarget: (...args: unknown[]) => mocks.liveSetTarget(...args),
+    liveRedetect: (...args: unknown[]) => mocks.liveRedetect(...args),
   },
 }));
 
@@ -72,6 +74,7 @@ beforeEach(() => {
   mocks.liveContinueRecordingOnly.mockReset().mockResolvedValue({ status: 'ok', data: null });
   mocks.liveSetSource.mockReset().mockResolvedValue({ status: 'ok', data: null });
   mocks.liveSetTarget.mockReset().mockResolvedValue({ status: 'ok', data: null });
+  mocks.liveRedetect.mockReset().mockResolvedValue({ status: 'ok', data: null });
 });
 
 describe('liveStore', () => {
@@ -352,6 +355,17 @@ describe('liveStore', () => {
     // A different session starts with a clean translation.
     channel.onmessage({ type: 'ready', seq: 9, snapshot: snapshot('session-2') });
     expect(store.translatedLines).toEqual([]);
+  });
+
+  it('redetect returns null on success and the typed error on failure', async () => {
+    const { createLiveStore } = await import('./live.svelte');
+    const store = createLiveStore();
+    expect(await store.redetect()).toBeNull();
+    mocks.liveRedetect.mockResolvedValueOnce({
+      status: 'error',
+      error: { category: 'network', code: 'network', detailRedacted: 'x' },
+    });
+    expect((await store.redetect())?.category).toBe('network');
   });
 
   it('setTarget forwards the choice and surfaces a model failure as a banner category', async () => {
