@@ -1000,6 +1000,7 @@ fn parse_models_page(body: &str) -> Result<ModelsPage, AppError> {
                 .name
                 .filter(|name| !name.is_empty())
                 .ok_or_else(|| AppError::new(Code::Shape, "Gemini model omitted its name"))?;
+            let name = crate::core::model_defaults::bare_model_name(&name).to_string();
             Ok(ModelInfo {
                 display_name: model.display_name.unwrap_or_else(|| name.clone()),
                 name,
@@ -1243,7 +1244,8 @@ mod tests {
                 .iter()
                 .map(|model| model.name.as_str())
                 .collect::<Vec<_>>(),
-            ["models/a"]
+            ["a"],
+            "the models/ resource prefix is stripped from listed names"
         );
         let requests = transport.requests();
         assert_eq!(requests.len(), 2);
@@ -1285,7 +1287,7 @@ mod tests {
                 .iter()
                 .map(|model| model.name.as_str())
                 .collect::<Vec<_>>(),
-            ["models/opaque-alias"]
+            ["opaque-alias"]
         );
     }
 

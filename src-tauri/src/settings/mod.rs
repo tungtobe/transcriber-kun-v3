@@ -160,7 +160,9 @@ fn load_model_field(
     match raw.get(key) {
         None => default.to_string(),
         Some(value) => match serde_json::from_str::<String>(value) {
-            Ok(parsed) if !parsed.trim().is_empty() => parsed,
+            Ok(parsed) if !parsed.trim().is_empty() => {
+                crate::core::model_defaults::bare_model_name(&parsed).to_string()
+            }
             _ => {
                 tracing::warn!(key, "giá trị settings không parse được, dùng mặc định");
                 default.to_string()
@@ -333,6 +335,15 @@ fn require_min_chunk_minutes(value: u32) -> Result<(), AppError> {
 /// `AppError` category `storage`; người gọi (ipc) chỉ phát `SettingsChanged`
 /// khi hàm này trả `Ok`.
 pub fn save(db: &Db, settings: &Settings) -> Result<(), AppError> {
+    let mut normalized = settings.clone();
+    for model in [
+        &mut normalized.transcribe_model,
+        &mut normalized.live_model,
+        &mut normalized.memo_model,
+    ] {
+        *model = crate::core::model_defaults::bare_model_name(model).to_string();
+    }
+    let settings = &normalized;
     require_non_blank_model(KEY_TRANSCRIBE_MODEL, &settings.transcribe_model)?;
     require_non_blank_model(KEY_LIVE_MODEL, &settings.live_model)?;
     require_non_blank_model(KEY_MEMO_MODEL, &settings.memo_model)?;
@@ -455,6 +466,36 @@ mod tests {
         };
         save(&db, &expected).unwrap();
         assert_eq!(load(&db), expected);
+    }
+
+    #[test]
+    fn save_stores_bare_model_names_without_the_models_resource_prefix() {
+        let db = open_db();
+        let settings = Settings {
+            transcribe_model: "models/gemini-3-flash".to_string(),
+            live_model: "models/gemini-live-x".to_string(),
+            memo_model: "gemini-plain".to_string(),
+            ..Default::default()
+        };
+        save(&db, &settings).unwrap();
+        let loaded = load(&db);
+        assert_eq!(loaded.transcribe_model, "gemini-3-flash");
+        assert_eq!(loaded.live_model, "gemini-live-x");
+        assert_eq!(loaded.memo_model, "gemini-plain");
+    }
+
+    #[test]
+    fn load_strips_the_prefix_from_values_saved_before_names_were_normalized() {
+        let db = open_db();
+        db.with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO settings (key, value) VALUES ('transcribeModel', '\"models/gemini-old\"')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(load(&db).transcribe_model, "gemini-old");
     }
 
     #[test]
