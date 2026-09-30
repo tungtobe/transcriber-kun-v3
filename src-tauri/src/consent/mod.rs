@@ -10,9 +10,12 @@ use specta::Type;
 /// The consent text version shipped by this binary.
 pub const CURRENT_VERSION: u32 = 1;
 
-/// The first public-policy URL. Keep this HTTPS-only until public beta
-/// hosting is finalized (OQ6).
-pub const PRIVACY_URL: &str = "https://transkun.app/privacy";
+/// The first public-policy URL. Release builds can set the final HTTPS Pages
+/// URL once the hosting origin and policy location are confirmed (OQ6).
+pub const PRIVACY_URL: &str = match option_env!("TRANS_KUN_PRIVACY_POLICY_URL") {
+    Some(value) => value,
+    None => "https://transkun.app/privacy",
+};
 
 /// Support contact URL shown in Settings → Giới thiệu (story 1.10). Same
 /// domain/scope as [`PRIVACY_URL`] — already covered by the existing

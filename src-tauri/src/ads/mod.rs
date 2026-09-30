@@ -293,6 +293,102 @@ fn parse_candidate(
     })
 }
 
+/// Reject an ads payload that the client would only partially display. The
+/// publisher calls this after attaching each image digest so malformed
+/// creatives cannot be signed into a Pages bundle.
+pub fn validate_publication_manifest(manifest: &AdsManifest) -> Result<(), &'static str> {
+    let mut seen_ids = std::collections::HashSet::new();
+    if let Some(report_url) = manifest.report_url.as_deref() {
+        remote::build_report_url(report_url, "publication-check")
+            .map_err(|_| "ads report URL is invalid")?;
+    }
+
+    for (index, creative) in manifest.creatives.iter().enumerate() {
+        let object = creative.as_object().ok_or("creative must be an object")?;
+        let id = object
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .ok_or("creative ID is missing")?;
+        if !seen_ids.insert(id.to_owned()) {
+            return Err("creative IDs must be unique");
+        }
+
+        let locales = object.get("locale").ok_or("creative locale is missing")?;
+        let supported_locales = match locales {
+            Value::String(locale) => vec![locale.as_str()],
+            Value::Array(locales) => locales
+                .iter()
+                .map(|locale| locale.as_str().ok_or("creative locale is invalid"))
+                .collect::<Result<Vec<_>, _>>()?,
+            _ => return Err("creative locale is invalid"),
+        };
+        if supported_locales.is_empty()
+            || supported_locales
+                .iter()
+                .any(|locale| !matches!(*locale, "vi" | "en" | "ja"))
+        {
+            return Err("creative locale is unsupported");
+        }
+        if ![AdsLocale::Vi, AdsLocale::En, AdsLocale::Ja]
+            .iter()
+            .any(|locale| {
+                parse_candidate(index, creative, *locale, manifest.report_url.as_deref()).is_some()
+            })
+        {
+            return Err("creative fields are invalid");
+        }
+
+        let start = object
+            .get("start")
+            .or_else(|| object.get("startAt"))
+            .and_then(parse_timestamp)
+            .ok_or("creative start time is invalid")?;
+        let end = object
+            .get("end")
+            .or_else(|| object.get("endAt"))
+            .and_then(parse_timestamp)
+            .ok_or("creative end time is invalid")?;
+        if start > end {
+            return Err("creative schedule is reversed");
+        }
+
+        let image = object
+            .get("image")
+            .and_then(Value::as_object)
+            .ok_or("creative image reference is missing")?;
+        if image.len() != 3
+            || !image.contains_key("url")
+            || !image.contains_key("sha256")
+            || !image.contains_key("mimeType")
+        {
+            return Err("creative image reference is invalid");
+        }
+        let digest = image
+            .get("sha256")
+            .and_then(Value::as_str)
+            .ok_or("creative image digest is missing")?;
+        if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("creative image digest is invalid");
+        }
+        let mime = image
+            .get("mimeType")
+            .and_then(Value::as_str)
+            .ok_or("creative image MIME type is missing")?;
+        if !matches!(mime, "image/png" | "image/jpeg" | "image/webp") {
+            return Err("creative image MIME type is unsupported");
+        }
+        let url = image
+            .get("url")
+            .and_then(Value::as_str)
+            .ok_or("creative image URL is missing")?;
+        remote::validate_click_url(url).map_err(|_| "creative image URL is invalid")?;
+    }
+
+    Ok(())
+}
+
 fn safe_copy(raw: &str, max_chars: usize) -> Option<String> {
     let value = raw.trim();
     if value.is_empty() || value.chars().count() > max_chars || value.chars().any(char::is_control)
@@ -376,7 +472,7 @@ pub(crate) fn weighted_order(
     ordered
 }
 
-pub(crate) fn display_dimensions_allowed(width: u32, height: u32) -> bool {
+pub fn display_dimensions_allowed(width: u32, height: u32) -> bool {
     matches!((width, height), (300, 100) | (320, 50))
 }
 

@@ -362,6 +362,12 @@ pub fn apply(
     }
 }
 
+pub fn validate_publication_document(
+    document: RecommendedSettingsDocument,
+) -> Result<RecommendedSettingsDocument, AppError> {
+    validate_document(document)
+}
+
 fn validate_document(
     mut document: RecommendedSettingsDocument,
 ) -> Result<RecommendedSettingsDocument, AppError> {

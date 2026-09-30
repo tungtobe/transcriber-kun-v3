@@ -9,7 +9,7 @@
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
-use ed25519_dalek::{Signature, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use image::{ImageFormat, ImageReader, Limits};
 use reqwest::header::{ACCEPT, CONTENT_LENGTH, CONTENT_TYPE, USER_AGENT};
 use reqwest::Url;
@@ -32,7 +32,8 @@ const CACHE_MAGIC: &[u8; 9] = b"TRREMOTE1";
 const CACHE_HEADER_BYTES: usize = CACHE_MAGIC.len() + std::mem::size_of::<i64>();
 const CACHE_TTL_SECONDS: i64 = 24 * 60 * 60;
 const MAX_DOCUMENT_BYTES: usize = 1024 * 1024;
-const MAX_IMAGE_BYTES: usize = 100 * 1024;
+pub const MAX_PUBLICATION_IMAGE_BYTES: usize = 100 * 1024;
+const MAX_IMAGE_BYTES: usize = MAX_PUBLICATION_IMAGE_BYTES;
 const MAX_IMAGE_WIDTH: u32 = 2048;
 const MAX_IMAGE_HEIGHT: u32 = 2048;
 const MAX_IMAGE_PIXELS: u64 = 4_194_304;
@@ -708,7 +709,35 @@ struct RemoteImageReference {
     mime_type: String,
 }
 
-fn verify_envelope_with_digest<T: DeserializeOwned>(
+/// Sign a payload using the one canonical wire contract consumed by the
+/// client. `serde_json::Value` sorts object keys in this crate configuration,
+/// so the signature covers exactly the bytes `verify_envelope_with_digest`
+/// reconstructs after decoding the envelope.
+pub fn sign_envelope(
+    payload: serde_json::Value,
+    signing_key: &SigningKey,
+) -> Result<Vec<u8>, RemoteFailure> {
+    let canonical_payload =
+        serde_json::to_vec(&payload).map_err(|_| RemoteFailure::InvalidEnvelope)?;
+    let mut signed_bytes = Vec::with_capacity(ENVELOPE_DOMAIN.len() + canonical_payload.len());
+    signed_bytes.extend_from_slice(ENVELOPE_DOMAIN);
+    signed_bytes.extend_from_slice(&canonical_payload);
+    let signature = signing_key.sign(&signed_bytes);
+    let envelope = serde_json::to_vec(&serde_json::json!({
+        "version": ENVELOPE_VERSION,
+        "payload": payload,
+        "signature": BASE64.encode(signature.to_bytes()),
+    }))
+    .map_err(|_| RemoteFailure::InvalidEnvelope)?;
+    if envelope.len() > MAX_DOCUMENT_BYTES {
+        return Err(RemoteFailure::ResponseTooLarge);
+    }
+    Ok(envelope)
+}
+
+/// Verify an envelope with the same canonicalization and domain separator
+/// used by the desktop client's remote gateway.
+pub fn verify_envelope_with_digest<T: DeserializeOwned>(
     bytes: &[u8],
     verifying_key: &VerifyingKey,
 ) -> Result<(T, [u8; 32]), RemoteFailure> {
@@ -878,6 +907,17 @@ fn validate_image(
         height,
         source,
     })
+}
+
+/// Validate a local image with the same byte, MIME, decode, and dimension
+/// limits used for downloaded signed creatives. This does not make the image
+/// trusted; callers must still sign its returned digest into the manifest.
+pub fn validate_publication_image(
+    bytes: Vec<u8>,
+    content_type: &str,
+) -> Result<VerifiedImage, RemoteFailure> {
+    let digest: [u8; 32] = Sha256::digest(&bytes).into();
+    validate_image(bytes, content_type, &digest, RemoteSource::Embedded)
 }
 
 /// Validate a creative click target. Only credential-free HTTPS URLs with a

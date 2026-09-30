@@ -1,0 +1,37 @@
+name: Gemini model smoke
+
+on:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gemini-model-smoke
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: macos-cargo-smoke-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: |
+            macos-cargo-smoke-
+
+      - name: Live setup and default transcription smoke
+        env:
+          GEMINI_SMOKE_API_KEY: ${{ secrets.GEMINI_SMOKE_API_KEY }}
+        run: cargo run --locked --manifest-path src-tauri/Cargo.toml --bin model-smoke
