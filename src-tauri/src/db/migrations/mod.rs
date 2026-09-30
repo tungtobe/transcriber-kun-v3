@@ -62,7 +62,7 @@ use rusqlite_migration::{Migrations, M};
 /// `transcript_id` đã lưu với transcript `primary` hiện tại để suy
 /// `fromPreviousTranscript` -- một FK ở đây sẽ chặn chính transaction xoá
 /// đó. `notes_revision` để `NULL` khi Phiên chưa từng có ghi chú lúc sinh.
-static MIGRATIONS: [M; 9] = [
+static MIGRATIONS: [M; 10] = [
     M::up(
         "CREATE TABLE settings (\n\
              key TEXT PRIMARY KEY,\n\
@@ -177,6 +177,19 @@ static MIGRATIONS: [M; 9] = [
                AND session_id IN (SELECT session_id FROM transcripts WHERE variant = 'retranscribe');\n\
          UPDATE transcripts SET variant = 'primary' WHERE variant = 'retranscribe';",
     ),
+    // Record the last remote recommendation accepted for each built-in
+    // template. Comparing this snapshot with the current row detects local
+    // edits before a later signed recommendation is applied.
+    M::up(
+        "CREATE TABLE recommended_template_state (\n\
+             locale TEXT NOT NULL,\n\
+             external_id TEXT NOT NULL,\n\
+             recommended_name TEXT NOT NULL,\n\
+             recommended_prompt TEXT NOT NULL,\n\
+             updated_at INTEGER NOT NULL,\n\
+             PRIMARY KEY (locale, external_id)\n\
+         );",
+    ),
 ];
 
 fn runner() -> Migrations<'static> {
@@ -200,6 +213,17 @@ mod tests {
     }
 
     #[test]
+    fn migration_10_creates_recommended_template_state() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run(&mut conn).unwrap();
+        assert!(table_exists(&conn, "recommended_template_state"));
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 10);
+    }
+
+    #[test]
     fn running_twice_is_a_noop() {
         let mut conn = Connection::open_in_memory().unwrap();
         run(&mut conn).unwrap();
@@ -210,8 +234,8 @@ mod tests {
         let version_after_second: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version_after_first, 9);
-        assert_eq!(version_after_second, 9);
+        assert_eq!(version_after_first, 10);
+        assert_eq!(version_after_second, 10);
     }
 
     #[test]
@@ -428,7 +452,7 @@ mod tests {
         let version_after: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version_after, 9);
+        assert_eq!(version_after, 10);
         assert!(table_exists(&conn, "tags"));
         assert!(table_exists(&conn, "session_tags"));
         let title: String = conn

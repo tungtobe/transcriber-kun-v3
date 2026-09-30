@@ -83,6 +83,19 @@ export const commands = {
 	 */
 	settingsSave: (settings: Settings) => typedError<null, AppError>(__TAURI_INVOKE("settings_save", { settings })),
 	/**
+	 *  Fetch a fresh signed recommendation only after an explicit user action,
+	 *  then return a read-only inline diff.
+	 */
+	settingsRecommendedPreview: () => typedError<RecommendedSettingsPreview, AppError>(__TAURI_INVOKE("settings_recommended_preview")),
+	/**
+	 *  Re-fetch the signed payload, check both its digest and the current local
+	 *  revision, then either write the exact preview plan or return a refreshed
+	 *  diff with no writes.
+	 */
+	settingsRecommendedApply: (token: string) => typedError<RecommendedSettingsApplyResult, AppError>(__TAURI_INVOKE("settings_recommended_apply", { token })),
+	/**  Invalidate a preview token without touching persisted settings or templates. */
+	settingsRecommendedCancel: (token: string) => typedError<null, AppError>(__TAURI_INVOKE("settings_recommended_cancel", { token })),
+	/**
 	 *  Return the Rust-owned consent policy and the durable decision in one
 	 *  typed snapshot. A policy read failure is a storage error; no fallback
 	 *  version is invented in the frontend.
@@ -793,6 +806,46 @@ export type PermissionState = "granted" | "denied" | "notDetermined" | "unknown"
  *  UI (spec I/O Matrix "Phiên live thiếu Proxy").
  */
 export type ProxyRelinkOutcome = "relinked" | "hashMismatch" | "cancelled" | "liveUnsupported";
+
+export type RecommendedSettingChange = {
+	field: RecommendedSettingField,
+	currentValue: string,
+	proposedValue: string,
+};
+
+export type RecommendedSettingField = "transcribeModel" | "liveModel" | "memoModel" | "chunkMinutes";
+
+export type RecommendedSettingsApplyResult = {
+	/**  A stale result carries a newly computed preview and has written nothing. */
+	stale: boolean,
+	appliedCount: number,
+	preview: RecommendedSettingsPreview | null,
+};
+
+export type RecommendedSettingsPreview = {
+	/**
+	 *  Opaque, process-local UUID. It is invalid after cancel, apply, or app
+	 *  restart and grants no access beyond this one preview plan.
+	 */
+	token: string,
+	changes: RecommendedSettingChange[],
+	templateChanges: RecommendedTemplateChange[],
+	templateConflicts: RecommendedTemplateConflict[],
+};
+
+export type RecommendedTemplateChange = {
+	externalId: string,
+	locale: string,
+	currentName: string | null,
+	proposedName: string,
+	currentPrompt: string | null,
+	proposedPrompt: string,
+};
+
+export type RecommendedTemplateConflict = {
+	externalId: string,
+	locale: string,
+};
 
 export type RecordingExportFormat = "wav" | "flac";
 

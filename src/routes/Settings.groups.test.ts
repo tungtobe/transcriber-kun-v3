@@ -3,7 +3,7 @@
 // specific, controllable state: real content per group and the "Consent
 // declined -> About only" no-regression guarantee (spec Acceptance).
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, render, screen } from '@testing-library/svelte';
+import { cleanup, fireEvent, render, screen } from '@testing-library/svelte';
 import { i18n } from '../i18n/index.svelte';
 import Settings from './Settings.svelte';
 
@@ -42,6 +42,9 @@ const mocks = vi.hoisted(() => ({
   diagnosticsSummary: vi.fn(),
   libraryStorageStats: vi.fn(),
   memoTemplatesList: vi.fn(),
+  settingsRecommendedPreview: vi.fn(),
+  settingsRecommendedApply: vi.fn(),
+  settingsRecommendedCancel: vi.fn(),
 }));
 
 vi.mock('../lib/stores/settings.svelte', () => ({ settingsStore: mocks.settingsStore }));
@@ -55,6 +58,9 @@ vi.mock('../lib/bindings', async (importOriginal) => {
       diagnosticsSummary: (...args: unknown[]) => mocks.diagnosticsSummary(...args),
       libraryStorageStats: (...args: unknown[]) => mocks.libraryStorageStats(...args),
       memoTemplatesList: (...args: unknown[]) => mocks.memoTemplatesList(...args),
+      settingsRecommendedPreview: (...args: unknown[]) => mocks.settingsRecommendedPreview(...args),
+      settingsRecommendedApply: (...args: unknown[]) => mocks.settingsRecommendedApply(...args),
+      settingsRecommendedCancel: (...args: unknown[]) => mocks.settingsRecommendedCancel(...args),
     },
   };
 });
@@ -94,6 +100,9 @@ beforeEach(() => {
       { id: 'd2', name: 'Memo song ngữ Nhật–Việt', prompt: 'Tóm tắt {transcript}', isDefault: true, locale: 'vi', defaultKey: 'bilingual-ja-vi' },
     ],
   });
+  mocks.settingsRecommendedPreview.mockReset();
+  mocks.settingsRecommendedApply.mockReset();
+  mocks.settingsRecommendedCancel.mockReset().mockResolvedValue({ status: 'ok', data: null });
 });
 
 describe('Settings group routing', () => {
@@ -143,6 +152,62 @@ describe('Settings group routing', () => {
     expect(screen.getByRole('button', { name: '+ Thêm mẫu' })).toBeTruthy();
     expect(screen.getByLabelText('Tên mẫu')).toBeTruthy();
     expect(screen.getByLabelText('Prompt')).toBeTruthy();
+  });
+
+  it('does not fetch recommendations on mount and fetches only after a click', async () => {
+    mocks.settingsRecommendedPreview.mockResolvedValue({
+      status: 'error',
+      error: { category: 'network', code: 'network', detailRedacted: 'https://private.example/secret' },
+    });
+    render(Settings, { props: { routeParams: { group: 'recommended' } } });
+
+    expect(mocks.settingsRecommendedPreview).not.toHaveBeenCalled();
+    expect(await screen.findByRole('heading', { name: 'Cấu hình đề xuất', level: 2 })).toBeTruthy();
+    await fireEvent.click(screen.getByRole('button', { name: 'Tải cấu hình đề xuất' }));
+
+    expect(mocks.settingsRecommendedPreview).toHaveBeenCalledTimes(1);
+    const alert = await screen.findByRole('alert');
+    expect(alert.textContent).toContain('Lỗi kết nối');
+    expect(alert.textContent).not.toContain('private.example');
+  });
+
+  it('applies only after the displayed diff is clicked and can cancel a preview', async () => {
+    mocks.settingsRecommendedPreview.mockResolvedValue({
+      status: 'ok',
+      data: {
+        token: 'preview-token',
+        changes: [{ field: 'chunkMinutes', currentValue: '5', proposedValue: '8' }],
+        templateChanges: [],
+        templateConflicts: [],
+      },
+    });
+    mocks.settingsRecommendedApply.mockResolvedValue({
+      status: 'ok',
+      data: { stale: false, appliedCount: 1, preview: null },
+    });
+    render(Settings, { props: { routeParams: { group: 'recommended' } } });
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Tải cấu hình đề xuất' }));
+    expect(await screen.findByText('5')).toBeTruthy();
+    expect(screen.getByText('8')).toBeTruthy();
+    expect(mocks.settingsRecommendedApply).not.toHaveBeenCalled();
+    await fireEvent.click(screen.getByRole('button', { name: 'Áp dụng thay đổi' }));
+    expect(mocks.settingsRecommendedApply).toHaveBeenCalledWith('preview-token');
+    expect(await screen.findByText('Đã áp dụng 1 thay đổi.')).toBeTruthy();
+
+    mocks.settingsRecommendedPreview.mockResolvedValueOnce({
+      status: 'ok',
+      data: {
+        token: 'cancel-token',
+        changes: [{ field: 'chunkMinutes', currentValue: '8', proposedValue: '9' }],
+        templateChanges: [],
+        templateConflicts: [],
+      },
+    });
+    await fireEvent.click(screen.getByRole('button', { name: 'Tải cấu hình đề xuất' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Huỷ bản xem trước' }));
+    expect(mocks.settingsRecommendedCancel).toHaveBeenCalledWith('cancel-token');
+    expect(await screen.findByText('Đã huỷ bản xem trước. Không có thay đổi nào được lưu.')).toBeTruthy();
   });
 
   it('renders real SettingsAbout content for the about group', () => {

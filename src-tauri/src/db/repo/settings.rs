@@ -27,16 +27,27 @@ pub fn read_all(conn: &Connection) -> rusqlite::Result<HashMap<String, String>> 
 /// dở (spec: "Lưu settings ... Lỗi ghi → storage, không phát event").
 pub fn upsert_many(conn: &mut Connection, entries: &[(&str, String)]) -> rusqlite::Result<()> {
     let tx = conn.transaction()?;
-    {
-        let mut stmt = tx.prepare(
-            "INSERT INTO settings (key, value) VALUES (?1, ?2) \
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        )?;
-        for (key, value) in entries {
-            stmt.execute(params![key, value])?;
-        }
-    }
+    upsert_many_in_transaction(&tx, entries)?;
     tx.commit()
+}
+
+/// Upsert selected settings inside a caller-owned transaction, allowing the
+/// recommendation service to commit settings and memo templates atomically.
+pub fn upsert_many_in_transaction(
+    conn: &Connection,
+    entries: &[(&str, String)],
+) -> rusqlite::Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let mut stmt = conn.prepare(
+        "INSERT INTO settings (key, value) VALUES (?1, ?2) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )?;
+    for (key, value) in entries {
+        stmt.execute(params![key, value])?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

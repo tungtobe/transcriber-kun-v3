@@ -68,7 +68,7 @@ fn validate_locale(locale: &str) -> Result<(), AppError> {
 /// Tên: trim rồi giới hạn 1–100 ký tự Unicode scalar (spec Boundaries
 /// Always). Rỗng sau trim bị từ chối cùng lỗi với "> 100 ký tự" -- cả hai
 /// đều `Code::Request`.
-fn validate_name(raw: &str) -> Result<String, AppError> {
+pub(crate) fn validate_name(raw: &str) -> Result<String, AppError> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err(AppError::new(Code::Request, "Tên mẫu không được để trống"));
@@ -99,6 +99,17 @@ pub fn validate_prompt(raw: &str) -> Result<(), AppError> {
         ));
     }
     Ok(())
+}
+
+/// Reuse the exact local name and prompt rules for signed recommendations.
+/// Remote template values go through the same normalization as user edits.
+pub(crate) fn validate_recommended_content(
+    name: &str,
+    prompt: &str,
+) -> Result<(String, String), AppError> {
+    let name = validate_name(name)?;
+    validate_prompt(prompt)?;
+    Ok((name, prompt.to_string()))
 }
 
 /// Đảm bảo hai mẫu mặc định của `locale` tồn tại -- gọi trong cùng

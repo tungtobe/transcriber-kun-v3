@@ -115,6 +115,108 @@ pub fn list(conn: &Connection, locale: &str) -> rusqlite::Result<Vec<MemoTemplat
     rows.collect()
 }
 
+/// Read every template in a deterministic order without seeding defaults.
+/// Recommendation previews use this for a stable local-state revision and
+/// must remain read-only before the user applies anything.
+pub fn list_all(conn: &Connection) -> rusqlite::Result<Vec<MemoTemplateRow>> {
+    let sql = format!(
+        "SELECT {SELECT_COLUMNS} FROM memo_templates \
+         ORDER BY COALESCE(locale, ''), is_default DESC, COALESCE(default_key, ''), created_at, id"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], row_to_template)?;
+    rows.collect()
+}
+
+/// Find a local recommended/default template. User-created templates have
+/// `is_default = 0` and are deliberately excluded from this lookup.
+pub fn get_recommended(
+    conn: &Connection,
+    locale: &str,
+    external_id: &str,
+) -> rusqlite::Result<Option<MemoTemplateRow>> {
+    let sql = format!(
+        "SELECT {SELECT_COLUMNS} FROM memo_templates \
+         WHERE is_default = 1 AND locale = ?1 AND default_key = ?2"
+    );
+    conn.query_row(&sql, params![locale, external_id], row_to_template)
+        .optional()
+}
+
+/// Last remote contents accepted for a recommendation, used to distinguish a
+/// later remote update from a local edit of the same template.
+pub fn get_recommended_state(
+    conn: &Connection,
+    locale: &str,
+    external_id: &str,
+) -> rusqlite::Result<Option<(String, String)>> {
+    conn.query_row(
+        "SELECT recommended_name, recommended_prompt FROM recommended_template_state \
+         WHERE locale = ?1 AND external_id = ?2",
+        params![locale, external_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()
+}
+
+/// Read all accepted recommendation baselines in a stable order.
+pub fn list_recommended_states(
+    conn: &Connection,
+) -> rusqlite::Result<Vec<(String, String, String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT locale, external_id, recommended_name, recommended_prompt \
+         FROM recommended_template_state ORDER BY locale, external_id",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+    })?;
+    rows.collect()
+}
+
+/// Upsert a validated recommended template inside the caller's transaction.
+/// The existing UUID is retained on updates.
+pub fn upsert_recommended(
+    conn: &Connection,
+    id: MemoTemplateId,
+    name: &str,
+    prompt: &str,
+    locale: &str,
+    external_id: &str,
+    now: i64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO memo_templates (id, name, prompt, is_default, locale, default_key, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, ?6) \
+         ON CONFLICT (locale, default_key) DO UPDATE SET \
+             name = excluded.name, prompt = excluded.prompt, updated_at = excluded.updated_at",
+        params![id.to_string(), name, prompt, locale, external_id, now],
+    )?;
+    Ok(())
+}
+
+/// Persist the accepted recommendation snapshot in the same transaction as
+/// its template row.
+pub fn upsert_recommended_state(
+    conn: &Connection,
+    locale: &str,
+    external_id: &str,
+    name: &str,
+    prompt: &str,
+    now: i64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO recommended_template_state \
+             (locale, external_id, recommended_name, recommended_prompt, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5) \
+         ON CONFLICT (locale, external_id) DO UPDATE SET \
+             recommended_name = excluded.recommended_name, \
+             recommended_prompt = excluded.recommended_prompt, \
+             updated_at = excluded.updated_at",
+        params![locale, external_id, name, prompt, now],
+    )?;
+    Ok(())
+}
+
 /// Đọc một mẫu theo `id` -- dùng để trả lại dòng vừa tạo/sửa qua IPC.
 pub fn get(conn: &Connection, id: MemoTemplateId) -> rusqlite::Result<Option<MemoTemplateRow>> {
     let sql = format!("SELECT {SELECT_COLUMNS} FROM memo_templates WHERE id = ?1");

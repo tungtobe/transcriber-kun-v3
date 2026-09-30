@@ -11,6 +11,7 @@
   import SettingsStorage from './settings/SettingsStorage.svelte';
   import SettingsDiagnostics from './settings/SettingsDiagnostics.svelte';
   import SettingsAbout from './settings/SettingsAbout.svelte';
+  import SettingsRecommended from './settings/SettingsRecommended.svelte';
 
   type RouteParams = { group?: string };
   let { routeParams = {} }: { routeParams?: RouteParams } = $props();
@@ -21,6 +22,7 @@
     { key: 'live', labelKey: 'settings.group.live' },
     { key: 'chunking', labelKey: 'settings.group.chunking' },
     { key: 'memo', labelKey: 'settings.group.memo' },
+    { key: 'recommended', labelKey: 'settings.group.recommended' },
     { key: 'storage', labelKey: 'settings.group.storage' },
     { key: 'diagnostics', labelKey: 'settings.group.diagnostics' },
     { key: 'about', labelKey: 'settings.group.about' },
@@ -67,6 +69,8 @@
         <SettingsChunking />
       {:else if group === 'memo'}
         <SettingsMemo />
+      {:else if group === 'recommended'}
+        <SettingsRecommended />
       {:else if group === 'storage'}
         <SettingsStorage />
       {:else if group === 'diagnostics'}

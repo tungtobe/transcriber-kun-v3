@@ -12,6 +12,8 @@ use crate::core::model_defaults::{
 };
 use crate::db::{repo, Db};
 
+pub mod recommended;
+
 /// `theme: 'system' | 'light' | 'dark'`, mặc định `system` (spec Decisions).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, Type)]
 #[serde(rename_all = "lowercase")]
@@ -216,6 +218,13 @@ pub fn load(db: &Db) -> Settings {
             Default::default()
         });
 
+    load_from_raw(&raw)
+}
+
+/// Parse a raw settings snapshot. The recommendation service uses this from
+/// the same SQLite transaction that reads template state, so its preview
+/// revision always describes one consistent local snapshot.
+pub(crate) fn load_from_raw(raw: &std::collections::HashMap<String, String>) -> Settings {
     let theme = match raw.get(KEY_THEME) {
         None => Theme::default(),
         Some(value) => serde_json::from_str::<Theme>(value).unwrap_or_else(|_| {
@@ -357,11 +366,16 @@ fn require_non_blank_model(field: &str, value: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+pub(crate) fn validate_recommended_model(field: &str, value: &str) -> Result<String, AppError> {
+    require_non_blank_model(field, value)?;
+    Ok(crate::core::model_defaults::bare_model_name(value).to_string())
+}
+
 /// Từ chối `chunkMinutes` ngoài `1..=MAX_CHUNK_MINUTES` trước khi ghi (spec
 /// Boundaries Always P0 review: "chunkMinutes là số nguyên trong 1..=60 ...
 /// Rust `settings::save` từ chối các giá trị ngoài khoảng (`Code::Format`)").
 /// `timestampOffsetSec` không cần kiểm tương tự -- kiểu `u32` đã loại âm.
-fn require_min_chunk_minutes(value: u32) -> Result<(), AppError> {
+pub(crate) fn require_min_chunk_minutes(value: u32) -> Result<(), AppError> {
     if !(1..=MAX_CHUNK_MINUTES).contains(&value) {
         return Err(AppError::new(
             Code::Format,
@@ -1209,7 +1223,12 @@ mod tests {
     fn live_target_defaults_to_none_and_round_trips() {
         let db = open_db();
         assert_eq!(load(&db).live_target, LiveTarget::None);
-        for target in [LiveTarget::Vi, LiveTarget::En, LiveTarget::Ja, LiveTarget::None] {
+        for target in [
+            LiveTarget::Vi,
+            LiveTarget::En,
+            LiveTarget::Ja,
+            LiveTarget::None,
+        ] {
             save(
                 &db,
                 &Settings {
@@ -1224,7 +1243,10 @@ mod tests {
 
     #[test]
     fn live_target_serializes_lowercase_and_maps_to_codes() {
-        assert_eq!(serde_json::to_string(&LiveTarget::None).unwrap(), "\"none\"");
+        assert_eq!(
+            serde_json::to_string(&LiveTarget::None).unwrap(),
+            "\"none\""
+        );
         assert_eq!(serde_json::to_string(&LiveTarget::Vi).unwrap(), "\"vi\"");
         assert_eq!(LiveTarget::None.as_code(), None);
         assert_eq!(LiveTarget::Ja.as_code(), Some("ja"));

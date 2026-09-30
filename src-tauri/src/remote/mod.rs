@@ -164,6 +164,9 @@ impl std::error::Error for RemoteFailure {}
 #[derive(Debug, Clone, PartialEq)]
 pub struct RemoteDocument<T> {
     pub payload: T,
+    /// SHA-256 of the exact canonical payload bytes covered by the verified
+    /// envelope signature. Embedded fallback documents have no signed digest.
+    pub signed_payload_digest: Option<[u8; 32]>,
     pub source: RemoteSource,
     pub provenance: RemoteProvenance,
     pub fetched_at_unix_seconds: Option<i64>,
@@ -175,6 +178,22 @@ pub struct RemoteDocument<T> {
     // Prevent callers from manufacturing a "verified manifest" from an
     // embedded fallback or arbitrary local value before asking for images.
     signature_verified: bool,
+}
+
+#[cfg(test)]
+pub(crate) fn test_fresh_document<T: serde::Serialize>(payload: T) -> RemoteDocument<T> {
+    let canonical_payload = serde_json::to_vec(&payload).expect("test payload serializes");
+    let signed_payload_digest = Some(Sha256::digest(canonical_payload).into());
+    RemoteDocument {
+        payload,
+        signed_payload_digest,
+        source: RemoteSource::Network,
+        provenance: RemoteProvenance::Fresh,
+        fetched_at_unix_seconds: Some(1_800_000_000),
+        recovered_from: None,
+        cache_warning: None,
+        signature_verified: true,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -410,6 +429,7 @@ impl RemoteGateway {
             Err(error) => {
                 return RemoteDocument {
                     payload: embedded_fallback,
+                    signed_payload_digest: None,
                     source: RemoteSource::Embedded,
                     provenance: RemoteProvenance::EmbeddedFallback,
                     fetched_at_unix_seconds: None,
@@ -425,18 +445,19 @@ impl RemoteGateway {
             .ok()
             .flatten()
             .and_then(|entry| {
-                verify_envelope::<T>(&entry.body, &self.verifying_key)
+                verify_envelope_with_digest::<T>(&entry.body, &self.verifying_key)
                     .ok()
-                    .map(|payload| (entry, payload))
+                    .map(|(payload, digest)| (entry, payload, digest))
             });
 
         let verified_cache = match verified_cache {
-            Some((entry, payload))
+            Some((entry, payload, signed_payload_digest))
                 if (0..=CACHE_TTL_SECONDS)
                     .contains(&now.saturating_sub(entry.fetched_at_unix_seconds)) =>
             {
                 return RemoteDocument {
                     payload,
+                    signed_payload_digest: Some(signed_payload_digest),
                     source: RemoteSource::VerifiedCache,
                     provenance: RemoteProvenance::Fresh,
                     fetched_at_unix_seconds: Some(entry.fetched_at_unix_seconds),
@@ -451,9 +472,10 @@ impl RemoteGateway {
         match self.fetch_network_document::<T>(&url, &cache_path).await {
             Ok(document) => document,
             Err(error) => {
-                if let Some((entry, payload)) = verified_cache {
+                if let Some((entry, payload, signed_payload_digest)) = verified_cache {
                     RemoteDocument {
                         payload,
+                        signed_payload_digest: Some(signed_payload_digest),
                         source: RemoteSource::VerifiedCache,
                         provenance: RemoteProvenance::StaleCache,
                         fetched_at_unix_seconds: Some(entry.fetched_at_unix_seconds),
@@ -464,6 +486,7 @@ impl RemoteGateway {
                 } else {
                     RemoteDocument {
                         payload: embedded_fallback,
+                        signed_payload_digest: None,
                         source: RemoteSource::Embedded,
                         provenance: RemoteProvenance::EmbeddedFallback,
                         fetched_at_unix_seconds: None,
@@ -503,7 +526,8 @@ impl RemoteGateway {
         if response.body.len() > MAX_DOCUMENT_BYTES {
             return Err(RemoteFailure::ResponseTooLarge);
         }
-        let payload = verify_envelope(&response.body, &self.verifying_key)?;
+        let (payload, signed_payload_digest) =
+            verify_envelope_with_digest(&response.body, &self.verifying_key)?;
         let fetched_at = self.clock.now_unix_seconds();
         let mut warning = None;
         if let Err(error) = write_cached_body(
@@ -518,6 +542,7 @@ impl RemoteGateway {
         }
         Ok(RemoteDocument {
             payload,
+            signed_payload_digest: Some(signed_payload_digest),
             source: RemoteSource::Network,
             provenance: RemoteProvenance::Fresh,
             fetched_at_unix_seconds: Some(fetched_at),
@@ -666,10 +691,10 @@ struct RemoteImageReference {
     mime_type: String,
 }
 
-fn verify_envelope<T: DeserializeOwned>(
+fn verify_envelope_with_digest<T: DeserializeOwned>(
     bytes: &[u8],
     verifying_key: &VerifyingKey,
-) -> Result<T, RemoteFailure> {
+) -> Result<(T, [u8; 32]), RemoteFailure> {
     if bytes.len() > MAX_DOCUMENT_BYTES {
         return Err(RemoteFailure::ResponseTooLarge);
     }
@@ -691,7 +716,10 @@ fn verify_envelope<T: DeserializeOwned>(
     verifying_key
         .verify_strict(&signed_bytes, &signature)
         .map_err(|_| RemoteFailure::InvalidSignature)?;
-    serde_json::from_value(envelope.payload).map_err(|_| RemoteFailure::InvalidEnvelope)
+    let signed_payload_digest = Sha256::digest(&canonical_payload).into();
+    let payload =
+        serde_json::from_value(envelope.payload).map_err(|_| RemoteFailure::InvalidEnvelope)?;
+    Ok((payload, signed_payload_digest))
 }
 
 #[derive(Debug)]
@@ -1032,9 +1060,12 @@ mod tests {
             "images": [{ "url": url, "sha256": digest, "mimeType": mime }]
         });
         let envelope = sign_payload(payload, signing_key);
+        let (payload, signed_payload_digest) =
+            verify_envelope_with_digest(&envelope, &signing_key.verifying_key())
+                .expect("test image manifest signature");
         RemoteDocument {
-            payload: verify_envelope(&envelope, &signing_key.verifying_key())
-                .expect("test image manifest signature"),
+            payload,
+            signed_payload_digest: Some(signed_payload_digest),
             source: RemoteSource::Network,
             provenance: RemoteProvenance::Fresh,
             fetched_at_unix_seconds: Some(1_800_000_000),
@@ -1070,6 +1101,71 @@ mod tests {
             )))
             .exists());
         assert_eq!(transport.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn signed_recommendation_produces_only_changed_allowlisted_preview_rows() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let key = signing_key();
+        let payload = serde_json::json!({
+            "schemaVersion": 1,
+            "settings": {
+                "transcribeModel": "unchanged-model",
+                "liveModel": "models/recommended-live",
+                "chunkMinutes": 5,
+                "apiKey": "ignored-secret",
+                "consentAcceptedVersion": 300
+            },
+            "templates": [],
+            "unknownField": "ignored"
+        });
+        let expected_digest: [u8; 32] =
+            Sha256::digest(serde_json::to_vec(&payload).unwrap()).into();
+        let transport = FakeTransport::new([response(sign_payload(payload, &key))]);
+        let gateway = test_gateway(
+            temp.path(),
+            &key,
+            transport.clone(),
+            FakeClock::new(1_800_000_000),
+        );
+        let db = crate::db::Db::open(temp.path()).expect("database");
+        db.with_connection(|conn| {
+            crate::db::repo::settings::upsert_many(
+                conn,
+                &[("transcribeModel", "\"unchanged-model\"".to_owned())],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let document: RemoteDocument<crate::settings::recommended::RecommendedSettingsDocument> =
+            gateway
+                .fetch_recommended_settings()
+                .await
+                .expect("signed recommended document");
+        assert_eq!(document.signed_payload_digest, Some(expected_digest));
+        let store = crate::settings::recommended::RecommendedPreviewStore::default();
+        let preview = crate::settings::recommended::preview(&db, &store, document).unwrap();
+
+        assert_eq!(transport.calls(), 1);
+        assert_eq!(preview.changes.len(), 1);
+        assert_eq!(
+            preview.changes[0].field,
+            crate::settings::recommended::RecommendedSettingField::LiveModel
+        );
+        assert_eq!(preview.changes[0].proposed_value, "recommended-live");
+        let raw = db
+            .with_connection(|conn| Ok(crate::db::repo::settings::read_all(conn)?))
+            .unwrap();
+        assert_eq!(
+            raw.get("transcribeModel").map(String::as_str),
+            Some("\"unchanged-model\"")
+        );
+        assert!(raw.get("liveModel").is_none());
+        assert!(serde_json::to_string(&preview)
+            .unwrap()
+            .find("ignored-secret")
+            .is_none());
     }
 
     #[tokio::test]

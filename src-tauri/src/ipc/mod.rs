@@ -460,6 +460,81 @@ async fn settings_get(state: tauri::State<'_, AppState>) -> Result<Settings, App
     track_ipc_error(&state.db, result).await
 }
 
+async fn fetch_recommended_document(
+    data_dir: Result<std::path::PathBuf, AppError>,
+) -> Result<
+    crate::remote::RemoteDocument<settings::recommended::RecommendedSettingsDocument>,
+    AppError,
+> {
+    let data_dir = data_dir?;
+    let gateway = crate::remote::RemoteGateway::from_app_data_dir(data_dir)
+        .map_err(crate::remote::RemoteFailure::as_app_error)?;
+    gateway
+        .fetch_recommended_settings()
+        .await
+        .map_err(crate::remote::RemoteFailure::as_app_error)
+}
+
+/// Fetch a fresh signed recommendation only after an explicit user action,
+/// then return a read-only inline diff.
+#[tauri::command]
+#[specta::specta]
+async fn settings_recommended_preview(
+    state: tauri::State<'_, AppState>,
+) -> Result<settings::recommended::RecommendedSettingsPreview, AppError> {
+    let result = async {
+        let document = fetch_recommended_document(state.data_dir.clone()).await?;
+        let db = state.db.clone()?;
+        let previews = state.recommended_previews.clone();
+        blocking(move || settings::recommended::preview(&db, &previews, document)).await
+    }
+    .await;
+    track_ipc_error(&state.db, result).await
+}
+
+/// Re-fetch the signed payload, check both its digest and the current local
+/// revision, then either write the exact preview plan or return a refreshed
+/// diff with no writes.
+#[tauri::command]
+#[specta::specta]
+async fn settings_recommended_apply(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    token: String,
+) -> Result<settings::recommended::RecommendedSettingsApplyResult, AppError> {
+    let result = async {
+        state.recommended_previews.require_active(&token)?;
+        let document = fetch_recommended_document(state.data_dir.clone()).await?;
+        let db = state.db.clone()?;
+        let previews = state.recommended_previews.clone();
+        let token_for_apply = token.clone();
+        let applied = blocking(move || {
+            settings::recommended::apply(&db, &previews, &token_for_apply, document)
+        })
+        .await?;
+        if !applied.stale {
+            let db = state.db.clone()?;
+            let current = blocking(move || Ok(settings::load(&db))).await?;
+            if let Err(error) = SettingsChanged(current).emit(&app) {
+                tracing::warn!(error = %error, "could not emit settingsChanged after applying recommendations");
+            }
+        }
+        Ok(applied)
+    }
+    .await;
+    track_ipc_error(&state.db, result).await
+}
+
+/// Invalidate a preview token without touching persisted settings or templates.
+#[tauri::command]
+#[specta::specta]
+fn settings_recommended_cancel(
+    state: tauri::State<'_, AppState>,
+    token: String,
+) -> Result<(), AppError> {
+    settings::recommended::RecommendedPreviewStore::cancel(&state.recommended_previews, &token)
+}
+
 /// Return the Rust-owned consent policy and the durable decision in one
 /// typed snapshot. A policy read failure is a storage error; no fallback
 /// version is invented in the frontend.
@@ -2884,6 +2959,9 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             live_unsubscribe,
             settings_get,
             settings_save,
+            settings_recommended_preview,
+            settings_recommended_apply,
+            settings_recommended_cancel,
             consent_policy,
             consent_accept,
             consent_decline,
