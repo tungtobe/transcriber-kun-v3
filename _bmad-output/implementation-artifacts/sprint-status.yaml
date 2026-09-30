@@ -99,7 +99,7 @@ development_status:
   6-1-module-remote-tải-xác-minh-chữ-ký-cache-fallback: review
   6-2-đồng-bộ-cấu-hình-đề-xuất: review
   6-3-pipeline-creative-chọn-xoay-giới-hạn-và-cờ-tắt-quảng-cáo: review
-  6-4-ad-slot-ở-sidebar-và-tuân-thủ-store: backlog
+  6-4-ad-slot-ở-sidebar-và-tuân-thủ-store: review
   6-5-công-cụ-ký-xuất-bản-nội-dung-từ-xa-và-smoke-test-hằng-tuần: backlog
   epic-6-retrospective: optional
 

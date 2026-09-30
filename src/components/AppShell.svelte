@@ -24,11 +24,25 @@
   import DropOverlay from './DropOverlay.svelte';
   import JobCard from './JobCard.svelte';
   import RecordingExportStatus from './RecordingExportStatus.svelte';
+  import AdSlot from './AdSlot.svelte';
 
   let { children }: { children?: Snippet } = $props();
 
   const currentPath = $derived(location());
   const consentRestricted = $derived(settingsStore.consentStatus === 'declined');
+  const adRouteEligible = $derived(
+    currentPath === '/' ||
+      currentPath === '/home' ||
+      currentPath === '/settings' ||
+      currentPath.startsWith('/settings/') ||
+      /^\/session\/[^/]+$/.test(currentPath),
+  );
+  const adsEligible = $derived(
+    adRouteEligible &&
+      !consentRestricted &&
+      settingsStore.onboardingCompleted &&
+      settingsStore.consentStatus === 'current',
+  );
   // Kéo thả (và overlay của nó) chỉ nhận ở Home và Transcript detail (spec
   // Never: "Không nhận file khi đang ở Onboarding/Settings").
   const dropEnabled = $derived(
@@ -156,6 +170,10 @@
     </div>
 
     <div class="sidebar-spacer"></div>
+
+    {#if adsEligible}
+      <AdSlot eligible={adsEligible} />
+    {/if}
 
     <section class="sidebar-footer" aria-label={i18n.t('app.shell.statusLabel')}>
       <p class="version-label">{i18n.t('app.version.label')}</p>

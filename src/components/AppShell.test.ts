@@ -5,10 +5,13 @@ import AppShell from './AppShell.svelte';
 import { i18n } from '../i18n/index.svelte';
 import { configureRouter } from '../lib/router';
 import type { DragDropEvent } from '../lib/dragdrop';
+import type { AdCreativeView, AdsLocale } from '../lib/bindings';
 
 const mocks = vi.hoisted(() => ({
   settingsStore: {
     theme: 'system' as const,
+    onboardingCompleted: false,
+    consentStatus: 'pending' as 'pending' | 'declined' | 'stale' | 'current',
     error: null as null | { category: string; code: string; detailRedacted: string },
     setTheme: vi.fn(),
     load: vi.fn(),
@@ -34,6 +37,14 @@ const mocks = vi.hoisted(() => ({
     subscribe: vi.fn(() => Promise.resolve()),
     unsubscribe: vi.fn(),
   },
+  commands: {
+    adsNext: vi.fn<(locale: AdsLocale) => Promise<{ status: 'ok'; data: AdCreativeView | null }>>(
+      async () => ({ status: 'ok', data: null }),
+    ),
+    adsImpression: vi.fn(() => Promise.resolve({ status: 'ok' as const, data: 'recorded' as const })),
+    adsClick: vi.fn(() => Promise.resolve({ status: 'ok' as const, data: 'opened' as const })),
+    adsReport: vi.fn(() => Promise.resolve({ status: 'ok' as const, data: 'opened' as const })),
+  },
 }));
 
 vi.mock('../lib/stores/settings.svelte', () => ({ settingsStore: mocks.settingsStore }));
@@ -41,6 +52,7 @@ vi.mock('../lib/stores/app.svelte', () => ({ appStore: mocks.appStore }));
 vi.mock('../lib/stores/intake.svelte', () => ({ intakeStore: mocks.intakeStore }));
 vi.mock('../lib/stores/jobs.svelte', () => ({ jobsStore: mocks.jobsStore }));
 vi.mock('../lib/stores/live.svelte', () => ({ liveStore: mocks.liveStore }));
+vi.mock('../lib/bindings', () => ({ commands: mocks.commands }));
 vi.mock('../lib/dragdrop', () => ({
   onDragDropEvent: (...args: unknown[]) => mocks.onDragDropEvent(...args),
 }));
@@ -55,6 +67,8 @@ beforeEach(() => {
   window.history.replaceState({}, '', '/home');
   window.dispatchEvent(new PopStateEvent('popstate', { state: {} }));
   mocks.settingsStore.theme = 'system';
+  mocks.settingsStore.onboardingCompleted = false;
+  mocks.settingsStore.consentStatus = 'pending';
   mocks.settingsStore.error = null;
   mocks.settingsStore.setTheme.mockReset();
   mocks.settingsStore.load.mockReset();
@@ -66,6 +80,10 @@ beforeEach(() => {
   mocks.liveStore.snapshot.recording = 'stopped';
   mocks.liveStore.subscribe.mockReset().mockResolvedValue(undefined);
   mocks.liveStore.unsubscribe.mockReset();
+  mocks.commands.adsNext.mockReset().mockResolvedValue({ status: 'ok', data: null });
+  mocks.commands.adsImpression.mockReset().mockResolvedValue({ status: 'ok', data: 'recorded' });
+  mocks.commands.adsClick.mockReset().mockResolvedValue({ status: 'ok', data: 'opened' });
+  mocks.commands.adsReport.mockReset().mockResolvedValue({ status: 'ok', data: 'opened' });
   dragDropHandler = null;
   mocks.onDragDropEvent.mockReset().mockImplementation((handler: (event: DragDropEvent) => void) => {
     dragDropHandler = handler;
@@ -74,6 +92,79 @@ beforeEach(() => {
 });
 
 describe('AppShell', () => {
+  it.each([
+    ['/home', 'Home'],
+    ['/session/session-1', 'Transcript detail'],
+    ['/settings/general', 'Settings'],
+  ])('requests and mounts the ad slot on eligible route %s (%s)', async (path) => {
+    window.history.replaceState({}, '', path);
+    window.dispatchEvent(new PopStateEvent('popstate', { state: {} }));
+    mocks.settingsStore.onboardingCompleted = true;
+    mocks.settingsStore.consentStatus = 'current';
+    mocks.commands.adsNext.mockResolvedValue({ status: 'ok', data: {
+      token: 'eligible-token', sponsoredLabel: 'Tài trợ', sponsor: 'Transcriber Kun',
+      title: 'Tập trung vào cuộc trò chuyện', body: 'Sắp xếp cuộc họp.',
+      imageDataUrl: null, width: 300, height: 100, whyThisAd: 'Thông tin tĩnh.',
+    } });
+
+    render(AppShell);
+
+    expect(await screen.findByRole('region', { name: 'Thông tin được tài trợ' })).toBeTruthy();
+    expect(mocks.commands.adsNext).toHaveBeenCalledTimes(1);
+    expect(mocks.commands.adsNext).toHaveBeenCalledWith('vi');
+  });
+
+  it.each([
+    ['setup', 'stopped'],
+    ['recording', 'active'],
+    ['saving', 'stopping'],
+  ] as const)('never mounts or requests an ad on /live during %s', (state, recording) => {
+    window.history.replaceState({}, '', '/live');
+    window.dispatchEvent(new PopStateEvent('popstate', { state: {} }));
+    mocks.liveStore.snapshot.recording = recording;
+    mocks.settingsStore.onboardingCompleted = true;
+    mocks.settingsStore.consentStatus = 'current';
+
+    render(AppShell);
+
+    expect(screen.queryByRole('region', { name: 'Thông tin được tài trợ' })).toBeNull();
+    expect(mocks.commands.adsNext).not.toHaveBeenCalled();
+    expect(mocks.commands.adsImpression).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['onboarding incomplete', false, 'current'],
+    ['consent pending', true, 'pending'],
+    ['consent declined', true, 'declined'],
+  ] as const)('does not request ads during %s', (_state, onboardingCompleted, consentStatus) => {
+    mocks.settingsStore.onboardingCompleted = onboardingCompleted;
+    mocks.settingsStore.consentStatus = consentStatus;
+    render(AppShell);
+
+    expect(screen.queryByRole('region', { name: 'Thông tin được tài trợ' })).toBeNull();
+    expect(mocks.commands.adsNext).not.toHaveBeenCalled();
+  });
+
+  it('removes the slot on navigation to /live without requesting or acknowledging another ad', async () => {
+    mocks.settingsStore.onboardingCompleted = true;
+    mocks.settingsStore.consentStatus = 'current';
+    mocks.commands.adsNext.mockResolvedValue({ status: 'ok', data: {
+      token: 'route-token', sponsoredLabel: 'Tài trợ', sponsor: 'Transcriber Kun',
+      title: 'Tập trung vào cuộc trò chuyện', body: 'Sắp xếp cuộc họp.',
+      imageDataUrl: null, width: 300, height: 100, whyThisAd: 'Thông tin tĩnh.',
+    } });
+    render(AppShell);
+    expect(await screen.findByRole('region', { name: 'Thông tin được tài trợ' })).toBeTruthy();
+    expect(mocks.commands.adsNext).toHaveBeenCalledTimes(1);
+
+    window.history.replaceState({}, '', '/live');
+    await fireEvent(window, new PopStateEvent('popstate', { state: {} }));
+
+    expect(screen.queryByRole('region', { name: 'Thông tin được tài trợ' })).toBeNull();
+    expect(mocks.commands.adsNext).toHaveBeenCalledTimes(1);
+    expect(mocks.commands.adsImpression).not.toHaveBeenCalled();
+  });
+
   it('always renders accessible shell landmarks and theme control', () => {
     render(AppShell);
 
