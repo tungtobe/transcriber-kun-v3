@@ -55,6 +55,8 @@ hound = "=3.5.1"
 chrono = "=0.4.45"
 sha2 = "=0.10.9"
 base64 = "=0.22.1"
+ed25519-dalek = "=2.2.0"
+image = { version = "=0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
 
 # Keyring is intentionally restricted to the two supported desktop stores.
 # Linux is not a supported product target; keeping this dependency target
