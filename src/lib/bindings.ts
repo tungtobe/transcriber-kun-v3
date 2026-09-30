@@ -83,6 +83,37 @@ export const commands = {
 	 */
 	settingsSave: (settings: Settings) => typedError<null, AppError>(__TAURI_INVOKE("settings_save", { settings })),
 	/**
+	 *  Return the next safe ad view for the three supported UI locales. The
+	 *  frontend must call `ads_impression` only after the returned card is
+	 *  actually visible; selection itself never increments a counter.
+	 */
+	adsNext: (locale: AdsLocale) => typedError<{
+	token: string,
+	sponsoredLabel: string,
+	sponsor: string,
+	title: string,
+	body: string,
+	imageDataUrl: string | null,
+	width: number,
+	height: number,
+	whyThisAd: string,
+} | null, AppError>(__TAURI_INVOKE("ads_next", { locale })),
+	/**
+	 *  Acknowledge actual visibility and persist one local impression per
+	 *  creative per ten minutes. Repeated acknowledgements are idempotent.
+	 */
+	adsImpression: (token: string) => typedError<AdsImpressionResult, AppError>(__TAURI_INVOKE("ads_impression", { token })),
+	/**
+	 *  Open a previously displayed creative's validated HTTPS target through the
+	 *  OS opener. The safe URL stays in Rust; only local click counts are stored.
+	 */
+	adsClick: (token: string) => typedError<AdsActionResult, AppError>(__TAURI_INVOKE("ads_click", { token })),
+	/**
+	 *  Open the safe report destination for a previously displayed creative.
+	 *  This is a user-requested navigation; it never transmits local counts.
+	 */
+	adsReport: (token: string) => typedError<AdsActionResult, AppError>(__TAURI_INVOKE("ads_report", { token })),
+	/**
 	 *  Fetch a fresh signed recommendation only after an explicit user action,
 	 *  then return a read-only inline diff.
 	 */
@@ -445,6 +476,29 @@ export const events = {
 };
 
 /* Types */
+/**
+ *  Safe view returned to Story 6.4. URLs and remote creative IDs remain in
+ *  Rust; the frontend receives only a process-local action token and verified
+ *  image bytes.
+ */
+export type AdCreativeView = {
+	token: string,
+	sponsoredLabel: string,
+	sponsor: string,
+	title: string,
+	body: string,
+	imageDataUrl: string | null,
+	width: number,
+	height: number,
+	whyThisAd: string,
+};
+
+export type AdsActionResult = "opened" | "unavailable" | "unknownSelection" | "suppressed";
+
+export type AdsImpressionResult = "recorded" | "duplicate" | "unknownSelection" | "suppressed";
+
+export type AdsLocale = "vi" | "en" | "ja";
+
 /**
  *  Lỗi thống nhất trả qua mọi command IPC. Serialize `{ category, code,
  *  detailRedacted }` — spec Boundaries.

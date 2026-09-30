@@ -177,6 +177,41 @@ const KEY_CHUNK_MINUTES: &str = "chunkMinutes";
 const KEY_TIMESTAMP_OFFSET_SEC: &str = "timestampOffsetSec";
 const KEY_TRANSCRIBE_LANGUAGE: &str = "transcribeLanguage";
 const KEY_LIVE_TARGET: &str = "liveTarget";
+const KEY_LOCAL_PREMIUM: &str = "isPremium";
+
+/// Read the durable local premium override used to suppress house ads. This
+/// flag is intentionally not part of the UI settings payload or settings
+/// editor; entitlement code can update it through [`set_local_premium`].
+pub fn is_premium(db: &Db) -> Result<bool, AppError> {
+    let raw = db.with_connection(|conn| Ok(repo::settings::read_all(conn)?))?;
+    match raw.get(KEY_LOCAL_PREMIUM) {
+        None => Ok(false),
+        Some(value) => match serde_json::from_str::<bool>(value) {
+            Ok(premium) => Ok(premium),
+            Err(_) => {
+                tracing::warn!(
+                    key = KEY_LOCAL_PREMIUM,
+                    "local premium flag is invalid; ads stay enabled"
+                );
+                Ok(false)
+            }
+        },
+    }
+}
+
+/// Persist the local premium override without exposing a UI control. Keeping
+/// this separate from [`save`] prevents frontend settings round trips from
+/// accidentally enabling or clearing premium suppression.
+pub fn set_local_premium(db: &Db, premium: bool) -> Result<(), AppError> {
+    let value = serde_json::to_string(&premium)
+        .map_err(|err| AppError::new(Code::Format, err.to_string()))?;
+    db.with_connection(|conn| {
+        Ok(repo::settings::upsert_many(
+            conn,
+            &[(KEY_LOCAL_PREMIUM, value)],
+        )?)
+    })
+}
 
 /// Shared by `load`'s three model branches: missing key, corrupt JSON, and a
 /// parsed-but-blank string (e.g. a hand-edited DB row) all fall back to
@@ -511,6 +546,45 @@ mod tests {
     fn load_on_empty_table_returns_defaults() {
         let db = open_db();
         assert_eq!(load(&db), default_settings_with_theme(Theme::System));
+    }
+
+    #[test]
+    fn local_premium_flag_defaults_off_persists_and_is_not_overwritten_by_ui_settings() {
+        let db = open_db();
+        assert!(!is_premium(&db).unwrap());
+        set_local_premium(&db, true).unwrap();
+        assert!(is_premium(&db).unwrap());
+
+        save(&db, &Settings::default()).unwrap();
+        assert!(is_premium(&db).unwrap());
+        set_local_premium(&db, false).unwrap();
+        assert!(!is_premium(&db).unwrap());
+    }
+
+    #[test]
+    fn local_premium_flag_survives_database_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = Db::open(dir.path()).unwrap();
+            set_local_premium(&db, true).unwrap();
+        }
+        let reopened = Db::open(dir.path()).unwrap();
+        assert!(is_premium(&reopened).unwrap());
+    }
+
+    #[test]
+    fn corrupt_local_premium_flag_defaults_to_false() {
+        let db = open_db();
+        db.with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO settings (key, value) VALUES ('isPremium', 'not-json')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(!is_premium(&db).unwrap());
     }
 
     #[test]

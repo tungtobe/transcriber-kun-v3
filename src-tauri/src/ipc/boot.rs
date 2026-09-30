@@ -91,6 +91,9 @@ pub struct AppState {
     /// One process-local recommendation preview. Restart, cancel, apply, or a
     /// newer preview makes the prior token unusable.
     pub recommended_previews: Arc<crate::settings::recommended::RecommendedPreviewStore>,
+    /// One process-local bridge from a selected house ad to its safe click
+    /// and report action. Persistent caps and counters stay in SQLite.
+    pub ad_selections: Arc<crate::ads::SelectionRegistry>,
     /// One export at a time. The token is installed before the native save
     /// dialog opens so cancellation and duplicate requests share one owner.
     pub recording_export: Arc<Mutex<Option<ActiveRecordingExport>>>,
@@ -285,6 +288,7 @@ pub fn boot<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
         wiping: Arc::new(AtomicBool::new(false)),
         memo_running: Arc::new(Mutex::new(HashMap::new())),
         recommended_previews: Arc::new(Default::default()),
+        ad_selections: Arc::new(Default::default()),
         recording_export: Arc::new(Mutex::new(None)),
         close_requested: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         close_confirmed: Arc::new(AtomicBool::new(false)),

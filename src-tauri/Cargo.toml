@@ -38,6 +38,7 @@ tracing = "=0.1.44"
 tracing-appender = "=0.2.5"
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
 uuid = { version = "=1.26.1", features = ["v7"] }
+rand = "=0.9.5"
 regex = "=1.13.1"
 # Story 1.2: `settings/` (de)serialize value từng khoá dạng JSON để lưu vào
 # cột TEXT của bảng `settings`; trước đó chỉ dùng trong spike test nên đủ ở

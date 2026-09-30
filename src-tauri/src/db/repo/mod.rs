@@ -1,5 +1,6 @@
 //! Repo theo entity — mỗi file SQL cho đúng một bảng (spec Boundaries).
 
+pub mod ads;
 pub mod counters;
 pub mod memo_templates;
 pub mod memos;

@@ -125,7 +125,7 @@ mod tests {
             let version: i64 = conn
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 10);
+            assert_eq!(version, 11);
             Ok(())
         })
         .unwrap();

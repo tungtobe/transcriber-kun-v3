@@ -475,6 +475,232 @@ async fn fetch_recommended_document(
         .map_err(crate::remote::RemoteFailure::as_app_error)
 }
 
+/// Select one locale/time/cap eligible ad. A remote or image failure falls
+/// back to the bundled card; a verified server disable or the durable local
+/// premium flag suppresses both remote and fallback content.
+async fn ads_next_inner(
+    state: &AppState,
+    locale: crate::ads::AdsLocale,
+) -> Result<Option<crate::ads::AdCreativeView>, AppError> {
+    let db = state.db.clone()?;
+    let is_premium = blocking(move || settings::is_premium(&db)).await?;
+    if is_premium {
+        return Ok(None);
+    }
+
+    let now = crate::ads::now_unix_seconds();
+    let data_dir = match state.data_dir.clone() {
+        Ok(data_dir) => data_dir,
+        Err(error) => {
+            tracing::warn!(error = %error, "ad remote unavailable; using bundled creative");
+            return Ok(Some(crate::ads::fallback_view(
+                locale,
+                &state.ad_selections,
+                now,
+            )));
+        }
+    };
+    let gateway = match crate::remote::RemoteGateway::from_app_data_dir(data_dir) {
+        Ok(gateway) => gateway,
+        Err(failure) => {
+            tracing::warn!(failure = %failure, "ad remote unavailable; using bundled creative");
+            return Ok(Some(crate::ads::fallback_view(
+                locale,
+                &state.ad_selections,
+                now,
+            )));
+        }
+    };
+
+    let document = gateway
+        .fetch_ads(crate::ads::AdsManifest {
+            // This placeholder is used only when remote fetch fails. In that
+            // case the embedded house ad remains available unless premium is
+            // set. Signed disable flags are checked by source provenance.
+            ads_enabled: true,
+            ..Default::default()
+        })
+        .await;
+    if crate::ads::suppress_ads(is_premium, Some(&document)) {
+        return Ok(None);
+    }
+    if document.source == crate::remote::RemoteSource::Embedded {
+        return Ok(Some(crate::ads::fallback_view(
+            locale,
+            &state.ad_selections,
+            now,
+        )));
+    }
+
+    let db = state.db.clone()?;
+    let last_displays =
+        blocking(move || db.with_connection(|conn| Ok(crate::db::repo::ads::last_displays(conn)?)))
+            .await?;
+    let candidates =
+        crate::ads::eligible_candidates(&document.payload, locale, now, &last_displays);
+    let candidates = crate::ads::weighted_order(candidates, crate::ads::random_unit_sample);
+    for candidate in candidates {
+        let image_pointer = format!("/creatives/{}/image", candidate.manifest_index);
+        match gateway.fetch_image(&document, &image_pointer).await {
+            Ok(image) if crate::ads::display_dimensions_allowed(image.width, image.height) => {
+                return Ok(Some(crate::ads::remote_view(
+                    candidate,
+                    &image,
+                    &state.ad_selections,
+                    now,
+                )));
+            }
+            Ok(image) => {
+                tracing::warn!(
+                    width = image.width,
+                    height = image.height,
+                    "ad image dimensions are not supported; skipping creative"
+                );
+            }
+            Err(failure) => {
+                tracing::warn!(failure = %failure, "ad image could not be verified; skipping creative");
+            }
+        }
+    }
+
+    Ok(Some(crate::ads::fallback_view(
+        locale,
+        &state.ad_selections,
+        now,
+    )))
+}
+
+/// Return the next safe ad view for the three supported UI locales. The
+/// frontend must call `ads_impression` only after the returned card is
+/// actually visible; selection itself never increments a counter.
+#[tauri::command]
+#[specta::specta]
+async fn ads_next(
+    state: tauri::State<'_, AppState>,
+    locale: crate::ads::AdsLocale,
+) -> Result<Option<crate::ads::AdCreativeView>, AppError> {
+    let result = ads_next_inner(&state, locale).await;
+    track_ipc_error(&state.db, result).await
+}
+
+/// Acknowledge actual visibility and persist one local impression per
+/// creative per ten minutes. Repeated acknowledgements are idempotent.
+#[tauri::command]
+#[specta::specta]
+async fn ads_impression(
+    state: tauri::State<'_, AppState>,
+    token: String,
+) -> Result<crate::ads::AdsImpressionResult, AppError> {
+    let result = async {
+        let db = state.db.clone()?;
+        if blocking(move || settings::is_premium(&db)).await? {
+            return Ok(crate::ads::AdsImpressionResult::Suppressed);
+        }
+        let now = crate::ads::now_unix_seconds();
+        let Some(selection) = state.ad_selections.confirm_visible(&token, now) else {
+            return Ok(crate::ads::AdsImpressionResult::UnknownSelection);
+        };
+        let db = state.db.clone()?;
+        let recorded = blocking(move || {
+            db.with_connection(|conn| {
+                Ok(crate::db::repo::ads::record_impression(
+                    conn,
+                    &selection.creative_id,
+                    now,
+                )?)
+            })
+        })
+        .await?;
+        Ok(if recorded {
+            crate::ads::AdsImpressionResult::Recorded
+        } else {
+            crate::ads::AdsImpressionResult::Duplicate
+        })
+    }
+    .await;
+    track_ipc_error(&state.db, result).await
+}
+
+/// Open a previously displayed creative's validated HTTPS target through the
+/// OS opener. The safe URL stays in Rust; only local click counts are stored.
+#[tauri::command]
+#[specta::specta]
+async fn ads_click(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    token: String,
+) -> Result<crate::ads::AdsActionResult, AppError> {
+    let result = async {
+        let db = state.db.clone()?;
+        if blocking(move || settings::is_premium(&db)).await? {
+            return Ok(crate::ads::AdsActionResult::Suppressed);
+        }
+        let now = crate::ads::now_unix_seconds();
+        let Some(selection) = state.ad_selections.visible_selection(&token, now) else {
+            return Ok(crate::ads::AdsActionResult::UnknownSelection);
+        };
+        let Some(url) = selection.click_url else {
+            return Ok(crate::ads::AdsActionResult::Unavailable);
+        };
+        let url = crate::remote::validate_click_url(url.as_str())
+            .map_err(crate::remote::RemoteFailure::as_app_error)?;
+        let db = state.db.clone()?;
+        blocking(move || {
+            use tauri_plugin_opener::OpenerExt;
+            app.opener()
+                .open_url(url.to_string(), None::<&str>)
+                .map_err(|error| AppError::new(Code::Storage, error.to_string()))?;
+            db.with_connection(|conn| {
+                crate::db::repo::ads::record_click(conn, &selection.creative_id)?;
+                Ok(())
+            })
+        })
+        .await?;
+        Ok(crate::ads::AdsActionResult::Opened)
+    }
+    .await;
+    track_ipc_error(&state.db, result).await
+}
+
+/// Open the safe report destination for a previously displayed creative.
+/// This is a user-requested navigation; it never transmits local counts.
+#[tauri::command]
+#[specta::specta]
+async fn ads_report(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    token: String,
+) -> Result<crate::ads::AdsActionResult, AppError> {
+    let result = async {
+        let db = state.db.clone()?;
+        if blocking(move || settings::is_premium(&db)).await? {
+            return Ok(crate::ads::AdsActionResult::Suppressed);
+        }
+        let now = crate::ads::now_unix_seconds();
+        let Some(selection) = state.ad_selections.visible_selection(&token, now) else {
+            return Ok(crate::ads::AdsActionResult::UnknownSelection);
+        };
+        let Some(url) = selection.report_url else {
+            return Ok(crate::ads::AdsActionResult::Unavailable);
+        };
+        let db = state.db.clone()?;
+        blocking(move || {
+            use tauri_plugin_opener::OpenerExt;
+            app.opener()
+                .open_url(url.to_string(), None::<&str>)
+                .map_err(|error| AppError::new(Code::Storage, error.to_string()))?;
+            db.with_connection(|conn| {
+                crate::db::repo::ads::record_report(conn, &selection.creative_id)?;
+                Ok(())
+            })
+        })
+        .await?;
+        Ok(crate::ads::AdsActionResult::Opened)
+    }
+    .await;
+    track_ipc_error(&state.db, result).await
+}
+
 /// Fetch a fresh signed recommendation only after an explicit user action,
 /// then return a read-only inline diff.
 #[tauri::command]
@@ -2959,6 +3185,10 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             live_unsubscribe,
             settings_get,
             settings_save,
+            ads_next,
+            ads_impression,
+            ads_click,
+            ads_report,
             settings_recommended_preview,
             settings_recommended_apply,
             settings_recommended_cancel,

@@ -196,6 +196,23 @@ pub(crate) fn test_fresh_document<T: serde::Serialize>(payload: T) -> RemoteDocu
     }
 }
 
+#[cfg(test)]
+pub(crate) fn test_embedded_document<T>(
+    payload: T,
+    recovered_from: Option<RemoteFailure>,
+) -> RemoteDocument<T> {
+    RemoteDocument {
+        payload,
+        signed_payload_digest: None,
+        source: RemoteSource::Embedded,
+        provenance: RemoteProvenance::EmbeddedFallback,
+        fetched_at_unix_seconds: None,
+        recovered_from,
+        cache_warning: None,
+        signature_verified: false,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageMime {
     Png,
@@ -1198,6 +1215,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn signed_ads_disable_stays_effective_from_verified_cache_while_offline() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let key = signing_key();
+        let clock = FakeClock::new(1_800_000_000);
+        let gateway = test_gateway(
+            temp.path(),
+            &key,
+            FakeTransport::new([
+                response(sign_payload(
+                    serde_json::json!({
+                        "adsEnabled": false,
+                        "reportUrl": "https://ads.example/report",
+                        "creatives": []
+                    }),
+                    &key,
+                )),
+                Err(RemoteFailure::Network),
+            ]),
+            clock.clone(),
+        );
+        let first: RemoteDocument<crate::ads::AdsManifest> = gateway
+            .fetch_ads(crate::ads::AdsManifest {
+                ads_enabled: true,
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(first.source, RemoteSource::Network);
+        assert!(crate::ads::suppress_ads(false, Some(&first)));
+
+        clock.set(1_800_000_000 + CACHE_TTL_SECONDS + 1);
+        let offline: RemoteDocument<crate::ads::AdsManifest> = gateway
+            .fetch_ads(crate::ads::AdsManifest {
+                ads_enabled: true,
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(offline.source, RemoteSource::VerifiedCache);
+        assert_eq!(offline.provenance, RemoteProvenance::StaleCache);
+        assert_eq!(offline.recovered_from, Some(RemoteFailure::Network));
+        assert!(crate::ads::suppress_ads(false, Some(&offline)));
+    }
+
+    #[tokio::test]
     async fn tampered_response_uses_embedded_ads_fallback_without_caching() {
         let temp = tempfile::tempdir().expect("tempdir");
         let key = signing_key();
@@ -1342,6 +1402,90 @@ mod tests {
             .path()
             .join(hex(&Sha256::digest(b"https://remote.example/creative.png")))
             .exists());
+    }
+
+    #[tokio::test]
+    async fn signed_ad_candidate_is_selected_only_with_its_verified_300_by_100_image() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let key = signing_key();
+        let bytes = png_bytes(300, 100);
+        let digest: [u8; 32] = Sha256::digest(&bytes).into();
+        let payload = serde_json::json!({
+            "adsEnabled": true,
+            "reportUrl": "https://ads.example/report",
+            "creatives": [{
+                "id": "campaign-01",
+                "image": {
+                    "url": "https://remote.example/campaign.png",
+                    "sha256": hex(&digest),
+                    "mimeType": "image/png"
+                },
+                "title": "A safe text title",
+                "sponsor": "ACME",
+                "url": "https://ads.example/offer",
+                "locale": ["en", "ja"],
+                "start": 1_799_999_000,
+                "end": 1_800_001_000,
+                "weight": 2.5,
+            }]
+        });
+        let mut image_response = response(bytes).expect("response");
+        image_response.content_type = Some("image/png".to_owned());
+        let gateway = test_gateway(
+            temp.path(),
+            &key,
+            FakeTransport::new([response(sign_payload(payload, &key)), Ok(image_response)]),
+            FakeClock::new(1_800_000_000),
+        );
+        let document: RemoteDocument<crate::ads::AdsManifest> = gateway
+            .fetch_ads(crate::ads::AdsManifest {
+                ads_enabled: true,
+                ..Default::default()
+            })
+            .await;
+        let candidates = crate::ads::eligible_candidates(
+            &document.payload,
+            crate::ads::AdsLocale::En,
+            1_800_000_000,
+            &std::collections::HashMap::new(),
+        );
+        let candidate = candidates.into_iter().next().expect("eligible creative");
+        let japanese_candidates = crate::ads::eligible_candidates(
+            &document.payload,
+            crate::ads::AdsLocale::Ja,
+            1_800_000_000,
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(japanese_candidates.len(), 1);
+        assert!(crate::ads::eligible_candidates(
+            &document.payload,
+            crate::ads::AdsLocale::Vi,
+            1_800_000_000,
+            &std::collections::HashMap::new(),
+        )
+        .is_empty());
+        let image = gateway
+            .fetch_image(&document, "/creatives/0/image")
+            .await
+            .expect("signed digest and bounded image verification");
+        let view = crate::ads::remote_view(
+            candidate.clone(),
+            &image,
+            &crate::ads::SelectionRegistry::default(),
+            1_800_000_000,
+        );
+
+        assert_eq!(document.source, RemoteSource::Network);
+        assert_eq!(candidate.creative_id, "campaign-01");
+        assert_eq!(candidate.sponsor, "ACME");
+        assert_eq!(candidate.click_url.as_str(), "https://ads.example/offer");
+        assert_eq!(view.sponsor, "ACME");
+        assert_eq!(view.title, "A safe text title");
+        assert!(crate::ads::display_dimensions_allowed(
+            image.width,
+            image.height
+        ));
+        assert_eq!((image.width, image.height), (300, 100));
     }
 
     #[tokio::test]
