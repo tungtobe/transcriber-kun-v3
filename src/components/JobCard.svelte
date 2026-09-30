@@ -62,6 +62,7 @@
 </script>
 
 {#if variant === 'compact'}
+  {#if totalCount > 0}
   <section class="job-card-compact" aria-label={i18n.t('app.shell.runningJobs')}>
     <div class="job-heading">
       <span>{i18n.t('app.shell.runningJobs')}</span>
@@ -74,10 +75,9 @@
           {i18n.t('home.jobCard.percent', { percent: percent(primaryRunning.processedMs, primaryRunning.totalMs) })}
         </span>
       </a>
-    {:else if totalCount === 0}
-      <p class="job-compact-empty">{i18n.t('app.shell.noRunningJobs')}</p>
     {/if}
   </section>
+  {/if}
 {:else if job}
   <div class="job-card-full">
     <a class="job-card-title" href={`/session/${job.sessionId}`} use:link>{displayName(job)}</a>
@@ -227,11 +227,6 @@
     font-variant-numeric: tabular-nums;
   }
 
-  .job-compact-empty {
-    margin: 0;
-    color: var(--color-text-muted);
-    font-size: var(--text-help-size);
-  }
 
   .job-compact-link {
     display: flex;

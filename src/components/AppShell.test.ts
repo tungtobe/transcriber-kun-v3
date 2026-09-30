@@ -82,7 +82,7 @@ describe('AppShell', () => {
     expect(screen.getByRole('banner')).toBeTruthy();
     expect(screen.getByRole('main', { name: 'Trang chủ' })).toBeTruthy();
     expect(screen.getByRole('combobox', { name: 'Chủ đề giao diện' })).toBeTruthy();
-    expect(screen.getByText('Không có job nào đang chạy.')).toBeTruthy();
+    expect(screen.queryByText('Không có job nào đang chạy.')).toBeNull();
     expect(screen.getByRole('link', { name: 'Trang chủ' }).getAttribute('aria-current')).toBe('page');
     expect(screen.getByRole('link', { name: 'Live' }).getAttribute('href')).toBe('/live');
   });

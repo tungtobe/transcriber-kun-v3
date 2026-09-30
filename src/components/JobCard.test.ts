@@ -122,10 +122,10 @@ describe('JobCard variant=full', () => {
 });
 
 describe('JobCard variant=compact', () => {
-  it('shows "Không có job nào đang chạy." when the registry has no jobs', () => {
+  it('is hidden when the registry has no jobs', () => {
     render(JobCard, { variant: 'compact' });
-    expect(screen.getByText('Không có job nào đang chạy.')).toBeTruthy();
-    expect(screen.getByText('0')).toBeTruthy();
+    expect(screen.queryByText('Không có job nào đang chạy.')).toBeNull();
+    expect(screen.queryByText('0')).toBeNull();
   });
 
   it('shows the running Job name + percent linking to /session/:sessionId, and the total running+queued count', () => {

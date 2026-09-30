@@ -50,12 +50,16 @@
   let autoScroll = $state(true);
   let elapsedSeconds = $state(0);
   let wallClockMs = $state(Date.now());
+  let timerStartedAt: number | null = null;
+  let timerSessionId: string | null = null;
   let transcriptEl = $state<HTMLDivElement | null>(null);
+  let sourceColEl = $state<HTMLDivElement | null>(null);
+  let translatedColEl = $state<HTMLDivElement | null>(null);
   let notesPanelRef = $state<{
     flush: () => Promise<boolean>;
     retry: () => Promise<boolean>;
   } | null>(null);
-  let previousScrollTop = 0;
+  const previousTops = new WeakMap<HTMLElement, number>();
   let focusListener: (() => void) | null = null;
 
   const isRunning = $derived(liveStore.snapshot.sessionId !== null && liveStore.snapshot.recording === 'active');
@@ -136,9 +140,8 @@
     void liveStore.draft;
     void liveStore.translatedLines.length;
     void liveStore.translatedDraft;
-    if (!isRunning || !autoScroll || !transcriptEl) return;
-    transcriptEl.scrollTop = transcriptEl.scrollHeight;
-    previousScrollTop = transcriptEl.scrollTop;
+    if (!isRunning || !autoScroll) return;
+    scrollAllToBottom();
   });
 
   $effect(() => {
@@ -154,7 +157,15 @@
       return;
     }
 
-    const startedAt = Date.now() - Math.max(0, durationSec) * 1000;
+    // Snapshot `Ready` mới (reconnect/remount) có thể mang durationSec = 0 hoặc
+    // cũ hơn đồng hồ cục bộ; chỉ neo lại khi backend báo lớn hơn để timer
+    // không bao giờ nhảy lùi về 0:00.
+    const candidate = Date.now() - Math.max(0, durationSec) * 1000;
+    if (timerSessionId !== sessionId || timerStartedAt === null || candidate < timerStartedAt) {
+      timerStartedAt = candidate;
+      timerSessionId = sessionId;
+    }
+    const startedAt = timerStartedAt;
     const update = () => {
       elapsedSeconds = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
       wallClockMs = Date.now();
@@ -381,16 +392,25 @@
     await liveStore.loadSources(true);
   }
 
-  function handleTranscriptScroll(): void {
-    const nextTop = transcriptEl?.scrollTop ?? 0;
-    if (nextTop < previousScrollTop) autoScroll = false;
-    previousScrollTop = nextTop;
+  // Chế độ 2 cột: mỗi cột tự cuộn riêng nên cả hai luôn bám cuối dù lệch độ dài.
+  function scrollAllToBottom(): void {
+    for (const el of [transcriptEl, sourceColEl, translatedColEl]) {
+      if (!el) continue;
+      el.scrollTop = el.scrollHeight;
+      previousTops.set(el, el.scrollTop);
+    }
+  }
+
+  function handleTranscriptScroll(event: Event): void {
+    const el = event.currentTarget as HTMLElement;
+    const nextTop = el.scrollTop;
+    if (nextTop < (previousTops.get(el) ?? 0)) autoScroll = false;
+    previousTops.set(el, nextTop);
   }
 
   function scrollToLatest(): void {
     autoScroll = true;
-    if (transcriptEl) transcriptEl.scrollTop = transcriptEl.scrollHeight;
-    previousScrollTop = transcriptEl?.scrollTop ?? previousScrollTop;
+    scrollAllToBottom();
   }
 
   function gapLabel(): string {
@@ -758,7 +778,7 @@
         >
           <div class="transcript-columns" class:two-columns={twoColumns}>
             {#if showSourceColumn}
-              <div class="transcript-column" data-column="source">
+              <div class="transcript-column" data-column="source" bind:this={sourceColEl} onscroll={handleTranscriptScroll}>
                 {#if translating}
                   <h3 class="column-title">{i18n.t('live.column.source', { language })}</h3>
                 {/if}
@@ -786,7 +806,7 @@
               </div>
             {/if}
             {#if showTranslatedColumn}
-              <div class="transcript-column" data-column="translated">
+              <div class="transcript-column" data-column="translated" bind:this={translatedColEl} onscroll={handleTranscriptScroll}>
                 <h3 class="column-title">
                   {i18n.t('live.column.translated', { target: activeTarget })}
                   {#if speaking}
@@ -922,7 +942,9 @@
   .speaking-pill { margin-left:var(--space-2); padding:0 var(--space-2); border:1px solid var(--color-accent); border-radius:var(--radius-md); font-size:var(--text-help-size); font-weight:500; }
   .tts-toggle:disabled { cursor:not-allowed; opacity:.7; }
   .transcript-columns { display:grid; grid-template-columns:minmax(0,1fr); gap:var(--space-5); }
-  .transcript-columns.two-columns { grid-template-columns:repeat(2,minmax(0,1fr)); }
+  .transcript-columns.two-columns { grid-template-columns:repeat(2,minmax(0,1fr)); height:100%; }
+  .transcript-list:has(.two-columns) { overflow:hidden; }
+  .two-columns .transcript-column { min-height:0; overflow:auto; }
   .transcript-column { min-width:0; }
   .column-title { margin:0 0 var(--space-2); color:var(--color-text-muted); font-size:var(--text-help-size); font-weight:600; }
   .target-error { align-items:center; }
